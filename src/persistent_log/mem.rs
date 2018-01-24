@@ -70,7 +70,7 @@ impl Log for MemLog {
     fn entry<W: Write>(&self, index: LogIndex, buf: Option<W>) -> Result<Term, Error> {
         match self.entries.get((index - 1).as_u64() as usize) {
             Some(&(term, ref bytes)) => {
-                if let Some(buf) = buf {
+                if let Some(mut buf) = buf {
                     buf.write(&bytes)?;
                 };
                 Ok(term)
@@ -84,7 +84,9 @@ impl Log for MemLog {
         from: LogIndex,
         entries: I,
     ) -> result::Result<(), Self::Error> {
-        assert!(self.latest_log_index().unwrap() + 1 >= from);
+        if self.latest_log_index()? + 1 < from {
+            return Err(Error::BadLogIndex);
+        }
 
         // TODO remove vector hack
         let mut entries_vec = Vec::new();
@@ -104,7 +106,7 @@ mod test {
     use super::*;
 
     use {LogIndex, ServerId, Term};
-    use persistent_log::{append_entries, Log};
+    use persistent_log::{append_entries, get_entry, Log};
 
     #[test]
     fn test_current_term() {
@@ -146,21 +148,22 @@ mod test {
         ).unwrap();
         assert_eq!(LogIndex::from(4), store.latest_log_index().unwrap());
         assert_eq!(Term::from(1), store.latest_log_term().unwrap());
+
         assert_eq!(
-            (Term::from(0), &*vec![1u8]),
-            store.entry(LogIndex::from(1)).unwrap()
+            (Term::from(0), vec![1u8]),
+            get_entry(&store, LogIndex::from(1))
         );
         assert_eq!(
-            (Term::from(0), &*vec![2u8]),
-            store.entry(LogIndex::from(2)).unwrap()
+            (Term::from(0), vec![2u8]),
+            get_entry(&store, LogIndex::from(2))
         );
         assert_eq!(
-            (Term::from(0), &*vec![3u8]),
-            store.entry(LogIndex::from(3)).unwrap()
+            (Term::from(0), vec![3u8]),
+            get_entry(&store, LogIndex::from(3))
         );
         assert_eq!(
-            (Term::from(1), &*vec![4u8]),
-            store.entry(LogIndex::from(4)).unwrap()
+            (Term::from(1), vec![4u8]),
+            get_entry(&store, LogIndex::from(4))
         );
 
         // [0.1, 0.2, 0.3]
@@ -168,16 +171,16 @@ mod test {
         assert_eq!(LogIndex(3), store.latest_log_index().unwrap());
         assert_eq!(Term::from(0), store.latest_log_term().unwrap());
         assert_eq!(
-            (Term::from(0), &*vec![1u8]),
-            store.entry(LogIndex::from(1)).unwrap()
+            (Term::from(0), vec![1u8]),
+            get_entry(&store, LogIndex::from(1))
         );
         assert_eq!(
-            (Term::from(0), &*vec![2u8]),
-            store.entry(LogIndex::from(2)).unwrap()
+            (Term::from(0), vec![2u8]),
+            get_entry(&store, LogIndex::from(2))
         );
         assert_eq!(
-            (Term::from(0), &*vec![3u8]),
-            store.entry(LogIndex::from(3)).unwrap()
+            (Term::from(0), vec![3u8]),
+            get_entry(&store, LogIndex::from(3))
         );
 
         // [0.1, 0.2, 2.3, 3.4]
@@ -189,20 +192,20 @@ mod test {
         assert_eq!(LogIndex(4), store.latest_log_index().unwrap());
         assert_eq!(Term::from(3), store.latest_log_term().unwrap());
         assert_eq!(
-            (Term::from(0), &*vec![1u8]),
-            store.entry(LogIndex::from(1)).unwrap()
+            (Term::from(0), vec![1u8]),
+            get_entry(&store, LogIndex::from(1))
         );
         assert_eq!(
-            (Term::from(0), &*vec![2u8]),
-            store.entry(LogIndex::from(2)).unwrap()
+            (Term::from(0), vec![2u8]),
+            get_entry(&store, LogIndex::from(2))
         );
         assert_eq!(
-            (Term::from(2), &*vec![3u8]),
-            store.entry(LogIndex::from(3)).unwrap()
+            (Term::from(2), vec![3u8]),
+            get_entry(&store, LogIndex::from(3))
         );
         assert_eq!(
-            (Term::from(3), &*vec![4u8]),
-            store.entry(LogIndex::from(4)).unwrap()
+            (Term::from(3), vec![4u8]),
+            get_entry(&store, LogIndex::from(4))
         );
     }
 }

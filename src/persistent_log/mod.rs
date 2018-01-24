@@ -51,26 +51,18 @@ pub trait Log: Clone + Debug + 'static {
     fn entry<W: Write>(&self, index: LogIndex, buf: Option<W>)
         -> result::Result<Term, Self::Error>;
 
-    // fn entry(&self, index: LogIndex) -> Result<(Term, &[u8]), Self::Error>;
-
-    ///// Returns the given range of entries (excluding the right endpoint).
-    fn entries(
-        &self,
-        lo: LogIndex,
-        hi: LogIndex,
-    ) -> result::Result<Vec<(Term, &[u8])>, Self::Error> {
-        unimplemented!()
-    }
-    //// TODO: can make LogIndex compatible for use in ranges.
-    //(lo.as_u64()..hi.as_u64())
-    //.map(|index| {
-    ////                let mut v = Vec::new();
-    ////let term = self.entry(LogIndex::from(index), &mut v);
-    ////(term, v.as_slice())
-
-    //self.entry(LogIndex::from(index))
-    //})
-    //.collect::<Result<_, _>>()
+    // /// Returns the given range of entries (excluding the right endpoint). Allocates.
+    //fn entries(
+    //&self,
+    //lo: LogIndex,
+    //hi: LogIndex,
+    //) -> result::Result<Vec<(Term, Vec<u8>)>, Self::Error> {
+    //let mut v = Vec::new();
+    //for index in lo.as_u64()..hi.as_u64() {
+    //let mut entry = Vec::new();
+    //let term = self.entry(LogIndex::from(index), &mut entry)?;
+    //v.push((term, v));
+    //}
     //}
 
     /// Appends the provided entries to the log beginning at the given index.
@@ -80,17 +72,6 @@ pub trait Log: Clone + Debug + 'static {
         entries: I,
     ) -> result::Result<(), Self::Error>;
 }
-
-
-///// Error type for `FsLog` and `MemLog`
-//#[derive(Fail, Debug)]
-//#[fail(display = "Consensus error")]
-//pub enum Error {
-//#[fail(display = "Log file version mismatch {} instead of {}", _0, _1)] Version(u64, u64),
-//#[fail(display = "Bad index requested")] BadIndex,
-//#[fail(display = "Log index out of bounds")] BadLogIndex,
-//#[fail(display = "Log I/O error")] Io(#[cause] ::std::io::Error),
-//}
 
 #[derive(Debug)]
 pub enum Error {

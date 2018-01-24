@@ -1,19 +1,7 @@
 /// Module contains message types used in consensus
 /// Any network message have to be converted to theese enums to be processed
-use {LogIndex, ServerId, Term};
+use {Entry, LogIndex, ServerId, Term};
 use state::ConsensusState;
-
-#[derive(Debug, Clone)]
-pub struct Entry {
-    pub term: Term,
-    pub data: Vec<u8>,
-}
-
-impl Entry {
-    pub fn new(term: Term, data: Vec<u8>) -> Self {
-        Self { term, data }
-    }
-}
 
 //================= Peer messages
 

@@ -4,7 +4,7 @@ use std::cmp;
 use std::io::Cursor;
 
 
-use {ClientId, LogIndex, ServerId, Term};
+use {ClientId, Entry, LogIndex, ServerId, Term};
 use state::{CandidateState, ConsensusState, FollowerState, LeaderState};
 use message::*;
 use error::Error;
@@ -319,25 +319,20 @@ where
             let from_index = next_index;
             let until_index = local_latest_log_index + 1;
 
-            let entries = self.log
-                .entries(LogIndex::from(from_index), LogIndex::from(until_index))
-                .unwrap()
-                .into_iter()
-                .map(|(term, slice)| {
-                    Entry {
-                        term,
-                        data: slice.to_vec(),
-                    }
-                })
-                .collect();
-
-            let message = AppendEntriesRequest {
+            let mut message = AppendEntriesRequest {
                 term: local_term,
                 prev_log_index,
                 prev_log_term,
-                entries: entries,
+                entries: Vec::new(),
                 leader_commit: self.commit_index,
             };
+
+            for idx in from_index.as_u64()..until_index.as_u64() {
+                let mut v = Vec::new();
+                let term = self.with_log(|log| log.entry(LogIndex(idx), Some(&mut v)))?;
+
+                message.entries.push(Entry::new(term, v));
+            }
 
             self.leader_state
                 .set_next_index(from, local_latest_log_index + 1);
@@ -785,24 +780,20 @@ where
                     self.with_log(|log| log.entry::<Vec<_>>(prev_log_index, None))?
                 };
 
-                let entries = self.log
-                    .entries(peer_index, until_index)
-                    .map_err(|e| Error::PersistentLog(Box::new(e)))?;
-
-                // TODO: we're getting double collect() here
-                let entries_vec = entries
-                    .iter()
-                    .map(|&(term, ref data)| Entry::new(term, data.to_vec()))
-                    .collect();
-
-                let message = AppendEntriesRequest {
+                let mut message = AppendEntriesRequest {
                     term: self.current_term(),
                     prev_log_index: prev_log_index,
                     prev_log_term: prev_log_term,
                     leader_commit: self.commit_index,
-                    entries: entries_vec,
+                    entries: Vec::new(),
                 };
 
+                for idx in peer_index.as_u64()..until_index.as_u64() {
+                    let mut v = Vec::new();
+                    let term = self.with_log(|log| log.entry(LogIndex(idx), Some(&mut v)))?;
+
+                    message.entries.push(Entry::new(term, v));
+                }
                 // For stateless/lossy  connections we cannot be sure if peer has received
                 // our entries, so we call set_next_index only after response, which
                 // is done in response processing code
@@ -839,8 +830,11 @@ where
     fn apply_commits(&mut self) -> HashMap<LogIndex, Vec<u8>> {
         let mut results = HashMap::new();
         while self.last_applied < self.commit_index {
+            let mut entry = Vec::new();
             // Unwrap justified here since we know there is an entry in the log.
-            let (_, entry) = self.log.entry(self.last_applied + 1).unwrap();
+            self.log
+                .entry(self.last_applied + 1, Some(&mut entry))
+                .unwrap();
 
             if !entry.is_empty() {
                 let result = self.state_machine.apply(&entry);

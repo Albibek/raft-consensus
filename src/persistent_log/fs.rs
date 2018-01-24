@@ -149,19 +149,13 @@ impl FsLog {
         from: LogIndex,
         entries: &mut [(Term, R)],
     ) -> Result<()> {
-        if self.latest_log_index()? + 1 >= from {
+        if self.latest_log_index()? + 1 < from {
             return Err(Error::BadLogIndex);
         }
         let mut index = (from - 1).as_u64() as usize;
         self.truncate_file(index)?;
         self.entries.truncate(index);
         self.offsets.truncate(index);
-        //I
-        //self.entries.extend(
-        //entries
-        //.iter()
-        //.map(|&(term, command)| (term, command.to_vec())),
-        //);
         for &mut (term, ref mut reader) in entries {
             let mut v = Vec::new();
             reader.read_to_end(&mut v)?;
@@ -221,7 +215,7 @@ impl Log for FsLog {
     fn entry<W: Write>(&self, index: LogIndex, buf: Option<W>) -> Result<Term> {
         match self.entries.get((index - 1).as_u64() as usize) {
             Some(&(term, ref bytes)) => {
-                if let Some(buf) = buf {
+                if let Some(mut buf) = buf {
                     buf.write(&bytes)?;
                 };
                 Ok(term)
@@ -236,7 +230,9 @@ impl Log for FsLog {
         from: LogIndex,
         entries: I,
     ) -> result::Result<(), Self::Error> {
-        assert!(self.latest_log_index()? + 1 >= from);
+        if self.latest_log_index()? + 1 < from {
+            return Err(Error::BadLogIndex);
+        }
         let from_idx = (from - 1).as_u64() as usize;
 
         // TODO remove vector hack
