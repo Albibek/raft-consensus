@@ -1,0 +1,14 @@
+[package]
+name = "raft-consensus"
+version = "0.1.0"
+authors = ["Albibek <albibek@gmail.com>"]
+
+[dependencies]
+uuid= {version= "^0.5", features=["use_std", "v4"]}
+byteorder="^1.2"
+failure_derive="^0.1"
+failure="^0.1"
+log={version="^0.4", features=["release_max_level_warn", "max_level_trace"] }
+
+[dev-dependencies]
+pretty_env_logger="^0.2"
