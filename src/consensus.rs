@@ -949,12 +949,17 @@ mod test {
         }
 
         // Applies the actions to the consensus peers (recursively applying any resulting
-        // actions), and TODO: returns any client messages.
-        fn apply_peer_messages(&mut self) -> HashMap<ServerId, HashSet<ConsensusTimeout>> {
+        // actions) and returns any client messages and set timeouts.
+        fn apply_peer_messages(
+            &mut self,
+        ) -> (
+            HashMap<ServerId, HashSet<ConsensusTimeout>>,
+            HashMap<ClientId, Vec<ClientResponse>>,
+        ) {
             trace!("apply peer messages");
             let mut queue: VecDeque<(ServerId, ServerId, PeerMessage)> = VecDeque::new();
             let mut timeouts: HashMap<ServerId, HashSet<ConsensusTimeout>> = HashMap::new();
-            // TODO timeouts
+            let mut client_messages: HashMap<ClientId, Vec<ClientResponse>> = HashMap::new();
             for (peer, mut consensus) in self.peers.iter_mut() {
                 for (to, messages) in consensus.handler.peer_messages.drain() {
                     for message in messages.into_iter() {
@@ -970,9 +975,10 @@ mod test {
                     }
                 }
 
+                client_messages.extend(consensus.handler.client_messages.clone());
                 consensus.handler.clear();
             }
-            trace!("Queue: {:?}", queue);
+            trace!("Initial queue: {:?}", queue);
             while let Some((from, to, message)) = queue.pop_front() {
                 let mut peer_consensus = self.peers.get_mut(&to).unwrap();
                 peer_consensus.apply_peer_message(from, message).unwrap();
@@ -992,9 +998,10 @@ mod test {
                     }
                 }
 
+                client_messages.extend(peer_consensus.handler.client_messages.clone());
                 peer_consensus.handler.clear();
             }
-            timeouts
+            (timeouts, client_messages)
         }
 
         fn into_peers(self) -> HashMap<ServerId, TestPeer> {
@@ -1120,153 +1127,123 @@ mod test {
         );
     }
 
-    ///// Emulates a slow heartbeat message in a two-node cluster.
-    /////
-    ///// The initial leader (Consensus 0) sends a heartbeat, but before it is received by the follower
-    ///// (Consensus 1), Consensus 1's election timeout fires. Consensus 1 transitions to candidate state
-    ///// and attempts to send a RequestVote to Consensus 0. When the partition is fixed, the
-    ///// RequestVote should prompt Consensus 0 to step down. Consensus 1 should send a stale term
-    ///// message in response to the heartbeat from Consensus 0.
-    //#[test]
-    //fn test_slow_heartbeat() {
-    //setup_test!("test_heartbeat");
-    //let mut peers = new_cluster(2);
-    //let peer_ids: Vec<ServerId> = peers.keys().cloned().collect();
-    //let peer_0 = &peer_ids[0];
-    //let peer_1 = &peer_ids[1];
-    //elect_leader(peer_0.clone(), &mut peers);
+    /// Emulates a slow heartbeat message in a two-node cluster.
+    ///
+    /// The initial leader (Consensus 0) sends a heartbeat, but before it is received by the follower
+    /// (Consensus 1), Consensus 1's election timeout fires. Consensus 1 transitions to candidate state
+    /// and attempts to send a RequestVote to Consensus 0. When the partition is fixed, the
+    /// RequestVote should prompt Consensus 0 to step down. Consensus 1 should send a stale term
+    /// message in response to the heartbeat from Consensus 0.
+    #[test]
+    fn test_slow_heartbeat() {
+        let mut cluster = TestCluster::new(2);
+        let peer_ids: Vec<ServerId> = cluster.peers.keys().cloned().collect();
+        let peer_0 = &peer_ids[0];
+        let peer_1 = &peer_ids[1];
+        cluster.elect_leader(peer_0.clone());
 
-    //let mut peer_0_actions = Actions::new();
-    //peers.get_mut(peer_0).unwrap().apply_timeout(
-    //ConsensusTimeout::Heartbeat(
-    //*peer_1,
-    //),
-    //&mut peer_0_actions,
-    //);
-    //assert!(peers[peer_0].is_leader());
+        cluster
+            .peers
+            .get_mut(peer_0)
+            .unwrap()
+            .apply_timeout(ConsensusTimeout::Heartbeat(*peer_1))
+            .unwrap();
+        assert!(cluster.peers[peer_0].is_leader());
 
-    //let mut peer_1_actions = Actions::new();
-    //peers.get_mut(peer_1).unwrap().apply_timeout(
-    //ConsensusTimeout::Election,
-    //&mut peer_1_actions,
-    //);
-    //assert!(peers[peer_1].is_candidate());
+        cluster
+            .peers
+            .get_mut(peer_1)
+            .unwrap()
+            .apply_timeout(ConsensusTimeout::Election)
+            .unwrap();
+        assert!(cluster.peers[peer_1].is_candidate());
+        cluster.apply_peer_messages();
+        // Apply candidate messages.
+        assert!(cluster.peers[peer_0].is_follower());
+        assert!(cluster.peers[peer_1].is_leader());
 
-    //// Apply candidate messages.
-    //assert!(apply_actions(*peer_1, peer_1_actions, &mut peers).is_empty());
-    //assert!(peers[peer_0].is_follower());
-    //assert!(peers[peer_1].is_leader());
+        // Apply stale heartbeat.
+        assert!(cluster.peers[peer_0].is_follower());
+        assert!(cluster.peers[peer_1].is_leader());
+    }
 
-    //// Apply stale heartbeat.
-    //assert!(apply_actions(*peer_0, peer_0_actions, &mut peers).is_empty());
-    //assert!(peers[peer_0].is_follower());
-    //assert!(peers[peer_1].is_leader());
-    //}
+    /// Tests that a client proposal is correctly replicated to peers, and the client is notified
+    /// of the success.
+    #[test]
+    fn test_proposal() {
+        // Test various sizes.
+        for size in 1..7 {
+            trace!("testing size {} cluster", size);
+            let mut cluster = TestCluster::new(size);
+            let peer_ids: Vec<ServerId> = cluster.peers.keys().cloned().collect();
+            let leader = &peer_ids[0];
+            cluster.elect_leader(leader.clone());
 
-    ///// Tests that a client proposal is correctly replicated to peers, and the client is notified
-    ///// of the success.
-    //#[test]
-    //fn test_proposal() {
-    //setup_test!("test_proposal");
-    //// Test various sizes.
-    //for i in 1..7 {
-    //debug!("testing size {} cluster", i);
-    //let mut peers = new_cluster(i);
-    //let peer_ids: Vec<ServerId> = peers.keys().cloned().collect();
-    //let leader = peer_ids[0];
-    //elect_leader(leader, &mut peers);
+            assert!(cluster.peers[leader].is_leader());
 
-    //let value: &[u8] = b"foo";
-    //let proposal = into_reader(&messages::proposal_request(value));
-    //let mut actions = Actions::new();
+            let value = b"foo".to_vec();
+            let proposal = ClientRequest::Proposal(value.clone());
+            let client = ClientId::new();
 
-    //let client = ClientId::new();
+            cluster
+                .peers
+                .get_mut(&leader)
+                .unwrap()
+                .apply_client_message(client, proposal)
+                .unwrap();
+            let (_, client_messages) = cluster.apply_peer_messages();
+            assert_eq!(1, client_messages.len());
 
-    //peers.get_mut(&leader).unwrap().apply_client_message(
-    //client,
-    //&proposal,
-    //&mut actions,
-    //);
+            for (_, peer) in cluster.peers {
+                let mut entry = Vec::new();
+                let term = peer.log.entry(LogIndex(1), Some(&mut entry)).unwrap();
+                assert_eq!(Term(1), term);
+                assert_eq!(value, entry);
+            }
+        }
+    }
 
-    //let client_messages = apply_actions(leader, actions, &mut peers);
-    //assert_eq!(1, client_messages.len());
-    //for peer in peers.values() {
-    //assert_eq!((Term(1), value), peer.log.entry(LogIndex(1)).unwrap());
-    //}
-    //}
-    //}
+    #[test]
+    // Verify that out-of-order appends don't lead to the log tail being
+    // dropped. See https://github.com/ktoso/akka-raft/issues/66; it's
+    // not actually something that can happen in practice with TCP, but
+    // wise to avoid it altogether.
+    fn test_append_reorder() {
+        let mut cluster = TestCluster::new(2);
+        let peer_ids: Vec<ServerId> = cluster.peers.keys().cloned().collect();
+        let follower = cluster.peers.get_mut(&ServerId(0)).unwrap();
 
-    //#[test]
-    //// Verify that out-of-order appends don't lead to the log tail being
-    //// dropped. See https://github.com/ktoso/akka-raft/issues/66; it's
-    //// not actually something that can happen in practice with TCP, but
-    //// wise to avoid it altogether.
-    //fn test_append_reorder() {
-    //setup_test!("test_append_reorder");
-    //let mut peers = new_cluster(2);
-    //let peer_ids: Vec<ServerId> = peers.keys().cloned().collect();
-    //let mut actions = Actions::new();
-    //let mut follower = peers.get_mut(&peer_ids[0]).unwrap();
-    //let value: &[u8] = b"foo";
-    //let entries = vec![(Term(1), value), (Term(1), value)];
-    //let msg1 = into_reader(&*messages::append_entries_request(
-    //Term(1),
-    //LogIndex(0),
-    //Term(0),
-    //&entries,
-    //LogIndex(0),
-    //));
-    //let msg2 = into_reader(&*messages::append_entries_request(
-    //Term(1),
-    //LogIndex(0),
-    //Term(0),
-    //&entries[0..1],
-    //LogIndex(0),
-    //));
-    //follower.apply_peer_message(peer_ids[1], &msg1, &mut actions);
-    //follower.apply_peer_message(peer_ids[1], &msg2, &mut actions);
+        let value = b"foo".to_vec();
+        let entries = vec![
+            Entry::new(Term(1), value.clone()),
+            Entry::new(Term(1), value.clone()),
+        ];
+        let msg1 = PeerMessage::AppendEntriesRequest(AppendEntriesRequest {
+            term: Term(1),
+            prev_log_index: LogIndex(0),
+            prev_log_term: Term(0),
+            leader_commit: LogIndex(0),
+            entries: entries.clone(),
+        });
 
-    //assert_eq!((Term(1), value), follower.log.entry(LogIndex(1)).unwrap());
-    //assert_eq!((Term(1), value), follower.log.entry(LogIndex(2)).unwrap());
-    //}
+        let mut unordered = entries.clone();
+        unordered.pop();
+        let msg2 = PeerMessage::AppendEntriesRequest(AppendEntriesRequest {
+            term: Term(1),
+            prev_log_index: LogIndex(0),
+            prev_log_term: Term(0),
+            leader_commit: LogIndex(0),
+            entries: unordered,
+        });
 
-    //#[bench]
-    //fn bench_proposal_1(b: &mut test::Bencher) {
-    //bench_n(b, 1)
-    //}
+        follower.apply_peer_message(peer_ids[1], msg1).unwrap();
+        follower.apply_peer_message(peer_ids[1], msg2).unwrap();
 
-    //#[bench]
-    //fn bench_proposal_3(b: &mut test::Bencher) {
-    //bench_n(b, 3)
-    //}
-
-    //#[bench]
-    //fn bench_proposal_5(b: &mut test::Bencher) {
-    //bench_n(b, 5)
-    //}
-
-    //fn bench_n(b: &mut test::Bencher, size: u64) {
-    //let mut peers = new_cluster(size);
-    //let peer_ids: Vec<ServerId> = peers.keys().cloned().collect();
-    //let leader = peer_ids[0];
-    //elect_leader(leader, &mut peers);
-
-    //let value: &[u8] = b"foo";
-    //let proposal = into_reader(&messages::proposal_request(value));
-    //let client = ClientId::new();
-
-
-    //b.iter(|| {
-    //let mut actions = Actions::new();
-    //peers.get_mut(&leader).unwrap().apply_client_message(
-    //client,
-    //&proposal,
-    //&mut actions,
-    //);
-
-    //let client_messages = apply_actions(leader, actions, &mut peers);
-    //assert_eq!(1, client_messages.len());
-    //});
-    //}
-    //}
+        let mut entry1 = Vec::new();
+        let term1 = follower.log.entry(LogIndex(1), Some(&mut entry1)).unwrap();
+        let mut entry2 = Vec::new();
+        let term2 = follower.log.entry(LogIndex(2), Some(&mut entry2)).unwrap();
+        assert_eq!((Term(1), &value), (term1, &entry1));
+        assert_eq!((Term(1), &value), (term2, &entry2));
+    }
 }
