@@ -1,6 +1,3 @@
-# Warning:
-The project is still incomplete, does not compile
-
 # raft-consensus
 Pure-rust, network-independent Raft consensus implementation
 
