@@ -4,11 +4,17 @@ version = "0.1.0"
 authors = ["Albibek <albibek@gmail.com>"]
 
 [dependencies]
-uuid= {version= "^0.5", features=["use_std", "v4"]}
+uuid = {version= "^0.5", features=["use_std", "v4"]}
 byteorder="^1.2"
 failure_derive="^0.1"
 failure="^0.1"
-log={version="^0.4", features=["release_max_level_warn", "max_level_trace"] }
+log = {version="^0.4", features=["release_max_level_warn", "max_level_trace"] }
+serde = { version = "^1.0", optional = true }
+serde_derive = { version = "^1.0", optional = true }
 
 [dev-dependencies]
 pretty_env_logger="^0.2"
+
+[features]
+default = []
+use_serde = ["serde", "serde_derive", "uuid/serde" ]

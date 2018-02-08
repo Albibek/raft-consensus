@@ -13,6 +13,7 @@ use ServerId;
 ///                  (if it gets enough votes) or a `Follower`, if it hears from
 ///                  a `Leader`.
 #[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
 pub enum ConsensusState {
     Follower,
     Candidate,

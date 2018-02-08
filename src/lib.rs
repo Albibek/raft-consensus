@@ -8,6 +8,12 @@ extern crate log;
 extern crate pretty_env_logger;
 extern crate uuid;
 
+#[cfg(feature = "use_serde")]
+extern crate serde;
+#[cfg(feature = "use_serde")]
+#[cfg_attr(feature = "serde", macro_use)]
+extern crate serde_derive;
+
 pub mod error;
 pub mod state_machine;
 pub mod persistent_log;
@@ -27,6 +33,7 @@ use uuid::Uuid;
 
 /// The term of a log entry.
 #[derive(Copy, Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
+#[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
 pub struct Term(pub u64);
 impl Term {
     pub fn as_u64(self) -> u64 {
@@ -76,6 +83,7 @@ impl fmt::Display for Term {
 
 /// The index of a log entry.
 #[derive(Copy, Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
+#[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
 pub struct LogIndex(pub u64);
 impl LogIndex {
     pub fn as_u64(self) -> u64 {
@@ -136,6 +144,7 @@ impl fmt::Display for LogIndex {
 /// The ID of a Raft server. Must be unique among the participants in a
 /// consensus group.
 #[derive(Copy, Clone, Hash, PartialEq, Eq, Ord, PartialOrd, Debug)]
+#[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
 pub struct ServerId(pub u64);
 
 impl ServerId {
@@ -164,6 +173,7 @@ impl fmt::Display for ServerId {
 
 /// The ID of a Raft client.
 #[derive(Copy, Clone, Hash, PartialEq, Eq, Debug)]
+#[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
 pub struct ClientId(pub Uuid);
 impl ClientId {
     pub fn new() -> ClientId {
@@ -189,6 +199,7 @@ impl fmt::Display for ClientId {
 
 /// Type representing a log entry
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
 pub struct Entry {
     pub term: Term,
     pub data: Vec<u8>,
