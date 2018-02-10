@@ -6,6 +6,7 @@ use state::ConsensusState;
 //================= Peer messages
 
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
 /// Any message that cluster peers can exchange
 pub enum PeerMessage {
     AppendEntriesRequest(AppendEntriesRequest),
@@ -15,6 +16,7 @@ pub enum PeerMessage {
 }
 
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
 /// Request for Raft AppendEntriesRPC
 pub struct AppendEntriesRequest {
     /// The leader's term.
@@ -35,6 +37,7 @@ pub struct AppendEntriesRequest {
 }
 
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
 /// Response for Raft AppendEntriesRPC
 pub enum AppendEntriesResponse {
     Success(Term, LogIndex),
@@ -44,6 +47,7 @@ pub enum AppendEntriesResponse {
 }
 
 #[derive(Clone, Debug)]
+#[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
 /// Request for Raft voting RPC
 pub struct RequestVoteRequest {
     /// The candidate's term.
@@ -57,6 +61,7 @@ pub struct RequestVoteRequest {
 }
 
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
 /// Response for Raft voting RPC
 pub enum RequestVoteResponse {
     StaleTerm(Term),
@@ -78,6 +83,7 @@ impl RequestVoteResponse {
 
 //================= Client messages
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
 pub enum ClientRequest {
     Ping,
     Proposal(Vec<u8>),
@@ -85,6 +91,7 @@ pub enum ClientRequest {
 }
 
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
 pub enum ClientResponse {
     Ping(PingResponse),
     Proposal(CommandResponse),
@@ -92,6 +99,7 @@ pub enum ClientResponse {
 }
 
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
 pub struct PingResponse {
     /// The server's current term
     pub(crate) term: Term,
@@ -104,6 +112,7 @@ pub struct PingResponse {
 }
 
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
 pub enum CommandResponse {
     Success(Vec<u8>),
 
@@ -124,6 +133,7 @@ pub enum CommandResponse {
 
 /// Consensus timeout types.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+#[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
 pub enum ConsensusTimeout {
     // An election timeout. Randomized value.
     Election,
