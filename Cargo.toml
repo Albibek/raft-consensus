@@ -1,7 +1,9 @@
 [package]
 name = "raft-consensus"
+description = "Raft consensus algorithm implementation"
 version = "0.1.3"
 authors = ["Albibek <albibek@gmail.com>"]
+license = "MIT"
 
 [dependencies]
 uuid = {version= "^0.5", features=["use_std", "v4"]}
