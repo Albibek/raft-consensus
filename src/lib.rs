@@ -11,25 +11,46 @@ extern crate uuid;
 #[cfg(feature = "use_serde")]
 extern crate serde;
 #[cfg(feature = "use_serde")]
-#[cfg_attr(feature = "serde", macro_use)]
+#[cfg_attr(feature = "use_serde", macro_use)]
 extern crate serde_derive;
+
+#[cfg(feature = "use_capnp")]
+extern crate capnp;
 
 pub mod error;
 pub mod state_machine;
 pub mod persistent_log;
 
-pub(crate) mod state;
+
 /// Implementation of Raft consensus API
 pub mod consensus;
+
 /// Messages that are passed during consensus work
+#[cfg_attr(feature = "use_capnp", macro_use)]
 pub mod message;
+
+pub(crate) mod state;
 /// Handlers for consensus callbacks
 pub mod handler;
+
+/// Handle consensus from many threads
+pub mod shared;
+#[cfg(feature = "use_capnp")]
+pub mod messages_capnp {
+    //    #![allow(dead_code)]
+    include!(concat!(env!("OUT_DIR"), "/schema/messages_capnp.rs"));
+}
 
 use std::{fmt, ops};
 
 use error::Error;
 use uuid::Uuid;
+
+#[cfg(feature = "use_capnp")]
+use messages_capnp::entry;
+
+#[cfg(feature = "use_capnp")]
+use capnp::message::{Allocator, Builder, HeapAllocator, Reader, ReaderSegments};
 
 /// The term of a log entry.
 #[derive(Copy, Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
@@ -198,7 +219,7 @@ impl fmt::Display for ClientId {
 }
 
 /// Type representing a log entry
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
 pub struct Entry {
     pub term: Term,
@@ -215,4 +236,21 @@ impl From<Entry> for (Term, Vec<u8>) {
     fn from(e: Entry) -> (Term, Vec<u8>) {
         (e.term, e.data)
     }
+}
+
+#[cfg(feature = "use_capnp")]
+impl Entry {
+    pub fn from_capnp<'a>(reader: entry::Reader<'a>) -> Result<Self, Error> {
+        Ok(Entry {
+            term: reader.get_term().into(),
+            data: reader.get_data().map_err(Error::Capnp)?.to_vec(),
+        })
+    }
+
+    pub fn fill_capnp<'a>(&self, builder: &mut entry::Builder<'a>) {
+        builder.set_term(self.term.as_u64());
+        builder.set_data(&self.data);
+    }
+
+    common_capnp!(entry::Builder, entry::Reader);
 }
