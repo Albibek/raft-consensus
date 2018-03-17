@@ -61,10 +61,10 @@ pub struct Consensus<L, M, H> {
     follower_state: FollowerState,
 }
 
-// Most of the functions return the message type to answer and a timeout
-// timeout means caller should reset the previous consensus timeout
-// and set the new one to the one returned by function
-// see ConsensusTimeout docs for timeout types
+// Most of the functions return the message type to answer and a timeout.
+// Timeout means caller should reset the previous consensus timeout
+// and set the new one to the one returned by function.
+// See ConsensusTimeout docs for timeout types.
 impl<L, M, H> Consensus<L, M, H>
 where
     L: Log,
@@ -621,7 +621,7 @@ where
     M: StateMachine,
     H: ConsensusHandler,
 {
-    /// Triggers a timeout for the peer.
+    /// Triggered by external timeouts.
     pub fn apply_timeout(&mut self, timeout: ConsensusTimeout) -> Result<(), Error> {
         match timeout {
             ConsensusTimeout::Election => self.election_timeout()?,
@@ -635,7 +635,7 @@ where
         Ok(())
     }
 
-    /// Triggers a heartbeat timeout for the peer.
+    /// Triggered by a heartbeat timeout for the peer.
     pub fn heartbeat_timeout(&mut self, peer: ServerId) -> Result<AppendEntriesRequest, Error> {
         self.assert_leader()?;
         debug!("HeartbeatTimeout for peer: {}", peer);
@@ -648,7 +648,7 @@ where
         })
     }
 
-    /// Triggers an election timeout.
+    /// Triggered by an election timeout.
     pub fn election_timeout(&mut self) -> Result<(), Error> {
         if self.is_leader() {
             return Err(Error::MustNotLeader);

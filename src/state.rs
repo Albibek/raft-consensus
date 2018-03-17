@@ -4,6 +4,15 @@ use ClientId;
 use LogIndex;
 use ServerId;
 
+#[cfg(feature = "use_capnp")]
+use messages_capnp::*;
+
+#[cfg(feature = "use_capnp")]
+use error::Error;
+
+#[cfg(feature = "use_capnp")]
+use capnp::message::{Allocator, Builder, HeapAllocator, Reader, ReaderSegments};
+
 /// Consensus modules can be in one of three state:
 ///
 /// * `Follower` - which replicates AppendEntries requests and votes for it's leader.
@@ -18,6 +27,27 @@ pub enum ConsensusState {
     Follower,
     Candidate,
     Leader,
+}
+
+#[cfg(feature = "use_capnp")]
+impl ConsensusState {
+    pub fn from_capnp<'a>(reader: consensus_state::Reader<'a>) -> Result<Self, Error> {
+        match reader.which().map_err(Error::CapnpSchema)? {
+            consensus_state::Which::Follower(()) => Ok(ConsensusState::Follower),
+            consensus_state::Which::Candidate(()) => Ok(ConsensusState::Candidate),
+            consensus_state::Which::Leader(()) => Ok(ConsensusState::Leader),
+        }
+    }
+
+    pub fn fill_capnp<'a>(&self, builder: &mut consensus_state::Builder<'a>) {
+        match self {
+            &ConsensusState::Follower => builder.borrow().set_follower(()),
+            &ConsensusState::Candidate => builder.borrow().set_candidate(()),
+            &ConsensusState::Leader => builder.borrow().set_leader(()),
+        };
+    }
+
+    common_capnp!(consensus_state::Builder, consensus_state::Reader);
 }
 
 /// The state associated with a Raft consensus module in the `Leader` state.
