@@ -1,6 +1,5 @@
 use std::sync::{Arc, Mutex};
 
-
 use {ClientId, ServerId};
 use consensus::{Consensus, ConsensusHandler};
 use state_machine::StateMachine;

@@ -260,7 +260,6 @@ impl Log for FsLog {
     }
 }
 
-
 impl Clone for FsLog {
     fn clone(&self) -> FsLog {
         // Wish I didn't have to unwrap the filehandles...
@@ -284,7 +283,6 @@ impl Clone for FsLog {
         }
     }
 }
-
 
 #[cfg(test)]
 mod test {
@@ -384,7 +382,6 @@ mod test {
             LogIndex::from(2),
             &[(Term::from(0), &[2]), (Term::from(0), &[3])],
         ).unwrap();
-
 
         assert_entries_equal(
             &store,

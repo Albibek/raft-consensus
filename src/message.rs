@@ -329,6 +329,7 @@ impl RequestVoteResponse {
 //================= Client messages
 #[derive(Clone, Debug, PartialEq)]
 #[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
+/// Request from client.
 pub enum ClientRequest {
     Ping,
     Proposal(Vec<u8>),
@@ -365,6 +366,7 @@ impl ClientRequest {
 
 #[derive(Clone, Debug, PartialEq)]
 #[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
+/// Response to clienti request.
 pub enum ClientResponse {
     Ping(PingResponse),
     Proposal(CommandResponse),
@@ -416,6 +418,7 @@ impl ClientResponse {
 
 #[derive(Clone, Debug, PartialEq)]
 #[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
+/// Part of client message.
 pub struct PingResponse {
     /// The server's current term
     pub(crate) term: Term,

@@ -210,7 +210,6 @@ mod test {
     }
 }
 
-
 impl Default for MemLog {
     fn default() -> Self {
         MemLog::new()

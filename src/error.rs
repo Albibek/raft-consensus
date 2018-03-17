@@ -1,3 +1,4 @@
+//! Error type with all possible errors
 use std::error::Error as StdError;
 use uuid::ParseError;
 use {ServerId, Term};

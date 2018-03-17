@@ -3,7 +3,6 @@ use std::sync::mpsc;
 
 use state_machine::StateMachine;
 
-
 /// A state machine that simply redirects all commands to a channel.
 ///
 /// This state machine is chiefly meant for testing.

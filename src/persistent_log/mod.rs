@@ -99,7 +99,6 @@ impl error::Error for Error {
     }
 }
 
-
 #[cfg(test)]
 use std::io::Cursor;
 
@@ -116,7 +115,6 @@ pub(crate) fn append_entries<L: Log>(
     store.append_entries(from, entries)?;
     Ok(())
 }
-
 
 #[cfg(test)]
 // helper for easier test migration

@@ -3,7 +3,6 @@ use std::fmt::Debug;
 use std::cmp;
 use std::io::Cursor;
 
-
 use {ClientId, Entry, LogIndex, ServerId, Term};
 use state::{CandidateState, ConsensusState, FollowerState, LeaderState};
 use message::*;
@@ -19,8 +18,7 @@ pub trait ConsensusHandler: Debug {
     fn set_timeout(&mut self, timeout: ConsensusTimeout);
     fn clear_timeout(&mut self, timeout: ConsensusTimeout);
 
-    /// Called when the particular event has been fully processed
-    /// Useful for doing actions in batches
+    /// Called when the particular event has been fully processed. Useful for doing actions in batches
     fn done(&mut self) {}
 }
 
@@ -396,10 +394,7 @@ where
         debug!(
             "RequestVoteRequest from Consensus {{ id: {}, term: {}, latest_log_term: \
              {}, latest_log_index: {} }}",
-            &candidate,
-            candidate_term,
-            candidate_log_term,
-            candidate_log_index
+            &candidate, candidate_term, candidate_log_term, candidate_log_index
         );
         let local_term = self.current_term();
 
@@ -407,8 +402,7 @@ where
             info!(
                 "received RequestVoteRequest from Consensus {{ id: {}, term: {} }} \
                  with newer term; transitioning to Follower",
-                candidate,
-                candidate_term
+                candidate, candidate_term
             );
             self.transition_to_follower(candidate_term, candidate)?;
             candidate_term
@@ -461,8 +455,7 @@ where
             info!(
                 "received RequestVoteResponse from Consensus {{ id: {}, term: {} }} \
                  with newer term; transitioning to Follower",
-                from,
-                voter_term
+                from, voter_term
             );
             self.transition_to_follower(voter_term, from)
         } else if local_term > voter_term {
@@ -1098,7 +1091,6 @@ mod test {
             assert_eq!(*to, follower_id.clone());
             peer_messages[0].clone()
         };
-
 
         // Follower responds
         let follower_response = {

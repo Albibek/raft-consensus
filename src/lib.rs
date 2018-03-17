@@ -1,3 +1,17 @@
+//! # Raft
+//!
+//! This is a crate containing a Raft consensus protocol implementation and encoding/decoding
+//! helpers. This is a logic-only crate without any network implementations.
+//!
+//! To use this crate in implementation, one should do the following:
+//!
+//! * determine and implement(or take ready ones) state machine and persistent log implementations
+//!
+//! * pass all raft-related messages from receivers/transmitters to `Consensus` structure
+//!
+//! * define a CollectionHandle that which functions are called at different stages of consensus
+//! defining actions depending on receive/transmit environment
+
 extern crate byteorder;
 extern crate failure;
 #[macro_use]
@@ -20,7 +34,6 @@ extern crate capnp;
 pub mod error;
 pub mod state_machine;
 pub mod persistent_log;
-
 
 /// Implementation of Raft consensus API
 pub mod consensus;
@@ -45,6 +58,11 @@ use std::{fmt, ops};
 
 use error::Error;
 use uuid::Uuid;
+
+pub use consensus::{Consensus, ConsensusHandler};
+pub use shared::SharedConsensus;
+pub use persistent_log::Log;
+pub use state_machine::StateMachine;
 
 #[cfg(feature = "use_capnp")]
 use messages_capnp::entry;
