@@ -899,6 +899,7 @@ where
 }
 
 #[derive(Debug, Clone)]
+/// Convenience wrapper over consensus, providing single handler
 pub struct HandledConsensus<L, M, H> {
     inner: Consensus<L, M>,
 
