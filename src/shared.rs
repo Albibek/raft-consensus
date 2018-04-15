@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use {ClientId, ServerId};
-use consensus::{Consensus, ConsensusHandler};
+use consensus::{ConsensusHandler, HandledConsensus};
 use state_machine::StateMachine;
 use persistent_log::Log;
 use message::*;
@@ -11,7 +11,7 @@ use error::Error;
 /// Based on standard `Arc<Mutex<_>>` approach
 #[derive(Debug, Clone)]
 pub struct SharedConsensus<L, M, H> {
-    inner: Arc<Mutex<Consensus<L, M, H>>>,
+    inner: Arc<Mutex<HandledConsensus<L, M, H>>>,
 }
 
 impl<L, M, H> SharedConsensus<L, M, H>
@@ -20,7 +20,7 @@ where
     M: StateMachine,
     H: ConsensusHandler,
 {
-    pub fn new(consensus: Consensus<L, M, H>) -> Self {
+    pub fn new(consensus: HandledConsensus<L, M, H>) -> Self {
         Self {
             inner: Arc::new(Mutex::new(consensus)),
         }
