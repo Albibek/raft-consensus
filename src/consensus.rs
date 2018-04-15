@@ -1049,7 +1049,10 @@ mod test {
         assert!(peer.is_leader());
         assert!(peer.handler.peer_messages.is_empty());
         assert!(peer.handler.client_messages.is_empty());
-        assert!(peer.handler.timeouts.is_empty());
+        // make sure all timeouts are clear
+        for to in peer.handler.timeouts {
+            assert!(peer.handler.clear_timeouts.iter().any(|&t| t == to))
+        }
     }
 
     /// A simple election test over multiple group sizes.
