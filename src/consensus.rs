@@ -113,7 +113,7 @@ where
                 request.map(PeerMessage::AppendEntriesRequest)
             }
             PeerMessage::RequestVoteRequest(request) => {
-                let response = self.request_vote_request(from, request)?;
+                let response = self.request_vote_request(handler, from, request)?;
                 Some(PeerMessage::RequestVoteResponse(response))
             }
 
@@ -215,7 +215,7 @@ where
             }
             ConsensusState::Candidate => {
                 // recognize the new leader, return to follower state, and apply the entries
-                self.transition_to_follower(leader_term, from)?;
+                self.transition_to_follower(handler, leader_term, from)?;
                 // previously the latter ^^ did set the timeout to true and pushed election timeout to
                 // actions
                 handler.set_timeout(ConsensusTimeout::Election);
@@ -232,7 +232,7 @@ where
                 }
 
                 // recognize the new leader, return to follower state, and apply the entries
-                self.transition_to_follower(leader_term, from)?;
+                self.transition_to_follower(handler, leader_term, from)?;
                 self.append_entries_request(handler, from, request)
             }
         }
@@ -256,7 +256,7 @@ where
             | AppendEntriesResponse::StaleTerm(term)
             | AppendEntriesResponse::InconsistentPrevEntry(term, _) if local_term < term =>
             {
-                self.transition_to_follower(term, from)?;
+                self.transition_to_follower(handler, term, from)?;
                 handler.set_timeout(ConsensusTimeout::Election);
                 return Ok(None);
             }
@@ -379,8 +379,9 @@ where
     }
 
     /// Applies a peer request vote request to the consensus state machine.
-    pub(crate) fn request_vote_request(
+    pub(crate) fn request_vote_request<H: ConsensusHandler>(
         &mut self,
+        handler: &mut H,
         candidate: ServerId,
         request: RequestVoteRequest,
     ) -> Result<RequestVoteResponse, Error> {
@@ -401,7 +402,7 @@ where
                  with newer term; transitioning to Follower",
                 candidate, candidate_term
             );
-            self.transition_to_follower(candidate_term, candidate)?;
+            self.transition_to_follower(handler, candidate_term, candidate)?;
             candidate_term
         } else {
             local_term
@@ -455,7 +456,7 @@ where
                  with newer term; transitioning to Follower",
                 from, voter_term
             );
-            self.transition_to_follower(voter_term, from)
+            self.transition_to_follower(handler, voter_term, from)
         } else if local_term > voter_term {
             // Ignore this message; it came from a previous election cycle.
             Ok(())
@@ -678,12 +679,23 @@ where
     /// Transitions the consensus state machine to Follower state with the provided term. The
     /// `voted_for` field will be reset. The provided leader hint will replace the last known
     /// leader.
-    fn transition_to_follower(&mut self, term: Term, leader: ServerId) -> Result<(), Error> {
+    fn transition_to_follower<H: ConsensusHandler>(
+        &mut self,
+        handler: &mut H,
+        term: Term,
+        leader: ServerId,
+    ) -> Result<(), Error> {
         self.log
             .set_current_term(term)
             .map_err(|e| Error::PersistentLog(Box::new(e)))?;
         self.state = ConsensusState::Follower;
         self.follower_state.set_leader(leader);
+
+        for &peer in self.peers.iter() {
+            handler.clear_timeout(ConsensusTimeout::Heartbeat(peer));
+        }
+
+        handler.set_timeout(ConsensusTimeout::Election);
         Ok(())
     }
 
@@ -737,7 +749,6 @@ where
 
         for &peer in self.peers.iter() {
             handler.send_peer_message(peer, PeerMessage::RequestVoteRequest(message.clone()));
-            handler.clear_timeout(ConsensusTimeout::Heartbeat(peer));
         }
         handler.set_timeout(ConsensusTimeout::Election);
         Ok(())
