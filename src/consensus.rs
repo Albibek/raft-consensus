@@ -475,7 +475,7 @@ where
     }
 }
 
-//==================== Client messages processing
+/// Client messages processing
 impl<L, M> Consensus<L, M>
 where
     L: Log,
@@ -599,7 +599,7 @@ where
     }
 }
 
-//==================== Timeouts
+/// Timeout handling
 impl<L, M> Consensus<L, M>
 where
     L: Log,
@@ -666,7 +666,7 @@ where
     }
 }
 
-//==================== State transitions
+/// State transitions handling
 impl<L, M> Consensus<L, M>
 where
     L: Log,
@@ -753,7 +753,7 @@ where
         Ok(())
     }
 }
-//==================== Utility functions
+/// Utility functions
 impl<L, M> Consensus<L, M>
 where
     L: Log,
