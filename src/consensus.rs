@@ -975,24 +975,13 @@ where
         self.inner.election_timeout(&mut self.handler)
     }
 
+    pub fn peer_connected(&mut self, peer: ServerId) -> Result<(), Error> {
+        self.inner.peer_connected(&mut self.handler, peer)
+    }
+
     /// Returns whether the consensus state machine is currently a Leader.
-    pub fn is_leader(&self) -> bool {
-        self.inner.is_leader()
-    }
-
-    /// Returns whether the consensus state machine is currently a Follower.
-    pub fn is_follower(&self) -> bool {
-        self.inner.is_follower()
-    }
-
-    /// Returns whether the consensus state machine is currently a Candidate.
-    pub fn is_candidate(&self) -> bool {
-        self.inner.is_candidate()
-    }
-
-    /// Get the cluster quorum majority size.
-    pub fn majority(&self) -> usize {
-        self.inner.majority()
+    pub fn get_state(&self) -> ConsensusState {
+        self.inner.get_state()
     }
 
     pub fn handler(&mut self) -> &mut H {
