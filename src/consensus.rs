@@ -848,17 +848,17 @@ where
     }
 
     /// Returns whether the consensus state machine is currently a Leader.
-    fn is_leader(&self) -> bool {
+    pub(crate) fn is_leader(&self) -> bool {
         self.state == ConsensusState::Leader
     }
 
     /// Returns whether the consensus state machine is currently a Follower.
-    fn is_follower(&self) -> bool {
+    pub(crate) fn is_follower(&self) -> bool {
         self.state == ConsensusState::Follower
     }
 
     /// Returns whether the consensus state machine is currently a Candidate.
-    fn is_candidate(&self) -> bool {
+    pub(crate) fn is_candidate(&self) -> bool {
         self.state == ConsensusState::Candidate
     }
 
@@ -891,7 +891,7 @@ where
     }
 
     /// Get the cluster quorum majority size.
-    fn majority(&self) -> usize {
+    pub(crate) fn majority(&self) -> usize {
         let peers = self.peers.len();
         // FIXME error processing
         let cluster_members = peers
@@ -982,6 +982,29 @@ where
     /// Returns whether the consensus state machine is currently a Leader.
     pub fn get_state(&self) -> ConsensusState {
         self.inner.get_state()
+    }
+
+    #[allow(dead_code)]
+    /// Returns whether the consensus state machine is currently a Leader.
+    pub(crate) fn is_leader(&self) -> bool {
+        self.inner.is_leader()
+    }
+
+    #[allow(dead_code)]
+    /// Returns whether the consensus state machine is currently a Follower.
+    pub(crate) fn is_follower(&self) -> bool {
+        self.inner.is_follower()
+    }
+
+    #[allow(dead_code)]
+    /// Returns whether the consensus state machine is currently a Candidate.
+    pub(crate) fn is_candidate(&self) -> bool {
+        self.inner.is_candidate()
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn majority(&self) -> usize {
+        self.inner.majority()
     }
 
     pub fn handler(&mut self) -> &mut H {
