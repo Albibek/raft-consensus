@@ -216,7 +216,7 @@ impl fmt::Display for ServerId {
 }
 
 /// The ID of a Raft client.
-#[derive(Copy, Clone, Hash, PartialEq, Eq, Debug)]
+#[derive(Copy, Clone, Hash, PartialEq, Eq, Debug, Default)]
 #[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
 pub struct ClientId(pub Uuid);
 impl ClientId {
@@ -229,9 +229,7 @@ impl ClientId {
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<ClientId, Error> {
-        Uuid::from_bytes(bytes)
-            .map(ClientId)
-            .map_err(|e| Error::Uuid(e))
+        Uuid::from_bytes(bytes).map(ClientId).map_err(Error::Uuid)
     }
 }
 

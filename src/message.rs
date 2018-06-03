@@ -284,11 +284,11 @@ impl From<RequestVoteResponse> for PeerMessage {
 
 impl RequestVoteResponse {
     pub fn voter_term(&self) -> Term {
-        match self {
-            &RequestVoteResponse::StaleTerm(t)
-            | &RequestVoteResponse::InconsistentLog(t)
-            | &RequestVoteResponse::Granted(t)
-            | &RequestVoteResponse::AlreadyVoted(t) => t,
+        match *self {
+            RequestVoteResponse::StaleTerm(t)
+            | RequestVoteResponse::InconsistentLog(t)
+            | RequestVoteResponse::Granted(t)
+            | RequestVoteResponse::AlreadyVoted(t) => t,
         }
     }
 }

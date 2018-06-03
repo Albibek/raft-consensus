@@ -49,10 +49,6 @@ pub struct Consensus<L, M> {
     follower_state: FollowerState,
 }
 
-// Most of the functions return the message type to answer and a timeout.
-// Timeout means caller should reset the previous consensus timeout
-// and set the new one to the one returned by function.
-// See ConsensusTimeout docs for timeout types.
 impl<L, M> Consensus<L, M>
 where
     L: Log,
@@ -70,14 +66,14 @@ where
         //.map_err(|e| Error::PersistentLog(Box::new(e)))?;
         let leader_state = LeaderState::new(latest_log_index, &peers.iter().cloned().collect());
         Ok(Self {
-            id: id,
-            peers: peers,
-            log: log,
-            state_machine: state_machine,
+            id,
+            peers,
+            log,
+            state_machine,
             commit_index: LogIndex(0),
             last_applied: LogIndex(0),
             state: ConsensusState::Follower,
-            leader_state: leader_state,
+            leader_state,
             candidate_state: CandidateState::new(),
             follower_state: FollowerState::new(),
         })
@@ -95,27 +91,30 @@ where
         from: ServerId,
         message: PeerMessage,
     ) -> Result<(), Error> {
+        let message = message; // This enforces a by-value move making clippy happy
         let response = match message {
-            PeerMessage::AppendEntriesRequest(request) => {
+            PeerMessage::AppendEntriesRequest(ref request) => {
                 let response = self.append_entries_request(handler, from, request)?;
                 Some(PeerMessage::AppendEntriesResponse(response))
             }
 
-            PeerMessage::AppendEntriesResponse(response) => {
+            PeerMessage::AppendEntriesResponse(ref response) => {
                 let request = self.append_entries_response(handler, from, response)?;
                 request.map(PeerMessage::AppendEntriesRequest)
             }
-            PeerMessage::RequestVoteRequest(request) => {
+            PeerMessage::RequestVoteRequest(ref request) => {
                 let response = self.request_vote_request(handler, from, request)?;
                 Some(PeerMessage::RequestVoteResponse(response))
             }
 
-            PeerMessage::RequestVoteResponse(response) => {
+            PeerMessage::RequestVoteResponse(ref response) => {
                 self.request_vote_response(handler, from, response)?;
                 None
             }
         };
-        response.map(|response| handler.send_peer_message(from, response));
+        if let Some(response) = response {
+            handler.send_peer_message(from, response)
+        }
         handler.done();
         Ok(())
     }
@@ -125,7 +124,7 @@ where
         &mut self,
         handler: &mut H,
         from: ServerId,
-        request: AppendEntriesRequest,
+        request: &AppendEntriesRequest,
     ) -> Result<AppendEntriesResponse, Error> {
         let leader_term = request.term;
         let current_term = self.current_term();
@@ -156,10 +155,9 @@ where
                         let existing_term = if leader_prev_log_index == LogIndex::from(0) {
                             Term::from(0)
                         } else {
-                            let term = self.log
+                            self.log
                                 .entry::<Vec<_>>(leader_prev_log_index, None)
-                                .map_err(|e| Error::PersistentLog(Box::new(e)))?;
-                            term
+                                .map_err(|e| Error::PersistentLog(Box::new(e)))?
                         };
 
                         if existing_term != leader_prev_log_term {
@@ -170,8 +168,8 @@ where
                                 leader_prev_log_index,
                             )
                         } else {
-                            if request.entries.len() > 0 {
-                                let entries = request.entries;
+                            if !request.entries.is_empty() {
+                                let entries = &request.entries;
                                 let num_entries = entries.len();
                                 let new_latest_log_index =
                                     leader_prev_log_index + num_entries as u64;
@@ -186,7 +184,7 @@ where
                                         leader_prev_log_index + 1,
                                         entries.into_iter().map(move |entry| {
                                             let Entry { term, data } = entry;
-                                            (term, Cursor::new(data))
+                                            (*term, Cursor::new(data))
                                         }),
                                     )
                                     .map_err(|e| Error::PersistentLog(Box::new(e)))?;
@@ -239,12 +237,12 @@ where
         &mut self,
         handler: &mut H,
         from: ServerId,
-        response: AppendEntriesResponse,
+        response: &AppendEntriesResponse,
     ) -> Result<Option<AppendEntriesRequest>, Error> {
         let local_term = self.current_term();
         let local_latest_log_index = self.latest_log_index();
 
-        match response {
+        match *response {
             AppendEntriesResponse::Success(term, _)
             | AppendEntriesResponse::StaleTerm(term)
             | AppendEntriesResponse::InconsistentPrevEntry(term, _) if local_term < term =>
@@ -261,7 +259,7 @@ where
             }
             AppendEntriesResponse::Success(_, follower_latest_log_index) => {
                 self.assert_leader()?;
-                let follower_latest_log_index = LogIndex::from(follower_latest_log_index);
+                let follower_latest_log_index = follower_latest_log_index;
                 if follower_latest_log_index > local_latest_log_index {
                     // TODO this error is probably fixable
                     return Err(Error::BadFollowerIndex);
@@ -273,8 +271,7 @@ where
             }
             AppendEntriesResponse::InconsistentPrevEntry(_, next_index) => {
                 self.assert_leader()?;
-                self.leader_state
-                    .set_next_index(from, LogIndex::from(next_index));
+                self.leader_state.set_next_index(from, next_index);
             }
             AppendEntriesResponse::StaleEntry => {
                 return Ok(None);
@@ -376,7 +373,7 @@ where
         &mut self,
         handler: &mut H,
         candidate: ServerId,
-        request: RequestVoteRequest,
+        request: &RequestVoteRequest,
     ) -> Result<RequestVoteResponse, Error> {
         // TODO remove
         let candidate_term = request.term;
@@ -430,10 +427,11 @@ where
         &mut self,
         handler: &mut H,
         from: ServerId,
-        response: RequestVoteResponse,
+        response: &RequestVoteResponse,
     ) -> Result<(), Error> {
         debug!("RequestVoteResponse from peer {}", from);
 
+        let response = response;
         let local_term = self.current_term();
         let voter_term = response.voter_term();
         let majority = self.majority();
@@ -497,11 +495,12 @@ where
                 response.map(ClientResponse::Proposal)
             }
             ClientRequest::Query(data) => {
-                Some(ClientResponse::Query(self.query_request(from, data)))
+                Some(ClientResponse::Query(self.query_request(from, &data)))
             }
         };
-
-        response.map(|response| handler.send_client_response(from, response));
+        if let Some(response) = response {
+            handler.send_client_response(from, response)
+        }
         handler.done();
         Ok(())
     }
@@ -531,7 +530,7 @@ where
                 //&self.peers[&self.follower_state.leader.unwrap()],
                 // TODO: unwrap
                 Ok(Some(CommandResponse::NotLeader(
-                    self.follower_state.leader.unwrap().clone(),
+                    self.follower_state.leader.unwrap(),
                 )))
             }
             ConsensusState::Leader => {
@@ -563,7 +562,7 @@ where
                         leader_commit,
                         entries: vec![Entry::new(term, request)],
                     };
-                    for &peer in self.peers.iter() {
+                    for &peer in &self.peers {
                         if self.leader_state.next_index(&peer) == log_index {
                             handler.send_peer_message(
                                 peer,
@@ -581,7 +580,7 @@ where
     }
 
     /// Applies a client query to the state machine.
-    fn query_request(&mut self, from: ClientId, request: Vec<u8>) -> CommandResponse {
+    fn query_request(&mut self, from: ClientId, request: &[u8]) -> CommandResponse {
         trace!("query from Client({})", from);
         let leader = self.follower_state.leader;
         match self.state {
@@ -589,7 +588,7 @@ where
             ConsensusState::Follower if leader.is_none() => CommandResponse::UnknownLeader,
             ConsensusState::Follower => {
                 //&self.peers[&self.follower_state.leader.unwrap()],
-                CommandResponse::NotLeader(self.follower_state.leader.unwrap().clone())
+                CommandResponse::NotLeader(self.follower_state.leader.unwrap())
             }
             ConsensusState::Leader => {
                 // TODO(from original raft): This is probably not exactly safe.
@@ -689,7 +688,7 @@ where
         self.state = ConsensusState::Follower;
         self.follower_state.set_leader(leader);
 
-        for &peer in self.peers.iter() {
+        for &peer in &self.peers {
             handler.clear_timeout(ConsensusTimeout::Heartbeat(peer));
         }
 
@@ -717,7 +716,7 @@ where
             entries: Vec::new(),
         };
 
-        for &peer in self.peers.iter() {
+        for &peer in &self.peers {
             handler.send_peer_message(peer, PeerMessage::AppendEntriesRequest(message.clone()));
             handler.clear_timeout(ConsensusTimeout::Heartbeat(peer));
         }
@@ -744,10 +743,10 @@ where
         let message = RequestVoteRequest {
             term: self.current_term(),
             last_log_index: self.latest_log_index(),
-            last_log_term: last_log_term,
+            last_log_term,
         };
 
-        for &peer in self.peers.iter() {
+        for &peer in &self.peers {
             handler.send_peer_message(peer, PeerMessage::RequestVoteRequest(message.clone()));
         }
         handler.set_timeout(ConsensusTimeout::Election);
@@ -787,8 +786,8 @@ where
 
                 let mut message = AppendEntriesRequest {
                     term: self.current_term(),
-                    prev_log_index: prev_log_index,
-                    prev_log_term: prev_log_term,
+                    prev_log_index,
+                    prev_log_term,
                     leader_commit: self.commit_index,
                     entries: Vec::new(),
                 };
@@ -933,7 +932,7 @@ where
     ) -> Result<Self, Error> {
         Ok(Self {
             inner: Consensus::new(id, peers, log, state_machine)?,
-            handler: handler,
+            handler,
         })
     }
 

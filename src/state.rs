@@ -80,8 +80,8 @@ impl LeaderState {
             .collect();
 
         LeaderState {
-            next_index: next_index,
-            match_index: match_index,
+            next_index,
+            match_index,
             proposals: VecDeque::new(),
         }
     }

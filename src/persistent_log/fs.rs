@@ -70,8 +70,8 @@ impl FsLog {
         let mut log = FsLog {
             reader: r,
             writer: w,
-            current_term: current_term,
-            voted_for: voted_for,
+            current_term,
+            voted_for,
             entries: Vec::new(),
             offsets: Vec::new(),
         };
@@ -216,7 +216,7 @@ impl Log for FsLog {
         match self.entries.get((index - 1).as_u64() as usize) {
             Some(&(term, ref bytes)) => {
                 if let Some(mut buf) = buf {
-                    buf.write(&bytes)?;
+                    buf.write_all(&bytes)?;
                 };
                 Ok(term)
             }

@@ -38,6 +38,7 @@ impl CollectHandler {
             client_messages: HashMap::new(),
             timeouts: Vec::new(),
             clear_timeouts: Vec::new(),
+            state: ConsensusState::Follower,
         }
     }
 
@@ -47,6 +48,12 @@ impl CollectHandler {
         self.client_messages.clear();
         self.timeouts.clear();
         self.clear_timeouts.clear();
+    }
+}
+
+impl Default for CollectHandler {
+    fn default() -> Self {
+        Self::new()
     }
 }
 

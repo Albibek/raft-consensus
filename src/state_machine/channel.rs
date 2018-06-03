@@ -13,7 +13,7 @@ pub struct ChannelStateMachine {
 impl ChannelStateMachine {
     pub fn new() -> (ChannelStateMachine, mpsc::Receiver<Vec<u8>>) {
         let (tx, recv) = mpsc::channel();
-        (ChannelStateMachine { tx: tx }, recv)
+        (ChannelStateMachine { tx }, recv)
     }
 }
 

@@ -37,7 +37,8 @@ impl Log for MemLog {
 
     fn set_current_term(&mut self, term: Term) -> result::Result<(), Error> {
         self.voted_for = None;
-        Ok(self.current_term = term)
+        self.current_term = term;
+        Ok(())
     }
 
     fn inc_current_term(&mut self) -> result::Result<Term, Error> {
@@ -51,7 +52,8 @@ impl Log for MemLog {
     }
 
     fn set_voted_for(&mut self, address: ServerId) -> result::Result<(), Error> {
-        Ok(self.voted_for = Some(address))
+        self.voted_for = Some(address);
+        Ok(())
     }
 
     fn latest_log_index(&self) -> result::Result<LogIndex, Error> {
@@ -71,7 +73,7 @@ impl Log for MemLog {
         match self.entries.get((index - 1).as_u64() as usize) {
             Some(&(term, ref bytes)) => {
                 if let Some(mut buf) = buf {
-                    buf.write(&bytes)?;
+                    buf.write_all(&bytes)?;
                 };
                 Ok(term)
             }
@@ -96,7 +98,8 @@ impl Log for MemLog {
             entries_vec.push((term, v));
         }
         self.entries.truncate((from - 1).as_u64() as usize);
-        Ok(self.entries.extend(entries_vec.into_iter()))
+        self.entries.extend(entries_vec.into_iter());
+        Ok(())
     }
 }
 
