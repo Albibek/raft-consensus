@@ -1,7 +1,7 @@
+use state::ConsensusState;
 /// Module contains message types used in consensus
 /// Any network message have to be converted to theese enums to be processed
 use {Entry, LogIndex, ServerId, Term};
-use state::ConsensusState;
 
 #[cfg(feature = "use_capnp")]
 use error::Error;
@@ -522,19 +522,19 @@ mod test {
     macro_rules! test_message_capnp {
         ($i:ident, $t:ty) => {
             fn $i(message: $t) {
-            let builder = message.as_capnp_heap();
-            let mut encoded = Vec::new();
+                let builder = message.as_capnp_heap();
+                let mut encoded = Vec::new();
 
-            ::capnp::serialize::write_message(&mut encoded, &builder).unwrap();
-            let mut encoded = ::std::io::Cursor::new(encoded);
-            let decoded = ::capnp::serialize::read_message(
-                &mut encoded,
-                ::capnp::message::DEFAULT_READER_OPTIONS,
-            ).unwrap();
-            let decoded = <$t>::from_capnp_untyped(decoded).unwrap();
-            assert_eq!(message, decoded);
+                ::capnp::serialize::write_message(&mut encoded, &builder).unwrap();
+                let mut encoded = ::std::io::Cursor::new(encoded);
+                let decoded = ::capnp::serialize::read_message(
+                    &mut encoded,
+                    ::capnp::message::DEFAULT_READER_OPTIONS,
+                ).unwrap();
+                let decoded = <$t>::from_capnp_untyped(decoded).unwrap();
+                assert_eq!(message, decoded);
             }
-        }
+        };
     }
 
     #[cfg(feature = "use_capnp")]
@@ -549,12 +549,10 @@ mod test {
             prev_log_index: 3.into(),
             prev_log_term: 2.into(),
             leader_commit: 4.into(),
-            entries: vec![
-                Entry {
-                    term: 9.into(),
-                    data: "qwer".to_string().into_bytes(),
-                },
-            ],
+            entries: vec![Entry {
+                term: 9.into(),
+                data: "qwer".to_string().into_bytes(),
+            }],
         };
 
         test_peer_message_capnp(message.into());

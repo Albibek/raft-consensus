@@ -189,8 +189,8 @@ impl FollowerState {
 mod tests {
     use std::collections::HashSet;
 
-    use {LogIndex, ServerId};
     use state::LeaderState;
+    use {LogIndex, ServerId};
 
     /// Tests the `LeaderState`'s  `.count_match_indexes()` function and makes sure it adequately
     /// produces the correct values.
