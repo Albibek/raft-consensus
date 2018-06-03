@@ -1012,7 +1012,54 @@ mod test {
     use handler::CollectHandler;
     use pretty_env_logger;
 
-    type TestPeer = HandledConsensus<MemLog, NullStateMachine, CollectHandler>;
+    #[derive(Debug)]
+    struct TestHandler(CollectHandler);
+
+    impl ConsensusHandler for TestHandler {
+        /// Saves peer message to a vector
+        fn send_peer_message(&mut self, id: ServerId, message: PeerMessage) {
+            self.0.send_peer_message(id, message)
+        }
+
+        /// Saves client message to a vector
+        fn send_client_response(&mut self, id: ClientId, message: ClientResponse) {
+            self.0.send_client_response(id, message)
+        }
+
+        /// Collects timeouts uniquely
+        fn set_timeout(&mut self, timeout: ConsensusTimeout) {
+            self.0.set_timeout(timeout)
+        }
+
+        fn clear_timeout(&mut self, timeout: ConsensusTimeout) {
+            self.0.clear_timeout(timeout)
+        }
+
+        fn state_changed(&mut self, old: ConsensusState, new: ConsensusState) {
+            match (&old, &new) {
+                (&ConsensusState::Leader, &ConsensusState::Candidate) => {
+                    panic!("Bad state transition: leader to candidate")
+                }
+                // TODO: this test is ok for single node
+                // (&ConsensusState::Follower, &ConsensusState::Leader) => {
+                //warn!("Bad state transition: follower to leader (ok for solitary transition)")
+                //}
+                (old, new) => trace!("state transition {:?} -> {:?}", old, new),
+            }
+            self.0.state_changed(old, new);
+        }
+
+        fn done(&mut self) {
+            trace!("apply done")
+        }
+    }
+    impl TestHandler {
+        fn clear(&mut self) {
+            self.0.clear()
+        }
+    }
+
+    type TestPeer = HandledConsensus<MemLog, NullStateMachine, TestHandler>;
 
     #[derive(Debug)]
     struct TestCluster {
@@ -1029,7 +1076,7 @@ mod test {
                 ids.remove(i); // remove self
                 let id = ServerId(i as u64);
                 let store = MemLog::new();
-                let handler = CollectHandler::new();
+                let handler = TestHandler(CollectHandler::new());
                 let mut consensus =
                     HandledConsensus::new(id, ids, store, NullStateMachine, handler).unwrap();
                 consensus.init();
@@ -1051,7 +1098,7 @@ mod test {
             let mut timeouts: HashMap<ServerId, HashSet<ConsensusTimeout>> = HashMap::new();
             let mut client_messages: HashMap<ClientId, Vec<ClientResponse>> = HashMap::new();
             for (peer, mut consensus) in self.peers.iter_mut() {
-                for (to, messages) in consensus.handler.peer_messages.drain() {
+                for (to, messages) in consensus.handler.0.peer_messages.drain() {
                     for message in messages.into_iter() {
                         queue.push_back((peer.clone(), to, message));
                     }
@@ -1059,20 +1106,20 @@ mod test {
 
                 let mut entry = timeouts.entry(peer.clone()).or_insert(HashSet::new());
 
-                for timeout in consensus.handler.timeouts.clone() {
+                for timeout in consensus.handler.0.timeouts.clone() {
                     if let ConsensusTimeout::Election = timeout {
                         entry.insert(timeout);
                     }
                 }
 
-                client_messages.extend(consensus.handler.client_messages.clone());
+                client_messages.extend(consensus.handler.0.client_messages.clone());
                 consensus.handler.clear();
             }
             trace!("Initial queue: {:?}", queue);
             while let Some((from, to, message)) = queue.pop_front() {
                 let mut peer_consensus = self.peers.get_mut(&to).unwrap();
                 peer_consensus.apply_peer_message(from, message).unwrap();
-                for (to, messages) in peer_consensus.handler.peer_messages.drain() {
+                for (to, messages) in peer_consensus.handler.0.peer_messages.drain() {
                     for message in messages.into_iter() {
                         queue.push_back((peer_consensus.inner.id.clone(), to, message));
                     }
@@ -1082,13 +1129,13 @@ mod test {
                 let mut entry = timeouts
                     .entry(peer_consensus.inner.id.clone())
                     .or_insert(HashSet::new());
-                for timeout in peer_consensus.handler.timeouts.clone() {
+                for timeout in peer_consensus.handler.0.timeouts.clone() {
                     if let ConsensusTimeout::Election = timeout {
                         entry.insert(timeout);
                     }
                 }
 
-                client_messages.extend(peer_consensus.handler.client_messages.clone());
+                client_messages.extend(peer_consensus.handler.0.client_messages.clone());
                 peer_consensus.handler.clear();
             }
             (timeouts, client_messages)
@@ -1144,11 +1191,11 @@ mod test {
 
         peer.apply_timeout(ConsensusTimeout::Election).unwrap();
         assert!(peer.is_leader());
-        assert!(peer.handler.peer_messages.is_empty());
-        assert!(peer.handler.client_messages.is_empty());
+        assert!(peer.handler.0.peer_messages.is_empty());
+        assert!(peer.handler.0.client_messages.is_empty());
         // make sure all timeouts are clear
-        for to in peer.handler.timeouts {
-            assert!(peer.handler.clear_timeouts.iter().any(|&t| t == to))
+        for to in peer.handler.0.timeouts {
+            assert!(peer.handler.0.clear_timeouts.iter().any(|&t| t == to))
         }
     }
 
@@ -1187,7 +1234,7 @@ mod test {
                 .apply_timeout(ConsensusTimeout::Heartbeat(follower_id.clone()))
                 .unwrap();
 
-            let (to, peer_messages) = leader.handler.peer_messages.iter().next().unwrap();
+            let (to, peer_messages) = leader.handler.0.peer_messages.iter().next().unwrap();
             assert_eq!(*to, follower_id.clone());
             peer_messages[0].clone()
         };
@@ -1200,9 +1247,9 @@ mod test {
             follower
                 .apply_peer_message(leader_id.clone(), peer_message)
                 .unwrap();
-            assert_eq!(follower.handler.timeouts[0], ConsensusTimeout::Election);
+            assert_eq!(follower.handler.0.timeouts[0], ConsensusTimeout::Election);
 
-            let (to, peer_messages) = follower.handler.peer_messages.iter().next().unwrap();
+            let (to, peer_messages) = follower.handler.0.peer_messages.iter().next().unwrap();
             assert_eq!(*to, leader_id.clone());
             peer_messages[0].clone()
         };
@@ -1212,7 +1259,7 @@ mod test {
         leader
             .apply_peer_message(follower_id.clone(), follower_response)
             .unwrap();
-        let heartbeat_timeout = leader.handler.timeouts.pop().unwrap();
+        let heartbeat_timeout = leader.handler.0.timeouts.pop().unwrap();
         assert_eq!(
             heartbeat_timeout,
             ConsensusTimeout::Heartbeat(follower_id.clone())
