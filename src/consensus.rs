@@ -1,29 +1,22 @@
-use std::collections::HashMap;
-use std::fmt::Debug;
 use std::cmp;
+use std::collections::HashMap;
 use std::io::Cursor;
 
-use {ClientId, Entry, LogIndex, ServerId, Term};
-use state::{CandidateState, ConsensusState, FollowerState, LeaderState};
-use message::*;
 use error::Error;
+use handler::ConsensusHandler;
+use message::*;
+use state::{CandidateState, ConsensusState, FollowerState, LeaderState};
+use {ClientId, Entry, LogIndex, ServerId, Term};
 
-use state_machine::StateMachine;
 use persistent_log::Log;
-
-/// Handler for actions returned from consensus
-pub trait ConsensusHandler: Debug {
-    fn send_peer_message(&mut self, id: ServerId, message: PeerMessage);
-    fn send_client_response(&mut self, id: ClientId, message: ClientResponse);
-    fn set_timeout(&mut self, timeout: ConsensusTimeout);
-    fn clear_timeout(&mut self, timeout: ConsensusTimeout);
-
-    /// Called when the particular event has been fully processed. Useful for doing actions in batches
-    fn done(&mut self) {}
-}
+use state_machine::StateMachine;
 
 /// An instance of a Raft state machine. The Consensus controls a client state machine, to which it
 /// applies entries in a globally consistent order.
+///
+/// Each event incoming from outside, like timer or a consensus packet, shoould be passed to
+/// corresponsing finction in consensus along with the handler implementation. Then handler functions
+/// will be called when corresponsing events happen
 #[derive(Debug, Clone)]
 pub struct Consensus<L, M> {
     // The ID of this consensus instance.
@@ -614,6 +607,8 @@ where
     M: StateMachine,
 {
     /// Triggered by external timeouts.
+    /// Convenience function for handling any timeout.
+    /// Will call either `heartbeat_timeout` or `election_timeout`
     pub fn apply_timeout<H: ConsensusHandler>(
         &mut self,
         handler: &mut H,
@@ -658,6 +653,8 @@ where
             self.log.inc_current_term().unwrap();
             self.log.set_voted_for(self.id).unwrap();
             let latest_log_index = self.latest_log_index();
+
+            handler.state_changed(self.state.clone(), ConsensusState::Leader);
             self.state = ConsensusState::Leader;
             self.leader_state.reinitialize(latest_log_index);
             handler.clear_timeout(ConsensusTimeout::Election);
@@ -688,6 +685,7 @@ where
         self.log
             .set_current_term(term)
             .map_err(|e| Error::PersistentLog(Box::new(e)))?;
+        handler.state_changed(self.state.clone(), ConsensusState::Follower);
         self.state = ConsensusState::Follower;
         self.follower_state.set_leader(leader);
 
@@ -705,6 +703,7 @@ where
         let latest_log_index = self.log
             .latest_log_index()
             .map_err(|e| Error::PersistentLog(Box::new(e)))?;
+        handler.state_changed(self.state.clone(), ConsensusState::Leader);
         self.state = ConsensusState::Leader;
         self.leader_state.reinitialize(latest_log_index);
 
@@ -737,6 +736,7 @@ where
         self.with_log(|log| log.set_voted_for(id))?;
         let last_log_term = self.with_log(|log| log.latest_log_term())?;
 
+        handler.state_changed(self.state.clone(), ConsensusState::Candidate);
         self.state = ConsensusState::Candidate;
         self.candidate_state.clear();
         self.candidate_state.record_vote(self.id);
@@ -1003,8 +1003,8 @@ where
 
 #[cfg(test)]
 mod test {
-    use std::collections::VecDeque;
     use std::collections::HashSet;
+    use std::collections::VecDeque;
 
     use super::*;
     use persistent_log::mem::MemLog;

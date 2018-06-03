@@ -1,10 +1,26 @@
 use std::collections::HashMap;
+use std::fmt::Debug;
 
-use {ClientId, ServerId};
 use message::*;
-use consensus::ConsensusHandler;
+use state::ConsensusState;
+use {ClientId, ServerId};
 
-/// A handler that collects all messages leaving processing of them untouched
+/// Handler for actions returned from consensus
+pub trait ConsensusHandler: Debug {
+    fn send_peer_message(&mut self, id: ServerId, message: PeerMessage);
+    fn send_client_response(&mut self, id: ClientId, message: ClientResponse);
+    fn set_timeout(&mut self, timeout: ConsensusTimeout);
+    fn clear_timeout(&mut self, timeout: ConsensusTimeout);
+
+    #[allow(unused_variables)]
+    /// Called when consensus goes to new state. Initializing new consensus does not call this function.
+    fn state_changed(&mut self, old: ConsensusState, new: ConsensusState) {}
+
+    /// Called when the particular event has been fully processed. Useful for doing actions in batches.
+    fn done(&mut self) {}
+}
+
+/// A handler that collects all messages leaving processing of them untouched.
 /// Note that timeouts vectors may intersect, that means both - clearing and setting a new timeout was requested.
 #[derive(Debug)]
 pub struct CollectHandler {
@@ -12,6 +28,7 @@ pub struct CollectHandler {
     pub client_messages: HashMap<ClientId, Vec<ClientResponse>>,
     pub timeouts: Vec<ConsensusTimeout>,
     pub clear_timeouts: Vec<ConsensusTimeout>,
+    pub state: ConsensusState,
 }
 
 impl CollectHandler {
@@ -36,13 +53,13 @@ impl CollectHandler {
 impl ConsensusHandler for CollectHandler {
     /// Saves peer message to a vector
     fn send_peer_message(&mut self, id: ServerId, message: PeerMessage) {
-        let peer = self.peer_messages.entry(id).or_insert(Vec::new());
+        let peer = self.peer_messages.entry(id).or_insert_with(Vec::new);
         peer.push(message);
     }
 
     /// Saves client message to a vector
     fn send_client_response(&mut self, id: ClientId, message: ClientResponse) {
-        let client = self.client_messages.entry(id).or_insert(Vec::new());
+        let client = self.client_messages.entry(id).or_insert_with(Vec::new);
         client.push(message);
     }
 
@@ -57,5 +74,9 @@ impl ConsensusHandler for CollectHandler {
         if !self.clear_timeouts.iter().any(|&t| t == timeout) {
             self.clear_timeouts.push(timeout);
         }
+    }
+
+    fn state_changed(&mut self, _old: ConsensusState, new: ConsensusState) {
+        self.state = new
     }
 }

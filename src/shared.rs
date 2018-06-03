@@ -1,11 +1,12 @@
 use std::sync::{Arc, Mutex};
 
-use {ClientId, ServerId};
-use consensus::{ConsensusHandler, HandledConsensus};
-use state_machine::StateMachine;
-use persistent_log::Log;
-use message::*;
+use consensus::HandledConsensus;
 use error::Error;
+use handler::ConsensusHandler;
+use message::*;
+use persistent_log::Log;
+use state_machine::StateMachine;
+use {ClientId, ServerId};
 
 /// Convenience wrapper for multithreaded handling of consensus packages
 /// Based on standard `Arc<Mutex<_>>` approach
