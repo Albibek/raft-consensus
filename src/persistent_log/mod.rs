@@ -12,8 +12,8 @@ pub mod mem;
 
 use std::error;
 use std::fmt::{self, Debug};
-use std::result;
 use std::io::{Read, Write};
+use std::result;
 
 pub use persistent_log::fs::FsLog;
 pub use persistent_log::mem::MemLog;
@@ -28,7 +28,7 @@ pub trait Log: Clone + Debug + 'static {
     fn current_term(&self) -> result::Result<Term, Self::Error>;
 
     /// Sets the current term to the provided value. The provided term must be greater than
-    /// the current term. The `voted_for` value will be reset`.
+    /// the current term. The `voted_for` value will be reset.
     fn set_current_term(&mut self, term: Term) -> result::Result<(), Self::Error>;
 
     /// Increment the current term. The `voted_for` value will be reset.

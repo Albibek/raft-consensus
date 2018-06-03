@@ -1,11 +1,11 @@
-use std::{fs, path, result};
 use std::io::prelude::*;
 use std::io::{BufReader, BufWriter, Read, SeekFrom, Write};
+use std::{fs, path, result};
 
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 
-use {Entry, LogIndex, ServerId, Term};
 use persistent_log::{Error, Log};
+use {Entry, LogIndex, ServerId, Term};
 
 /// This is a `Log` implementation that stores entries in the filesystem
 /// as well as in a struct. It is chiefly intended for testing.
@@ -286,11 +286,11 @@ impl Clone for FsLog {
 
 #[cfg(test)]
 mod test {
+    use super::*;
+    use persistent_log::{append_entries, get_entry, Log};
     use std::fs::remove_file;
     use std::path::Path;
-    use super::*;
     use {LogIndex, ServerId, Term};
-    use persistent_log::{append_entries, get_entry, Log};
 
     fn assert_entries_equal(store: &FsLog, expected: Vec<(Term, &[u8])>) {
         assert_eq!(

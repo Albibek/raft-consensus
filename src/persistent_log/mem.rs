@@ -1,5 +1,5 @@
-use std::result;
 use std::io::{Read, Write};
+use std::result;
 
 use persistent_log::{Error, Log};
 use {LogIndex, ServerId, Term};
@@ -105,8 +105,8 @@ mod test {
 
     use super::*;
 
-    use {LogIndex, ServerId, Term};
     use persistent_log::{append_entries, get_entry, Log};
+    use {LogIndex, ServerId, Term};
 
     #[test]
     fn test_current_term() {
