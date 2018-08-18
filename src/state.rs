@@ -41,9 +41,9 @@ impl ConsensusState {
 
     pub fn fill_capnp<'a>(&self, builder: &mut consensus_state::Builder<'a>) {
         match self {
-            &ConsensusState::Follower => builder.borrow().set_follower(()),
-            &ConsensusState::Candidate => builder.borrow().set_candidate(()),
-            &ConsensusState::Leader => builder.borrow().set_leader(()),
+            &ConsensusState::Follower => builder.reborrow().set_follower(()),
+            &ConsensusState::Candidate => builder.reborrow().set_candidate(()),
+            &ConsensusState::Leader => builder.reborrow().set_leader(()),
         };
     }
 

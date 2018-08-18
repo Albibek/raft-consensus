@@ -77,19 +77,19 @@ impl PeerMessage {
     pub fn fill_capnp<'a>(&self, builder: &mut peer_message::Builder<'a>) {
         match self {
             &PeerMessage::AppendEntriesRequest(ref message) => {
-                let mut builder = builder.borrow().init_append_entries_request();
+                let mut builder = builder.reborrow().init_append_entries_request();
                 message.fill_capnp(&mut builder);
             }
             &PeerMessage::AppendEntriesResponse(ref message) => {
-                let mut builder = builder.borrow().init_append_entries_response();
+                let mut builder = builder.reborrow().init_append_entries_response();
                 message.fill_capnp(&mut builder);
             }
             &PeerMessage::RequestVoteRequest(ref message) => {
-                let mut builder = builder.borrow().init_request_vote_request();
+                let mut builder = builder.reborrow().init_request_vote_request();
                 message.fill_capnp(&mut builder);
             }
             &PeerMessage::RequestVoteResponse(ref message) => {
-                let mut builder = builder.borrow().init_request_vote_response();
+                let mut builder = builder.reborrow().init_request_vote_response();
                 message.fill_capnp(&mut builder);
             }
         };
@@ -152,10 +152,10 @@ impl AppendEntriesRequest {
         builder.set_leader_commit(self.leader_commit.into());
         if self.entries.len() > 0 {
             // TODO: guarantee entries length fits u32
-            let mut entries = builder.borrow().init_entries(self.entries.len() as u32);
+            let mut entries = builder.reborrow().init_entries(self.entries.len() as u32);
 
             for (n, entry) in self.entries.iter().enumerate() {
-                let mut slot = entries.borrow().get(n as u32);
+                let mut slot = entries.reborrow().get(n as u32);
                 entry.fill_capnp(&mut slot);
             }
         }
@@ -207,13 +207,13 @@ impl AppendEntriesResponse {
     pub fn fill_capnp<'a>(&self, builder: &mut append_entries_response::Builder<'a>) {
         match self {
             &AppendEntriesResponse::Success(term, log_index) => {
-                let mut message = builder.borrow().init_success();
+                let mut message = builder.reborrow().init_success();
                 message.set_term(term.into());
                 message.set_log_index(log_index.into());
             }
             &AppendEntriesResponse::StaleTerm(term) => builder.set_stale_term(term.into()),
             &AppendEntriesResponse::InconsistentPrevEntry(term, log_index) => {
-                let mut message = builder.borrow().init_inconsistent_prev_entry();
+                let mut message = builder.reborrow().init_inconsistent_prev_entry();
                 message.set_term(term.into());
                 message.set_log_index(log_index.into());
             }
@@ -399,15 +399,15 @@ impl ClientResponse {
     pub fn fill_capnp<'a>(&self, builder: &mut client_response::Builder<'a>) {
         match self {
             &ClientResponse::Ping(ref data) => {
-                let mut builder = builder.borrow().init_ping();
+                let mut builder = builder.reborrow().init_ping();
                 data.fill_capnp(&mut builder);
             }
             &ClientResponse::Proposal(ref data) => {
-                let mut builder = builder.borrow().init_proposal();
+                let mut builder = builder.reborrow().init_proposal();
                 data.fill_capnp(&mut builder);
             }
             &ClientResponse::Query(ref data) => {
-                let mut builder = builder.borrow().init_query();
+                let mut builder = builder.reborrow().init_query();
                 data.fill_capnp(&mut builder);
             }
         }
@@ -447,7 +447,7 @@ impl PingResponse {
         builder.set_term(self.term.into());
         builder.set_index(self.index.into());
         {
-            let mut builder = builder.borrow().init_state();
+            let mut builder = builder.reborrow().init_state();
             self.state.fill_capnp(&mut builder);
         }
     }
