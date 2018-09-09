@@ -229,7 +229,7 @@ impl ClientId {
     }
 
     pub fn from_bytes(bytes: &[u8]) -> Result<ClientId, Error> {
-        Uuid::from_bytes(bytes).map(ClientId).map_err(Error::Uuid)
+        Uuid::from_slice(bytes).map(ClientId).map_err(Error::Uuid)
     }
 }
 

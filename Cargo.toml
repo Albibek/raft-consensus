@@ -9,7 +9,7 @@ keywords = ["raft", "consensus", "distributed"]
 categories = ["algorithms"]
 
 [dependencies]
-uuid = {version= "^0.5", features=["use_std", "v4"]}
+uuid = {version= "^0.7", features=["v4"]}
 byteorder="^1.2"
 failure_derive="^0.1"
 failure="^0.1"

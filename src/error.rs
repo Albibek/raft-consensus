@@ -1,6 +1,6 @@
 //! Error type with all possible errors
 use std::error::Error as StdError;
-use uuid::ParseError;
+use uuid::BytesError;
 use {ServerId, Term};
 
 #[cfg(feature = "use_capnp")]
@@ -24,7 +24,7 @@ pub enum Error {
     AnotherLeader(ServerId, Term),
 
     #[fail(display = "UUID conversion")]
-    Uuid(#[cause] ParseError),
+    Uuid(#[cause] BytesError),
 
     #[cfg(feature = "use_capnp")]
     #[fail(display = "Decoding capnp")]
