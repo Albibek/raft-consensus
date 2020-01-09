@@ -1,18 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
-use ClientId;
-use LogIndex;
-use ServerId;
-
-#[cfg(feature = "use_capnp")]
-use messages_capnp::*;
-
-#[cfg(feature = "use_capnp")]
-use error::Error;
-
-#[cfg(feature = "use_capnp")]
-use capnp::message::{Allocator, Builder, HeapAllocator, Reader, ReaderSegments};
-
+use crate::message::ConsensusStateKind;
+use crate::{ClientId, LogIndex, ServerId};
 /// Consensus modules can be in one of three state:
 ///
 /// * `Follower` - which replicates AppendEntries requests and votes for it's leader.
@@ -21,38 +10,56 @@ use capnp::message::{Allocator, Builder, HeapAllocator, Reader, ReaderSegments};
 /// * `Candidate` -  which campaigns in an election and may become a `Leader`
 ///                  (if it gets enough votes) or a `Follower`, if it hears from
 ///                  a `Leader`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-#[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
+#[derive(Clone, Debug)]
 pub enum ConsensusState {
-    Follower,
-    Candidate,
-    Leader,
+    Follower(FollowerState),
+    Candidate(CandidateState),
+    Leader(LeaderState),
 }
 
-#[cfg(feature = "use_capnp")]
 impl ConsensusState {
-    pub fn from_capnp<'a>(reader: consensus_state::Reader<'a>) -> Result<Self, Error> {
-        match reader.which().map_err(Error::CapnpSchema)? {
-            consensus_state::Which::Follower(()) => Ok(ConsensusState::Follower),
-            consensus_state::Which::Candidate(()) => Ok(ConsensusState::Candidate),
-            consensus_state::Which::Leader(()) => Ok(ConsensusState::Leader),
+    pub fn kind(&self) -> ConsensusStateKind {
+        match self {
+            ConsensusState::Follower(_) => ConsensusStateKind::Follower,
+            ConsensusState::Candidate(_) => ConsensusStateKind::Candidate,
+            ConsensusState::Leader(_) => ConsensusStateKind::Leader,
         }
     }
 
-    pub fn fill_capnp<'a>(&self, builder: &mut consensus_state::Builder<'a>) {
-        match self {
-            &ConsensusState::Follower => builder.reborrow().set_follower(()),
-            &ConsensusState::Candidate => builder.reborrow().set_candidate(()),
-            &ConsensusState::Leader => builder.reborrow().set_leader(()),
-        };
+    pub fn is_follower(&self) -> bool {
+        if let ConsensusState::Follower(_) = self {
+            true
+        } else {
+            false
+        }
     }
 
-    common_capnp!(consensus_state::Builder, consensus_state::Reader);
+    pub fn is_candidate(&self) -> bool {
+        if let ConsensusState::Candidate(_) = self {
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn is_leader(&self) -> bool {
+        if let ConsensusState::Leader(_) = self {
+            true
+        } else {
+            false
+        }
+    }
+}
+
+impl Default for ConsensusState {
+    fn default() -> Self {
+        ConsensusState::Follower(FollowerState::new())
+    }
 }
 
 /// The state associated with a Raft consensus module in the `Leader` state.
 #[derive(Clone, Debug)]
-pub(crate) struct LeaderState {
+pub struct LeaderState {
     next_index: HashMap<ServerId, LogIndex>,
     match_index: HashMap<ServerId, LogIndex>,
     /// Stores in-flight client proposals.
@@ -67,17 +74,23 @@ impl LeaderState {
     /// * `latest_log_index` - The index of the leader's most recent log entry at the
     ///                        time of election.
     /// * `peers` - The set of peer cluster members.
-    pub(crate) fn new(latest_log_index: LogIndex, peers: &HashSet<ServerId>) -> LeaderState {
-        let next_index = peers
-            .iter()
-            .cloned()
-            .map(|peer| (peer, latest_log_index + 1))
-            .collect();
-        let match_index = peers
-            .iter()
-            .cloned()
-            .map(|peer| (peer, LogIndex::from(0)))
-            .collect();
+    pub(crate) fn new<'a, I: Iterator<Item = &'a ServerId>>(
+        latest_log_index: LogIndex,
+        peers: I,
+    ) -> LeaderState {
+        let mut next_index = HashMap::new();
+        let mut match_index = HashMap::new();
+        peers
+            .map(|peer| {
+                next_index.insert(peer.clone(), latest_log_index + 1);
+                match_index.insert(peer.clone(), LogIndex::from(0));
+            })
+            .last();
+
+        // let match_index = peers
+        //.cloned()
+        //.map(|peer| (peer, LogIndex::from(0)))
+        //.collect();
 
         LeaderState {
             next_index,
@@ -107,22 +120,11 @@ impl LeaderState {
         // +1 for self.
         self.match_index.values().filter(|&&i| i >= index).count() + 1
     }
-
-    /// Reinitializes the state following an election.
-    pub(crate) fn reinitialize(&mut self, latest_log_index: LogIndex) {
-        for next_index in self.next_index.values_mut() {
-            *next_index = latest_log_index + 1;
-        }
-        for match_index in self.match_index.values_mut() {
-            *match_index = LogIndex::from(0);
-        }
-        self.proposals.clear();
-    }
 }
 
 /// The state associated with a Raft consensus module in the `Candidate` state.
 #[derive(Clone, Debug)]
-pub(crate) struct CandidateState {
+pub struct CandidateState {
     granted_votes: HashSet<ServerId>,
 }
 
@@ -144,11 +146,6 @@ impl CandidateState {
         self.granted_votes.len()
     }
 
-    /// Clears the vote count.
-    pub(crate) fn clear(&mut self) {
-        self.granted_votes.clear();
-    }
-
     /// Returns whether the peer has voted in the current election.
     pub(crate) fn peer_voted(&self, voter: ServerId) -> bool {
         self.granted_votes.contains(&voter)
@@ -157,31 +154,21 @@ impl CandidateState {
 
 /// The state associated with a Raft consensus module in the `Follower` state.
 #[derive(Clone, Debug)]
-pub(crate) struct FollowerState {
+pub struct FollowerState {
     /// The most recent leader of the follower. The leader is not guaranteed to be active, so this
     /// should only be used as a hint.
     pub(crate) leader: Option<ServerId>,
-    /// The minimal index at which entries can be appended. This bit of state
-    /// allows avoiding overwriting of possibly committed parts of the log
-    /// when messages arrive out of order. It is reset on set_leader() and
-    /// otherwise left untouched.
-    /// See see ktoso/akka-raft#66.
-    pub(crate) min_index: LogIndex,
 }
 
 impl FollowerState {
     /// Returns a new `FollowerState`.
     pub(crate) fn new() -> FollowerState {
-        FollowerState {
-            leader: None,
-            min_index: LogIndex(0),
-        }
+        FollowerState { leader: None }
     }
 
     /// Sets a new leader.
     pub(crate) fn set_leader(&mut self, leader: ServerId) {
         self.leader = Some(leader);
-        self.min_index = LogIndex(0);
     }
 }
 

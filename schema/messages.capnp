@@ -9,6 +9,9 @@ struct PeerMessage {
 
    requestVoteRequest @2 :RequestVoteRequest;
    requestVoteResponse @3 :RequestVoteResponse;
+
+   addServerRequest @4 :AddServerRequest;
+   addServerResponse @5 :AddServerResponse;
    }
 }
 
@@ -45,6 +48,19 @@ struct RequestVoteResponse {
     granted @2 :UInt64;
     alreadyVoted @3 :UInt64;
   }
+}
+
+struct AddServerRequest {
+    id @0 :UInt64;
+    info @1 :Data;
+}
+
+struct AddServerResponse {
+    union {
+        success @0 :Void;
+        unknownLeader @1 :Void;
+        notLeader @2 :UInt64;
+    }
 }
 
 # Client messages
@@ -90,12 +106,23 @@ struct ConsensusState {
 
 struct Entry {
     term @0 :UInt64;
-    data @1 :Data;
+    data @1 :EntryData;
+}
+
+struct EntryData {
+    union {
+        client @0 :Data;
+        addServer @1 :AddServerEntry;
+        removeServer @2 :UInt64;
+    }
+}
+
+struct AddServerEntry {
+    id @0 :UInt64;
+    info @1 :Data;
 }
 
 struct TermAndIndex {
     term @0 :UInt64;
     logIndex @1 :UInt64;
 }
-
-

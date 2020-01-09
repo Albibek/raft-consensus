@@ -7,18 +7,19 @@
 //! internally used by the library, while letting this library authors no to be opinionated about
 //! how data is stored.
 
-pub mod fs;
+//FIXME
+//pub mod fs;
 pub mod mem;
 
 use std::error;
 use std::fmt::{self, Debug};
-use std::io::{Read, Write};
 use std::result;
 
-pub use persistent_log::fs::FsLog;
-pub use persistent_log::mem::MemLog;
+// FIXME:
+//pub use persistent_log::fs::FsLog;
+pub use crate::persistent_log::mem::MemLog;
 
-use {LogIndex, ServerId, Term};
+use crate::{Entry, LogIndex, ServerId, Term};
 
 /// A store of persistent Raft state.
 pub trait Log: Clone + Debug + 'static {
@@ -31,7 +32,7 @@ pub trait Log: Clone + Debug + 'static {
     /// the current term. The `voted_for` value will be reset.
     fn set_current_term(&mut self, term: Term) -> result::Result<(), Self::Error>;
 
-    /// Increment the current term. The `voted_for` value will be reset.
+    /// Increment the current term. The `voted_for` value must be reset.
     fn inc_current_term(&mut self) -> result::Result<Term, Self::Error>;
 
     /// Returns the candidate id of the candidate voted for in the current term (or none).
@@ -46,10 +47,11 @@ pub trait Log: Clone + Debug + 'static {
     /// Returns the term of the latest persisted log entry (0 if the log is empty).
     fn latest_log_term(&self) -> result::Result<Term, Self::Error>;
 
-    /// Returns the term for the entry at the provided log index writing entry itself to writer if
-    /// requested
-    fn entry<W: Write>(&self, index: LogIndex, buf: Option<W>)
-        -> result::Result<Term, Self::Error>;
+    /// Returns term corresponding to log index
+    fn term(&self, index: LogIndex) -> result::Result<Term, Self::Error>;
+
+    /// Writes the entry at the provided log index to provided reference
+    fn entry(&self, index: LogIndex, dest: &mut Entry) -> result::Result<(), Self::Error>;
 
     // /// Returns the given range of entries (excluding the right endpoint). Allocates.
     //fn entries(
@@ -66,7 +68,7 @@ pub trait Log: Clone + Debug + 'static {
     //}
 
     /// Appends the provided entries to the log beginning at the given index.
-    fn append_entries<R: Read, I: Iterator<Item = (Term, R)>>(
+    fn append_entries<I: Iterator<Item = Entry>>(
         &mut self,
         from: LogIndex,
         entries: I,
@@ -107,19 +109,19 @@ use std::io::Cursor;
 pub(crate) fn append_entries<L: Log>(
     store: &mut L,
     from: LogIndex,
-    entries: &[(Term, &[u8])],
+    entries: &[(Term, EntryKind, &[u8])],
 ) -> Result<(), L::Error> {
     let entries = entries
         .iter()
-        .map(|&(term, entry)| (term, Cursor::new(entry)));
+        .map(|&(term, kind, entry)| (term, kind, Cursor::new(entry)));
     store.append_entries(from, entries)?;
     Ok(())
 }
 
 #[cfg(test)]
 // helper for easier test migration
-pub(crate) fn get_entry<L: Log>(store: &L, log_index: LogIndex) -> (Term, Vec<u8>) {
+pub(crate) fn get_entry<L: Log>(store: &L, log_index: LogIndex) -> (Term, EntryKind, Vec<u8>) {
     let mut data = Vec::new();
     let term = store.entry(log_index, Some(&mut data)).unwrap();
-    (term, data)
+    (term, kind, data)
 }

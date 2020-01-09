@@ -1,4 +1,4 @@
-use state_machine::StateMachine;
+use crate::state_machine::StateMachine;
 
 /// A state machine with no states.
 #[derive(Debug)]

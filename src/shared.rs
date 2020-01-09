@@ -1,12 +1,12 @@
 use std::sync::{Arc, Mutex};
 
-use consensus::HandledConsensus;
-use error::Error;
-use handler::ConsensusHandler;
-use message::*;
-use persistent_log::Log;
-use state_machine::StateMachine;
-use {ClientId, ServerId};
+use crate::consensus::HandledConsensus;
+use crate::error::Error;
+use crate::handler::ConsensusHandler;
+use crate::message::*;
+use crate::persistent_log::Log;
+use crate::state_machine::StateMachine;
+use crate::{ClientId, ServerId};
 
 /// Convenience wrapper for multithreaded handling of consensus packages
 /// Based on standard `Arc<Mutex<_>>` approach

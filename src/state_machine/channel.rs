@@ -1,7 +1,7 @@
 use std::fmt::{self, Debug};
 use std::sync::mpsc;
 
-use state_machine::StateMachine;
+use crate::state_machine::StateMachine;
 
 /// A state machine that simply redirects all commands to a channel.
 ///

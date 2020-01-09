@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 use std::fmt::Debug;
 
-use message::*;
-use state::ConsensusState;
-use {ClientId, ServerId};
+use crate::message::*;
+use crate::state::ConsensusState;
+use crate::{ClientId, ServerId};
 
 /// Handler for actions returned from consensus
 pub trait ConsensusHandler: Debug {
@@ -12,9 +12,13 @@ pub trait ConsensusHandler: Debug {
     fn set_timeout(&mut self, timeout: ConsensusTimeout);
     fn clear_timeout(&mut self, timeout: ConsensusTimeout);
 
+    /// Called when new server request is coming.
+    /// Handler may require knowing this to connect to server
+    //fn new_server(&mut self, id: ServerId, info: Vec<u8>);
+
     #[allow(unused_variables)]
     /// Called when consensus goes to new state. Initializing new consensus does not call this function.
-    fn state_changed(&mut self, old: ConsensusState, new: ConsensusState) {}
+    fn state_changed(&mut self, old: ConsensusState, new: &ConsensusState) {}
 
     /// Called when the particular event has been fully processed. Useful for doing actions in batches.
     fn done(&mut self) {}
@@ -38,7 +42,7 @@ impl CollectHandler {
             client_messages: HashMap::new(),
             timeouts: Vec::new(),
             clear_timeouts: Vec::new(),
-            state: ConsensusState::Follower,
+            state: ConsensusState::default(),
         }
     }
 
@@ -83,7 +87,7 @@ impl ConsensusHandler for CollectHandler {
         }
     }
 
-    fn state_changed(&mut self, _old: ConsensusState, new: ConsensusState) {
-        self.state = new
+    fn state_changed(&mut self, _old: ConsensusState, new: &ConsensusState) {
+        self.state = new.clone()
     }
 }

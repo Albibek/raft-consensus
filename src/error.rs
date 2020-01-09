@@ -1,40 +1,44 @@
 //! Error type with all possible errors
+use crate::{ServerId, Term};
 use std::error::Error as StdError;
+use thiserror::Error as ThisError;
 use uuid::BytesError;
-use {ServerId, Term};
 
 #[cfg(feature = "use_capnp")]
 use capnp::Error as CapnpError;
 #[cfg(feature = "use_capnp")]
 use capnp::NotInSchema;
 
-#[fail(display = "Consensus error")]
-#[derive(Fail, Debug)]
+#[error("Consensus error")]
+#[derive(ThisError, Debug)]
 pub enum Error {
-    #[fail(display = "Consensus state was not Leader while it had to be.")]
+    #[error("Consensus state was not Leader while it had to be.")]
     MustLeader,
 
-    #[fail(display = "Consensus state was Leader while it had NOT to be.")]
+    #[error("Consensus state was Leader while it had NOT to be.")]
     MustNotLeader,
 
-    #[fail(display = "Follower responded with inconsistent index.")]
+    #[error("Follower responded with inconsistent index.")]
     BadFollowerIndex,
 
-    #[fail(display = "BUG: peer leader with matching term detected")]
+    #[error("Unknown peer")]
+    UnknownPeer(ServerId),
+
+    #[error("BUG: peer leader with matching term detected")]
     AnotherLeader(ServerId, Term),
 
-    #[fail(display = "UUID conversion")]
-    Uuid(#[cause] BytesError),
+    #[error("UUID conversion")]
+    Uuid(#[from] BytesError),
 
+    #[error("Decoding capnp")]
     #[cfg(feature = "use_capnp")]
-    #[fail(display = "Decoding capnp")]
-    Capnp(#[cause] CapnpError),
+    Capnp(#[from] CapnpError),
 
+    #[error("Detecting capnp schema")]
     #[cfg(feature = "use_capnp")]
-    #[fail(display = "Detecting capnp schema")]
-    CapnpSchema(#[cause] NotInSchema),
+    CapnpSchema(#[from] NotInSchema),
 
-    #[fail(display = "Error in PersistentLog")]
+    #[error("Error in PersistentLog")]
     // TODO: Proper error conversions
-    PersistentLog(Box<StdError + 'static + Send + Sync>),
+    PersistentLog(Box<dyn StdError + 'static + Send + Sync>),
 }

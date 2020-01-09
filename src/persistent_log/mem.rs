@@ -1,21 +1,15 @@
-use std::io::{Read, Write};
 use std::result;
 
-use persistent_log::{Error, Log};
-use {LogIndex, ServerId, Term};
+use crate::persistent_log::{Error, Log};
+use crate::{Entry, LogIndex, ServerId, Term};
 
 /// This is a `Log` implementation that stores entries in a simple in-memory vector. Other data
 /// is stored in a struct. It is chiefly intended for testing.
-///
-/// # Panic
-///
-/// No bounds checking is performed and attempted access to non-existing log
-/// indexes will panic.
 #[derive(Clone, Debug)]
 pub struct MemLog {
     current_term: Term,
     voted_for: Option<ServerId>,
-    entries: Vec<(Term, Vec<u8>)>,
+    entries: Vec<Entry>,
 }
 
 impl MemLog {
@@ -65,23 +59,25 @@ impl Log for MemLog {
         if len == 0 {
             Ok(Term::from(0))
         } else {
-            Ok(self.entries[len - 1].0)
+            Ok(self.entries[len - 1].term)
         }
     }
 
-    fn entry<W: Write>(&self, index: LogIndex, buf: Option<W>) -> Result<Term, Error> {
-        match self.entries.get((index - 1).as_u64() as usize) {
-            Some(&(term, ref bytes)) => {
-                if let Some(mut buf) = buf {
-                    buf.write_all(&bytes)?;
-                };
-                Ok(term)
-            }
-            None => Err(Error::BadIndex),
-        }
+    fn term(&self, index: LogIndex) -> Result<Term, Error> {
+        self.entries
+            .get((index - 1).as_u64() as usize)
+            .map(|entry| entry.term)
+            .ok_or(Error::BadIndex)
     }
 
-    fn append_entries<R: Read, I: Iterator<Item = (Term, R)>>(
+    fn entry(&self, index: LogIndex, dest: &mut Entry) -> Result<(), Error> {
+        self.entries
+            .get((index - 1).as_u64() as usize)
+            .map(|entry| *dest = entry.clone())
+            .ok_or(Error::BadIndex)
+    }
+
+    fn append_entries<I: Iterator<Item = Entry>>(
         &mut self,
         from: LogIndex,
         entries: I,
@@ -90,15 +86,14 @@ impl Log for MemLog {
             return Err(Error::BadLogIndex);
         }
 
-        // TODO remove vector hack
-        let mut entries_vec = Vec::new();
-        for (term, mut reader) in entries {
-            let mut v = Vec::new();
-            reader.read_to_end(&mut v)?;
-            entries_vec.push((term, v));
+        let start = (from - 1).as_u64() as usize;
+        if self.entries.len() < start + 1 {
+            return Err(Error::BadLogIndex);
+        } else {
+            self.entries.truncate(start);
         }
-        self.entries.truncate((from - 1).as_u64() as usize);
-        self.entries.extend(entries_vec.into_iter());
+
+        self.entries.extend(entries);
         Ok(())
     }
 }
@@ -148,7 +143,8 @@ mod test {
                 (Term::from(0), &[3]),
                 (Term::from(1), &[4]),
             ],
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(LogIndex::from(4), store.latest_log_index().unwrap());
         assert_eq!(Term::from(1), store.latest_log_term().unwrap());
 
@@ -191,7 +187,8 @@ mod test {
             &mut store,
             LogIndex::from(3),
             &[(Term(2), &[3]), (Term(3), &[4])],
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(LogIndex(4), store.latest_log_index().unwrap());
         assert_eq!(Term::from(3), store.latest_log_term().unwrap());
         assert_eq!(

@@ -12,8 +12,8 @@ use std::fmt::Debug;
 pub mod channel;
 pub mod null;
 
-pub use state_machine::channel::ChannelStateMachine;
-pub use state_machine::null::NullStateMachine;
+pub use crate::state_machine::channel::ChannelStateMachine;
+pub use crate::state_machine::null::NullStateMachine;
 
 /// This trait is meant to be implemented such that the commands issued to it via `apply()` will
 /// be reflected in your consuming application. Commands sent via `apply()` have been committed

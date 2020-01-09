@@ -1,26 +1,18 @@
-use state::ConsensusState;
-/// Module contains message types used in consensus
-/// Any network message have to be converted to theese enums to be processed
-use {Entry, LogIndex, ServerId, Term};
+#[cfg(feature = "use_serde")]
+use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "use_capnp")]
-use error::Error;
+use crate::error::Error;
+
+#[cfg(feature = "use_capnp")]
+use crate::messages_capnp::*;
 
 #[cfg(feature = "use_capnp")]
 use capnp::message::{Allocator, Builder, HeapAllocator, Reader, ReaderSegments};
-#[cfg(feature = "use_capnp")]
-use messages_capnp::*;
 
-//================= Peer messages
-#[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
-#[derive(Clone, Debug, PartialEq)]
-/// Any message that cluster peers can exchange
-pub enum PeerMessage {
-    AppendEntriesRequest(AppendEntriesRequest),
-    AppendEntriesResponse(AppendEntriesResponse),
-    RequestVoteRequest(RequestVoteRequest),
-    RequestVoteResponse(RequestVoteResponse),
-}
+/// Module contains message types used in consensus
+/// Any network message have to be converted to theese enums to be processed
+use crate::{Entry, LogIndex, ServerId, Term};
 
 #[cfg(feature = "use_capnp")]
 macro_rules! common_capnp {
@@ -47,29 +39,71 @@ macro_rules! common_capnp {
     }
 }
 
+//================= Consensus state types without internals
+#[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
+#[derive(Clone, Debug, PartialEq)]
+/// Any message that cluster peers can exchange
+pub enum ConsensusStateKind {
+    Follower,
+    Candidate,
+    Leader,
+}
+
+#[cfg(feature = "use_capnp")]
+impl ConsensusStateKind {
+    pub fn from_capnp<'a>(reader: consensus_state::Reader<'a>) -> Result<Self, Error> {
+        match reader.which().map_err(Error::CapnpSchema)? {
+            consensus_state::Which::Follower(()) => Ok(ConsensusStateKind::Follower),
+            consensus_state::Which::Candidate(()) => Ok(ConsensusStateKind::Candidate),
+            consensus_state::Which::Leader(()) => Ok(ConsensusStateKind::Leader),
+        }
+    }
+
+    pub fn fill_capnp<'a>(&self, builder: &mut consensus_state::Builder<'a>) {
+        match self {
+            &ConsensusStateKind::Follower => builder.reborrow().set_follower(()),
+            &ConsensusStateKind::Candidate => builder.reborrow().set_candidate(()),
+            &ConsensusStateKind::Leader => builder.reborrow().set_leader(()),
+        };
+    }
+
+    common_capnp!(consensus_state::Builder, consensus_state::Reader);
+}
+
+//================= Peer messages
+#[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
+#[derive(Clone, Debug, PartialEq)]
+/// Any message that cluster peers can exchange
+pub enum PeerMessage {
+    AppendEntriesRequest(AppendEntriesRequest),
+    AppendEntriesResponse(AppendEntriesResponse),
+    RequestVoteRequest(RequestVoteRequest),
+    RequestVoteResponse(RequestVoteResponse),
+    AddServerRequest(AddServerRequest),
+    AddServerResponse(AddServerResponse),
+}
+
 #[cfg(feature = "use_capnp")]
 impl PeerMessage {
     pub fn from_capnp<'a>(reader: peer_message::Reader<'a>) -> Result<Self, Error> {
         match reader.which().map_err(Error::CapnpSchema)? {
-            peer_message::Which::AppendEntriesRequest(m) => {
-                let message = m.map_err(Error::Capnp)?;
-                let message = AppendEntriesRequest::from_capnp(message)?;
-                Ok(message.into())
+            peer_message::Which::AppendEntriesRequest(message) => {
+                Ok(AppendEntriesRequest::from_capnp(message?)?.into())
             }
-            peer_message::Which::AppendEntriesResponse(m) => {
-                let message = m.map_err(Error::Capnp)?;
-                let message = AppendEntriesResponse::from_capnp(message)?;
-                Ok(message.into())
+            peer_message::Which::AppendEntriesResponse(message) => {
+                Ok(AppendEntriesResponse::from_capnp(message?)?.into())
             }
-            peer_message::Which::RequestVoteRequest(m) => {
-                let message = m.map_err(Error::Capnp)?;
-                let message = RequestVoteRequest::from_capnp(message)?;
-                Ok(message.into())
+            peer_message::Which::RequestVoteRequest(message) => {
+                Ok(RequestVoteRequest::from_capnp(message?)?.into())
             }
-            peer_message::Which::RequestVoteResponse(m) => {
-                let message = m.map_err(Error::Capnp)?;
-                let message = RequestVoteResponse::from_capnp(message)?;
-                Ok(message.into())
+            peer_message::Which::RequestVoteResponse(message) => {
+                Ok(RequestVoteResponse::from_capnp(message?)?.into())
+            }
+            peer_message::Which::AddServerRequest(message) => {
+                Ok(AddServerRequest::from_capnp(message?)?.into())
+            }
+            peer_message::Which::AddServerResponse(message) => {
+                Ok(AddServerResponse::from_capnp(message?)?.into())
             }
         }
     }
@@ -90,6 +124,14 @@ impl PeerMessage {
             }
             &PeerMessage::RequestVoteResponse(ref message) => {
                 let mut builder = builder.reborrow().init_request_vote_response();
+                message.fill_capnp(&mut builder);
+            }
+            &PeerMessage::AddServerRequest(ref message) => {
+                let mut builder = builder.reborrow().init_add_server_request();
+                message.fill_capnp(&mut builder);
+            }
+            &PeerMessage::AddServerResponse(ref message) => {
+                let mut builder = builder.reborrow().init_add_server_response();
                 message.fill_capnp(&mut builder);
             }
         };
@@ -326,6 +368,76 @@ impl RequestVoteResponse {
     );
 }
 
+//================= Cluster membership change messages
+#[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
+/// Request for adding new server to cluster
+pub struct AddServerRequest {
+    /// The id of new server being added
+    pub id: ServerId,
+    pub info: Vec<u8>,
+}
+
+impl From<AddServerRequest> for PeerMessage {
+    fn from(msg: AddServerRequest) -> PeerMessage {
+        PeerMessage::AddServerRequest(msg)
+    }
+}
+
+#[cfg(feature = "use_capnp")]
+impl AddServerRequest {
+    pub fn from_capnp<'a>(reader: add_server_request::Reader<'a>) -> Result<Self, Error> {
+        Ok(Self {
+            id: reader.get_id().into(),
+            info: reader.get_info()?.to_vec(),
+        })
+    }
+
+    pub fn fill_capnp<'a>(&self, builder: &mut add_server_request::Builder<'a>) {
+        builder.set_id(self.id.into());
+        builder.set_info(&self.info);
+    }
+
+    common_capnp!(add_server_request::Builder, add_server_request::Reader);
+}
+
+#[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
+/// Response when adding new server to cluster
+pub enum AddServerResponse {
+    Success,
+    UnknownLeader,
+    NotLeader(ServerId),
+}
+
+impl From<AddServerResponse> for PeerMessage {
+    fn from(msg: AddServerResponse) -> PeerMessage {
+        PeerMessage::AddServerResponse(msg)
+    }
+}
+
+#[cfg(feature = "use_capnp")]
+impl AddServerResponse {
+    pub fn from_capnp<'a>(reader: add_server_response::Reader<'a>) -> Result<Self, Error> {
+        let message = match reader.which().map_err(Error::CapnpSchema)? {
+            add_server_response::Which::Success(()) => AddServerResponse::Success,
+            add_server_response::Which::UnknownLeader(()) => AddServerResponse::UnknownLeader,
+            add_server_response::Which::NotLeader(id) => AddServerResponse::NotLeader(id.into()),
+        };
+        Ok(message)
+    }
+
+    pub fn fill_capnp<'a>(&self, builder: &mut add_server_response::Builder<'a>) {
+        match self {
+            &AddServerResponse::Success => builder.set_success(()),
+            &AddServerResponse::UnknownLeader => builder.set_unknown_leader(()),
+            &AddServerResponse::NotLeader(id) => builder.set_not_leader(id.into()),
+        }
+    }
+
+    common_capnp!(add_server_response::Builder, add_server_response::Reader);
+}
+
 //================= Client messages
 #[derive(Clone, Debug, PartialEq)]
 #[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
@@ -364,7 +476,7 @@ impl ClientRequest {
     common_capnp!(client_request::Builder, client_request::Reader);
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 #[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
 /// Response to clienti request.
 pub enum ClientResponse {
@@ -416,7 +528,7 @@ impl ClientResponse {
     common_capnp!(client_response::Builder, client_response::Reader);
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 #[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
 /// Part of client message.
 pub struct PingResponse {
@@ -427,7 +539,7 @@ pub struct PingResponse {
     pub(crate) index: LogIndex,
 
     /// The server's current state
-    pub(crate) state: ConsensusState,
+    pub(crate) state: ConsensusStateKind,
 }
 
 #[cfg(feature = "use_capnp")]
@@ -438,7 +550,7 @@ impl PingResponse {
             index: reader.get_index().into(),
             state: {
                 let reader = reader.get_state().map_err(Error::Capnp)?;
-                ConsensusState::from_capnp(reader)?
+                ConsensusStateKind::from_capnp(reader)?
             },
         })
     }
@@ -530,7 +642,8 @@ mod test {
                 let decoded = ::capnp::serialize::read_message(
                     &mut encoded,
                     ::capnp::message::DEFAULT_READER_OPTIONS,
-                ).unwrap();
+                )
+                .unwrap();
                 let decoded = <$t>::from_capnp_untyped(decoded).unwrap();
                 assert_eq!(message, decoded);
             }
@@ -620,5 +733,4 @@ mod test {
         });
         test_message(message);
     }
-
 }
