@@ -61,7 +61,8 @@ where
         log: L,
         state_machine: M,
     ) -> Result<Self, Error> {
-        let latest_log_index = log.latest_log_index()
+        let latest_log_index = log
+            .latest_log_index()
             .map_err(|e| Error::PersistentLog(Box::new(e)))?;
         //.map_err(|e| Error::PersistentLog(Box::new(e)))?;
         let leader_state = LeaderState::new(latest_log_index, &peers.iter().cloned().collect());
@@ -245,7 +246,8 @@ where
         match *response {
             AppendEntriesResponse::Success(term, _)
             | AppendEntriesResponse::StaleTerm(term)
-            | AppendEntriesResponse::InconsistentPrevEntry(term, _) if local_term < term =>
+            | AppendEntriesResponse::InconsistentPrevEntry(term, _)
+                if local_term < term =>
             {
                 self.transition_to_follower(handler, term, from)?;
                 handler.set_timeout(ConsensusTimeout::Election);
@@ -253,7 +255,8 @@ where
             }
             AppendEntriesResponse::Success(term, _)
             | AppendEntriesResponse::StaleTerm(term)
-            | AppendEntriesResponse::InconsistentPrevEntry(term, _) if local_term > term =>
+            | AppendEntriesResponse::InconsistentPrevEntry(term, _)
+                if local_term > term =>
             {
                 return Ok(None);
             }
@@ -699,7 +702,8 @@ where
     /// Transitions this consensus state machine to Leader state.
     fn transition_to_leader<H: ConsensusHandler>(&mut self, handler: &mut H) -> Result<(), Error> {
         trace!("transitioning to Leader");
-        let latest_log_index = self.log
+        let latest_log_index = self
+            .log
             .latest_log_index()
             .map_err(|e| Error::PersistentLog(Box::new(e)))?;
         handler.state_changed(self.state.clone(), ConsensusState::Leader);
@@ -709,7 +713,8 @@ where
         let message = AppendEntriesRequest {
             term: self.current_term(),
             prev_log_index: latest_log_index,
-            prev_log_term: self.log
+            prev_log_term: self
+                .log
                 .latest_log_term()
                 .map_err(|e| Error::PersistentLog(Box::new(e)))?,
             leader_commit: self.commit_index,

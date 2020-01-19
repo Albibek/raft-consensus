@@ -530,7 +530,8 @@ mod test {
                 let decoded = ::capnp::serialize::read_message(
                     &mut encoded,
                     ::capnp::message::DEFAULT_READER_OPTIONS,
-                ).unwrap();
+                )
+                .unwrap();
                 let decoded = <$t>::from_capnp_untyped(decoded).unwrap();
                 assert_eq!(message, decoded);
             }
@@ -620,5 +621,4 @@ mod test {
         });
         test_message(message);
     }
-
 }
