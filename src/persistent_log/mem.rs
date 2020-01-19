@@ -148,7 +148,8 @@ mod test {
                 (Term::from(0), &[3]),
                 (Term::from(1), &[4]),
             ],
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(LogIndex::from(4), store.latest_log_index().unwrap());
         assert_eq!(Term::from(1), store.latest_log_term().unwrap());
 
@@ -191,7 +192,8 @@ mod test {
             &mut store,
             LogIndex::from(3),
             &[(Term(2), &[3]), (Term(3), &[4])],
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(LogIndex(4), store.latest_log_index().unwrap());
         assert_eq!(Term::from(3), store.latest_log_term().unwrap());
         assert_eq!(

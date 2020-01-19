@@ -40,10 +40,12 @@ pub struct FsLog {
 
 impl FsLog {
     pub fn new(filename: &path::Path) -> Result<FsLog> {
-        let mut w = BufWriter::new(fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .open(&filename)?);
+        let mut w = BufWriter::new(
+            fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .open(&filename)?,
+        );
 
         let filelen = w.get_ref().metadata()?.len();
 
@@ -353,7 +355,8 @@ mod test {
                 (Term::from(0), &[3]),
                 (Term::from(1), &[4]),
             ],
-        ).unwrap();
+        )
+        .unwrap();
 
         assert_entries_equal(
             &store,
@@ -381,7 +384,8 @@ mod test {
             &mut store,
             LogIndex::from(2),
             &[(Term::from(0), &[2]), (Term::from(0), &[3])],
-        ).unwrap();
+        )
+        .unwrap();
 
         assert_entries_equal(
             &store,
@@ -402,7 +406,8 @@ mod test {
                 (Term::from(2), &[5]),
                 (Term::from(2), &[6]),
             ],
-        ).unwrap();
+        )
+        .unwrap();
         assert_entries_equal(
             &store,
             vec![
@@ -418,7 +423,8 @@ mod test {
             &mut store,
             LogIndex::from(3),
             &[(Term(4), &[7]), (Term(5), &[8])],
-        ).unwrap();
+        )
+        .unwrap();
         assert_entries_equal(
             &store,
             vec![
@@ -448,7 +454,8 @@ mod test {
                     (Term::from(0), &[3]),
                     (Term::from(1), &[4]),
                 ],
-            ).unwrap();
+            )
+            .unwrap();
         }
 
         // New store with the same backing file starts with the same state.
