@@ -1,7 +1,5 @@
-use std::result;
-
 use crate::persistent_log::{Error, Log};
-use crate::{Entry, LogIndex, ServerId, Term};
+use crate::{ConsensusConfig, Entry, EntryData, LogIndex, ServerId, Term};
 
 /// This is a `Log` implementation that stores entries in a simple in-memory vector. Other data
 /// is stored in a struct. It is chiefly intended for testing.
@@ -10,6 +8,7 @@ pub struct MemLog {
     current_term: Term,
     voted_for: Option<ServerId>,
     entries: Vec<Entry>,
+    latest_config_index: Option<usize>,
 }
 
 impl MemLog {
@@ -18,6 +17,7 @@ impl MemLog {
             current_term: Term(0),
             voted_for: None,
             entries: Vec::new(),
+            latest_config_index: None,
         }
     }
 }
@@ -25,41 +25,63 @@ impl MemLog {
 impl Log for MemLog {
     type Error = Error;
 
-    fn current_term(&self) -> result::Result<Term, Error> {
+    fn current_term(&self) -> Result<Term, Error> {
         Ok(self.current_term)
     }
 
-    fn set_current_term(&mut self, term: Term) -> result::Result<(), Error> {
+    fn set_current_term(&mut self, term: Term) -> Result<(), Error> {
         self.voted_for = None;
         self.current_term = term;
         Ok(())
     }
 
-    fn inc_current_term(&mut self) -> result::Result<Term, Error> {
+    fn inc_current_term(&mut self) -> Result<Term, Error> {
         self.voted_for = None;
         self.current_term = self.current_term + 1;
         self.current_term()
     }
 
-    fn voted_for(&self) -> result::Result<Option<ServerId>, Error> {
+    fn voted_for(&self) -> Result<Option<ServerId>, Error> {
         Ok(self.voted_for)
     }
 
-    fn set_voted_for(&mut self, address: ServerId) -> result::Result<(), Error> {
+    fn set_voted_for(&mut self, address: ServerId) -> Result<(), Error> {
         self.voted_for = Some(address);
         Ok(())
     }
 
-    fn latest_log_index(&self) -> result::Result<LogIndex, Error> {
+    fn latest_log_index(&self) -> Result<LogIndex, Error> {
         Ok(LogIndex(self.entries.len() as u64))
     }
 
-    fn latest_log_term(&self) -> result::Result<Term, Error> {
+    fn latest_log_term(&self) -> Result<Term, Error> {
         let len = self.entries.len();
         if len == 0 {
             Ok(Term::from(0))
         } else {
             Ok(self.entries[len - 1].term)
+        }
+    }
+
+    fn set_latest_config_index(&mut self, index: LogIndex) -> Result<(), Self::Error> {
+        self.latest_config_index = Some(index.0 as usize);
+        Ok(())
+    }
+
+    fn read_latest_config(&self, config: &mut ConsensusConfig) -> Result<(), Self::Error> {
+        let index = self
+            .latest_config_index
+            .map(|u| u as usize)
+            .ok_or(Error::BadIndex)?;
+        match self.entries.get(index) {
+            Some(Entry {
+                data: EntryData::Config(latest_config),
+                ..
+            }) => {
+                *config = latest_config.clone();
+                Ok(())
+            }
+            _ => Err(Error::BadIndex),
         }
     }
 
@@ -81,7 +103,7 @@ impl Log for MemLog {
         &mut self,
         from: LogIndex,
         entries: I,
-    ) -> result::Result<(), Self::Error> {
+    ) -> Result<(), Self::Error> {
         if self.latest_log_index()? + 1 < from {
             return Err(Error::BadLogIndex);
         }

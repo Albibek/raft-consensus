@@ -13,52 +13,58 @@ pub mod mem;
 
 use std::error;
 use std::fmt::{self, Debug};
-use std::result;
 
 // FIXME:
 //pub use persistent_log::fs::FsLog;
 pub use crate::persistent_log::mem::MemLog;
 
-use crate::{Entry, LogIndex, ServerId, Term};
+use crate::{ConsensusConfig, Entry, LogIndex, ServerId, Term};
 
 /// A store of persistent Raft state.
 pub trait Log: Clone + Debug + 'static {
     type Error: error::Error + Debug + Sized + 'static + Send + Sync;
 
     /// Returns the latest known term.
-    fn current_term(&self) -> result::Result<Term, Self::Error>;
+    fn current_term(&self) -> Result<Term, Self::Error>;
 
     /// Sets the current term to the provided value. The provided term must be greater than
     /// the current term. The `voted_for` value will be reset.
-    fn set_current_term(&mut self, term: Term) -> result::Result<(), Self::Error>;
+    fn set_current_term(&mut self, term: Term) -> Result<(), Self::Error>;
 
     /// Increment the current term. The `voted_for` value must be reset.
-    fn inc_current_term(&mut self) -> result::Result<Term, Self::Error>;
+    fn inc_current_term(&mut self) -> Result<Term, Self::Error>;
 
     /// Returns the candidate id of the candidate voted for in the current term (or none).
-    fn voted_for(&self) -> result::Result<Option<ServerId>, Self::Error>;
+    fn voted_for(&self) -> Result<Option<ServerId>, Self::Error>;
 
     /// Sets the candidate id voted for in the current term.
-    fn set_voted_for(&mut self, server: ServerId) -> result::Result<(), Self::Error>;
+    fn set_voted_for(&mut self, server: ServerId) -> Result<(), Self::Error>;
 
     /// Returns the index of the latest persisted log entry (0 if the log is empty).
-    fn latest_log_index(&self) -> result::Result<LogIndex, Self::Error>;
+    fn latest_log_index(&self) -> Result<LogIndex, Self::Error>;
 
     /// Returns the term of the latest persisted log entry (0 if the log is empty).
-    fn latest_log_term(&self) -> result::Result<Term, Self::Error>;
+    fn latest_log_term(&self) -> Result<Term, Self::Error>;
+
+    /// Since the config is written as a separate entry, it is already in the log, we only need
+    /// to save it's index in the log
+    fn set_latest_config_index(&mut self, index: LogIndex) -> Result<(), Self::Error>;
+
+    /// Should put the latest (actual for the current term) config into config provided rerefence
+    fn read_latest_config(&self, config: &mut ConsensusConfig) -> Result<(), Self::Error>;
 
     /// Returns term corresponding to log index
-    fn term(&self, index: LogIndex) -> result::Result<Term, Self::Error>;
+    fn term(&self, index: LogIndex) -> Result<Term, Self::Error>;
 
-    /// Writes the entry at the provided log index to provided reference
-    fn entry(&self, index: LogIndex, dest: &mut Entry) -> result::Result<(), Self::Error>;
+    /// Reads the entry at the provided log index into entry provided by reference
+    fn entry(&self, index: LogIndex, dest: &mut Entry) -> Result<(), Self::Error>;
 
     // /// Returns the given range of entries (excluding the right endpoint). Allocates.
     //fn entries(
     //&self,
     //lo: LogIndex,
     //hi: LogIndex,
-    //) -> result::Result<Vec<(Term, Vec<u8>)>, Self::Error> {
+    //) -> Result<Vec<(Term, Vec<u8>)>, Self::Error> {
     //let mut v = Vec::new();
     //for index in lo.as_u64()..hi.as_u64() {
     //let mut entry = Vec::new();
@@ -72,7 +78,7 @@ pub trait Log: Clone + Debug + 'static {
         &mut self,
         from: LogIndex,
         entries: I,
-    ) -> result::Result<(), Self::Error>;
+    ) -> Result<(), Self::Error>;
 }
 
 #[derive(Debug)]

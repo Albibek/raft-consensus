@@ -50,21 +50,7 @@ struct RequestVoteResponse {
   }
 }
 
-struct AddServerRequest {
-    id @0 :UInt64;
-    info @1 :Data;
-}
-
-struct AddServerResponse {
-    union {
-        success @0 :Void;
-        unknownLeader @1 :Void;
-        notLeader @2 :UInt64;
-    }
-}
-
 # Client messages
-
 struct ClientRequest {
     union {
         ping @0 :Void;
@@ -81,6 +67,23 @@ struct ClientResponse {
     }
 }
 
+# Cluster membership change messages
+struct AddServerRequest {
+    id @0 :UInt64;
+    info @1 :Data;
+}
+
+struct ServerCommandResponse {
+    union {
+        success @0 :Void;
+        badPeer @1 :Void;
+        alreadyPending @2 :Void;
+        unknownLeader @3 :Void;
+        notLeader @4 :UInt64;
+    }
+}
+
+# Other messages
 struct CommandResponse {
     union {
         success @0 :Data;
@@ -96,6 +99,7 @@ struct PingResponse {
     state @2 :ConsensusState;
 }
 
+# Other structures
 struct ConsensusState {
     union {
         leader @0 :Void;

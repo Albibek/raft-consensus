@@ -5,8 +5,10 @@ use std::collections::HashMap;
 use crate::error::Error;
 use crate::handler::ConsensusHandler;
 use crate::message::*;
-use crate::state::{CandidateState, ConsensusState, FollowerState, LeaderState};
-use crate::{ClientId, Entry, EntryData, LogIndex, Peer, ServerId, Term};
+use crate::state::{
+    CandidateState, CatchingUpRemote, CatchingUpState, ConsensusState, FollowerState, LeaderState,
+};
+use crate::{ClientId, ConsensusConfig, Entry, EntryData, LogIndex, Peer, ServerId, Term};
 
 use crate::persistent_log::Log;
 use crate::state_machine::StateMachine;
@@ -44,6 +46,9 @@ pub struct Consensus<L, M> {
     // Index of the latest entry applied to the state machine.
     last_applied: LogIndex,
 
+    // stores old config while new config is being committed to log
+    config_change: Option<ConsensusConfig>,
+
     // The current state of the `Consensus` (`Leader`, `Candidate`, or `Follower`).
     state: ConsensusState,
 }
@@ -54,10 +59,20 @@ where
     M: StateMachine,
 {
     /// Creates a `Consensus`.
+    ///
     /// Note that peers is a bootstrap list of peers consensus should initially connect to
     /// peer list can be empty if creator of consensus is totally sure peers exist in i.e. log or
     /// will be added later
     pub fn new(id: ServerId, peers: Vec<Peer>, log: L, state_machine: M) -> Result<Self, Error> {
+        // if the peer is in bootstrap config, we consider it a part of a cluster so far, and being
+        // able to vote right from the start
+        // otherwise it is started in a catching up state, starting to wwait for incoming
+        // appendEnvtires from leader
+        let state = if peers.iter().any(|peer| peer.id == id) {
+            ConsensusState::Follower(FollowerState::new())
+        } else {
+            ConsensusState::CatchingUp(CatchingUpState::new())
+        };
         Ok(Self {
             id,
             peers,
@@ -66,7 +81,8 @@ where
             commit_index: LogIndex(0),
             last_applied: LogIndex(0),
             min_index: LogIndex(0),
-            state: ConsensusState::Follower(FollowerState::new()),
+            config_change: None,
+            state,
         })
     }
 
@@ -103,15 +119,6 @@ where
                 self.request_vote_response(handler, from, response)?;
                 None
             }
-            PeerMessage::AddServerRequest(ref request) => {
-                let response = self.add_server_request(handler, from, request)?;
-                Some(PeerMessage::AddServerResponse(response))
-            }
-
-            PeerMessage::AddServerResponse(ref response) => {
-                self.add_server_response(handler, from, response)?;
-                None
-            }
         };
         if let Some(response) = response {
             handler.send_peer_message(from, response)
@@ -135,8 +142,12 @@ where
         }
 
         match self.state {
-            ConsensusState::Follower(ref mut state) => {
-                state.set_leader(from);
+            ConsensusState::CatchingUp(ref mut state) => {
+                // catching up basically repeats the follower's behaviour
+                // except saving the leader address (since node is not in cluster, not known to
+                // cluster and does not process any requests)
+                // TODO: it's lots of code common with FollowerState, we probably should generalize it at the cost of
+                // loosing some liearability of reading it
                 if current_term < leader_term {
                     self.log
                         .set_current_term(leader_term)
@@ -181,6 +192,24 @@ where
                                     // rearranged; see ktoso/akka-raft#66.
                                     return Ok(AppendEntriesResponse::StaleEntry);
                                 }
+                                for entry in entries {
+                                    // if entry is configuration change, we should update our
+                                    if let Entry {
+                                        data: EntryData::Config(config),
+                                        ..
+                                    } = entry
+                                    {
+                                        // entry list may contain multiple config changes,
+                                        // including ones committed by majority (which doesn't mean
+                                        // this peer has committed them)
+                                        // so we just overwrite everything
+                                        // and take only the last one
+                                        self.config_change = Some(ConsensusConfig {
+                                            peers: self.peers.clone(),
+                                        });
+                                        self.peers = config.peers.clone();
+                                    }
+                                }
                                 self.log
                                     .append_entries(
                                         leader_prev_log_index + 1,
@@ -203,6 +232,82 @@ where
                 handler.set_timeout(ConsensusTimeout::Election);
                 Ok(message)
             }
+            ConsensusState::Follower(ref mut state) => {
+                state.set_leader(from);
+                if current_term < leader_term {
+                    self.log
+                        .set_current_term(leader_term)
+                        .map_err(|e| Error::PersistentLog(Box::new(e)))?;
+                }
+                let message = {
+                    let leader_prev_log_index = request.prev_log_index;
+                    let leader_prev_log_term = request.prev_log_term;
+
+                    let latest_log_index = self.latest_log_index();
+                    if latest_log_index < leader_prev_log_index {
+                        // If the previous entries index was not the same we'd leave a gap! Reply failure.
+                        AppendEntriesResponse::InconsistentPrevEntry(
+                            self.current_term(),
+                            leader_prev_log_index,
+                        )
+                    } else {
+                        let existing_term = if leader_prev_log_index == LogIndex::from(0) {
+                            Term::from(0)
+                        } else {
+                            self.log
+                                .term(leader_prev_log_index)
+                                .map_err(|e| Error::PersistentLog(Box::new(e)))?
+                        };
+
+                        if existing_term != leader_prev_log_term {
+                            // If an existing entry conflicts with a new one (same index but different terms),
+                            // delete the existing entry and all that follow it
+                            AppendEntriesResponse::InconsistentPrevEntry(
+                                self.current_term(),
+                                leader_prev_log_index,
+                            )
+                        } else {
+                            if !request.entries.is_empty() {
+                                let entries = &request.entries;
+                                let num_entries = entries.len();
+                                let new_latest_log_index =
+                                    leader_prev_log_index + num_entries as u64;
+                                for entry in entries {
+                                    // if entry is configuration change, we should update our
+                                    //
+                                    if let Entry {
+                                        data: EntryData::Config(config),
+                                        ..
+                                    } = entry
+                                    {
+                                        self.config_change = Some(ConsensusConfig {
+                                            peers: self.peers.clone(),
+                                        });
+                                        self.peers = config.peers.clone();
+                                    }
+                                }
+                                self.log
+                                    .append_entries(
+                                        leader_prev_log_index + 1,
+                                        entries.iter().cloned(),
+                                    )
+                                    .map_err(|e| Error::PersistentLog(Box::new(e)))?;
+                                self.min_index = new_latest_log_index;
+                                // we are now matching the leader's log up to and including `new_latest_log_index`.
+                                self.commit_index =
+                                    cmp::min(request.leader_commit, new_latest_log_index);
+                                self.apply_commits();
+                            }
+                            AppendEntriesResponse::Success(
+                                self.current_term(),
+                                self.with_log(|log| log.latest_log_index())?,
+                            )
+                        }
+                    }
+                };
+                handler.set_timeout(ConsensusTimeout::Election);
+                Ok(message)
+            }
             ConsensusState::Candidate(_) => {
                 // recognize the new leader, return to follower state, and apply the entries
                 self.transition_to_follower(handler, leader_term, from)?;
@@ -216,9 +321,10 @@ where
                     // The single leader-per-term invariant is broken; there is a bug in the Raft
                     // implementation.
 
-                    // Even implementation bugs should not break the whole process probably
-
-                    return Err(Error::AnotherLeader(from, current_term));
+                    // Even implementation bugs should not break the whole process, so we return an
+                    // error
+                    panic!("single leader condition is broken");
+                    // return Err(Error::AnotherLeader(from, current_term));
                 }
 
                 // recognize the new leader, return to follower state, and apply the entries
@@ -241,6 +347,10 @@ where
         let local_term = self.current_term();
         let local_latest_log_index = self.latest_log_index();
 
+        if let ConsensusState::CatchingUp(_) = self.state {
+            // catching up hosts don't send requests and do not receive responses
+            return Err(Error::UnexpectedMessage);
+        }
         match *response {
             AppendEntriesResponse::Success(term, _)
             | AppendEntriesResponse::StaleTerm(term)
@@ -321,6 +431,7 @@ where
                     leader_commit: self.commit_index,
                 };
 
+                todo!("deal with cathing-up peer rounds and term comparison");
                 // as of now we push all the entries, regardless of amount
                 // this may be kind of dangerous sometimes because of amount being too big
                 // but most probably snapshotting whould solve it
@@ -406,6 +517,7 @@ where
         candidate: ServerId,
         request: &RequestVoteRequest,
     ) -> Result<RequestVoteResponse, Error> {
+        self.reset_catching_up(handler)?;
         // TODO remove
         let candidate_term = request.term;
         let candidate_log_term = request.last_log_term;
@@ -462,6 +574,7 @@ where
     ) -> Result<(), Error> {
         debug!("RequestVoteResponse from peer {}", from);
 
+        self.reset_catching_up(handler)?;
         let response = response;
         let local_term = self.current_term();
         let voter_term = response.voter_term();
@@ -516,45 +629,68 @@ where
     M: StateMachine,
 {
     /// Handles initiating of adding a new server to consensus
-    pub fn add_server_request<H: ConsensusHandler>(
+    pub fn apply_add_server_message<H: ConsensusHandler>(
         &mut self,
         handler: &mut H,
-        from: ServerId,
-        message: &AddServerRequest,
-    ) -> Result<AddServerResponse, Error> {
-        //
-        trace!("query for adding new server ({})", from);
-        /*
-           let leader = self.follower_state.leader;
-           match self.state {
-           ConsensusState::Candidate => Ok(Some(CommandResponse::UnknownLeader)),
-           ConsensusState::Follower if leader.is_none() => {
-           Ok(Some(CommandResponse::UnknownLeader))
-           }
-           ConsensusState::Follower => {
-        //&self.peers[&self.follower_state.leader.unwrap()],
-        // TODO: unwrap
-        Ok(Some(CommandResponse::NotLeader(
-        self.follower_state.leader.unwrap(),
-        )))
-        }
-        ConsensusState::Leader => match self.new_peer {
-        Some(peer) => todo!(),
-        None => todo!(),
-        },
-        };
-        */
-        todo!();
-    }
+        request: &AddServerRequest,
+    ) -> Result<ServerCommandResponse, Error> {
+        trace!("got query for adding new server");
+        match &mut self.state {
+            ConsensusState::CatchingUp(_) => Err(Error::UnexpectedMessage),
+            ConsensusState::Candidate(_) => Ok(ServerCommandResponse::UnknownLeader),
+            ConsensusState::Follower(ref state) => state
+                .leader
+                .map_or(Ok(ServerCommandResponse::UnknownLeader), |leader| {
+                    Ok(ServerCommandResponse::NotLeader(leader))
+                }),
+            ConsensusState::Leader(ref mut state) => {
+                // We can basically get into 2 cases here:
+                // * connect followed by AddServer: someone started a new node, but did not send
+                // an AddServer command. In this case we'll have a call to peer_connected, but will
+                // ignore it
+                // * AddServer followed by connect: someone first called the AddServer command and
+                // only then started the node
 
-    /// Handles initiating of adding a new server to consensus
-    pub fn add_server_response<H: ConsensusHandler>(
-        &mut self,
-        handler: &mut H,
-        from: ServerId,
-        message: &AddServerResponse,
-    ) -> Result<AddServerResponse, Error> {
-        todo!()
+                // upon receiving such a message, we need to let handlrer know we've got a new
+                // server
+
+                // then we add a server to consensus as being catching up
+
+                if state.catching_up.is_some() || self.config_change.is_some() {
+                    return Ok(ServerCommandResponse::AlreadyPending);
+                } else {
+                    // let handler know about a peer and check it's validity
+                    if handler.new_server(request.id, &request.info).is_err() {
+                        return Ok(ServerCommandResponse::BadPeer);
+                    }
+
+                    state.catching_up = Some(CatchingUpRemote::new(request.id));
+
+                    // take all log entries from the beginning of the log
+                    let mut message = AppendEntriesRequest {
+                        term: self.current_term(),
+                        prev_log_index: LogIndex(0),
+                        prev_log_term: Term(0),
+                        leader_commit: self.commit_index,
+                        entries: Vec::new(),
+                    };
+
+                    for idx in 0.. {
+                        let mut entry = Entry::default();
+                        self.with_log_mut(|log| log.entry(LogIndex(idx), &mut entry))?;
+
+                        message.entries.push(entry);
+                    }
+                    // For stateless/lossy  connections we cannot be sure if peer has received
+                    // our entries, so we call set_next_index only after response, which
+                    // is done in response processing code
+                    //self.leader_state.set_next_index(peer, until_index);
+                    handler
+                        .send_peer_message(request.id, PeerMessage::AppendEntriesRequest(message));
+                }
+                todo!();
+            }
+        }
     }
 }
 
@@ -609,15 +745,11 @@ where
         let term = self.current_term();
         match &mut self.state {
             ConsensusState::Candidate(_) => Ok(Some(CommandResponse::UnknownLeader)),
-            ConsensusState::Follower(ref state) => {
-                if state.leader.is_none() {
-                    Ok(Some(CommandResponse::UnknownLeader))
-                } else {
-                    //&self.peers[&self.follower_state.leader.unwrap()],
-                    // TODO: unwrap
-                    Ok(Some(CommandResponse::NotLeader(state.leader.unwrap())))
-                }
-            }
+            ConsensusState::Follower(ref state) => state
+                .leader
+                .map_or(Ok(Some(CommandResponse::UnknownLeader)), |leader| {
+                    Ok(Some(CommandResponse::NotLeader(leader)))
+                }),
             ConsensusState::Leader(ref mut state) => {
                 let log_index = prev_log_index + 1;
                 debug!("ProposalRequest from client {}: entry {}", from, log_index);
@@ -669,14 +801,11 @@ where
         trace!("query from Client({})", from);
         match &mut self.state {
             ConsensusState::Candidate(_) => CommandResponse::UnknownLeader,
-            ConsensusState::Follower(state) => {
-                if state.leader.is_none() {
-                    CommandResponse::UnknownLeader
-                } else {
-                    //&self.peers[&self.follower_state.leader.unwrap()],
-                    CommandResponse::NotLeader(state.leader.unwrap())
-                }
-            }
+            ConsensusState::Follower(ref state) => state
+                .leader
+                .map_or(CommandResponse::UnknownLeader, |leader| {
+                    CommandResponse::NotLeader(leader)
+                }),
             ConsensusState::Leader(_) => {
                 // TODO(from original raft): This is probably not exactly safe.
                 let result = self.state_machine.query(&request);
@@ -940,6 +1069,7 @@ where
                 handler.send_peer_message(peer, PeerMessage::RequestVoteRequest(message));
             }
             ConsensusState::Follower(_) => {
+                todo!("consider voter");
                 // No message is necessary; if the peer is a leader or candidate they will send a
                 // message.
             }
@@ -949,22 +1079,48 @@ where
         Ok(())
     }
 
+    fn reset_catching_up<H: ConsensusHandler>(&mut self, handler: &mut H) -> Result<(), Error> {
+        match &mut self.state {
+            ConsensusState::CatchingUp(_) => {
+                handler.peer_failed(self.id);
+                Err(Error::CatchUpFailed)
+            }
+            ConsensusState::Leader(ref mut state) => {
+                if let Some(catching_up_state) = state.catching_up.take() {
+                    handler.peer_failed(catching_up_state.peer.id);
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// Applies all committed but unapplied log entries to the state machine. Returns the set of
     /// return values from the commits applied.
     fn apply_commits(&mut self) -> HashMap<LogIndex, Vec<u8>> {
         let mut results = HashMap::new();
         while self.last_applied < self.commit_index {
             let mut entry = Entry::default();
-            // Unwrap justified here since we know there is an entry in the log.
+            // Unwrap is justified here since we know there is an entry in the log.
             self.log.entry(self.last_applied + 1, &mut entry).unwrap();
 
-            // apply only client data to the state machine
-            if let EntryData::Client(data) = entry.data {
-                if !data.is_empty() {
-                    let result = self.state_machine.apply(&data);
-                    results.insert(self.last_applied + 1, result);
+            match entry.data {
+                EntryData::Heartbeat => {
+                    // nothing to commit here
                 }
-                self.last_applied = self.last_applied + 1;
+                // data  is applied to the state machine
+                EntryData::Client(data) => {
+                    if !data.is_empty() {
+                        let result = self.state_machine.apply(&data);
+                        results.insert(self.last_applied + 1, result);
+                    }
+                    self.last_applied = self.last_applied + 1;
+                }
+                EntryData::Config(config) => {
+                    self.log.set_latest_config_index(self.last_applied);
+                    // remove the temporarily saved conig change
+                    self.config_change = None;
+                }
             }
         }
         results

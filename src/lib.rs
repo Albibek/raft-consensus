@@ -242,13 +242,12 @@ impl fmt::Display for ClientId {
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
 pub enum EntryData {
+    Heartbeat,
     Client(Vec<u8>),
-    AddServer(ServerId, Vec<u8>),
-    RemoveServer(ServerId),
+    Config(ConsensusConfig),
     // TODO:
-    // AddClient
+    // RegisterClient
     // RemoveClient
-    // Snapshot,
 }
 
 /// Type representing a log entry
@@ -312,4 +311,9 @@ impl Entry {
     }
 
     common_capnp!(entry::Builder, entry::Reader);
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ConsensusConfig {
+    peers: Vec<Peer>,
 }

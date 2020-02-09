@@ -24,6 +24,12 @@ pub enum Error {
     #[error("Unknown peer")]
     UnknownPeer(ServerId),
 
+    #[error("unexpected message")]
+    UnexpectedMessage,
+
+    #[error("catching up failed because of leader change")]
+    CatchUpFailed,
+
     #[error("BUG: peer leader with matching term detected")]
     AnotherLeader(ServerId, Term),
 

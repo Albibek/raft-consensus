@@ -79,8 +79,6 @@ pub enum PeerMessage {
     AppendEntriesResponse(AppendEntriesResponse),
     RequestVoteRequest(RequestVoteRequest),
     RequestVoteResponse(RequestVoteResponse),
-    AddServerRequest(AddServerRequest),
-    AddServerResponse(AddServerResponse),
 }
 
 #[cfg(feature = "use_capnp")]
@@ -98,12 +96,6 @@ impl PeerMessage {
             }
             peer_message::Which::RequestVoteResponse(message) => {
                 Ok(RequestVoteResponse::from_capnp(message?)?.into())
-            }
-            peer_message::Which::AddServerRequest(message) => {
-                Ok(AddServerRequest::from_capnp(message?)?.into())
-            }
-            peer_message::Which::AddServerResponse(message) => {
-                Ok(AddServerResponse::from_capnp(message?)?.into())
             }
         }
     }
@@ -124,14 +116,6 @@ impl PeerMessage {
             }
             &PeerMessage::RequestVoteResponse(ref message) => {
                 let mut builder = builder.reborrow().init_request_vote_response();
-                message.fill_capnp(&mut builder);
-            }
-            &PeerMessage::AddServerRequest(ref message) => {
-                let mut builder = builder.reborrow().init_add_server_request();
-                message.fill_capnp(&mut builder);
-            }
-            &PeerMessage::AddServerResponse(ref message) => {
-                let mut builder = builder.reborrow().init_add_server_response();
                 message.fill_capnp(&mut builder);
             }
         };
@@ -378,12 +362,6 @@ pub struct AddServerRequest {
     pub info: Vec<u8>,
 }
 
-impl From<AddServerRequest> for PeerMessage {
-    fn from(msg: AddServerRequest) -> PeerMessage {
-        PeerMessage::AddServerRequest(msg)
-    }
-}
-
 #[cfg(feature = "use_capnp")]
 impl AddServerRequest {
     pub fn from_capnp<'a>(reader: add_server_request::Reader<'a>) -> Result<Self, Error> {
@@ -404,34 +382,40 @@ impl AddServerRequest {
 #[derive(Clone, Debug, PartialEq)]
 #[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
 /// Response when adding new server to cluster
-pub enum AddServerResponse {
+pub enum ServerCommandResponse {
     Success,
+    BadPeer,
+    AlreadyPending,
     UnknownLeader,
     NotLeader(ServerId),
 }
 
-impl From<AddServerResponse> for PeerMessage {
-    fn from(msg: AddServerResponse) -> PeerMessage {
-        PeerMessage::AddServerResponse(msg)
-    }
-}
-
 #[cfg(feature = "use_capnp")]
-impl AddServerResponse {
+impl ServerCommandResponse {
     pub fn from_capnp<'a>(reader: add_server_response::Reader<'a>) -> Result<Self, Error> {
         let message = match reader.which().map_err(Error::CapnpSchema)? {
-            add_server_response::Which::Success(()) => AddServerResponse::Success,
-            add_server_response::Which::UnknownLeader(()) => AddServerResponse::UnknownLeader,
-            add_server_response::Which::NotLeader(id) => AddServerResponse::NotLeader(id.into()),
+            server_command_response::Which::Success(()) => ServerCommandResponse::Success,
+            server_command_response::Which::BadPeer(()) => ServerCommandResponse::BadPeer,
+            server_command_response::Which::AlreadyPending(()) => {
+                ServerCommandResponse::AlreadyPending
+            }
+            server_command_response::Which::UnknownLeader(()) => {
+                ServerCommandResponse::UnknownLeader
+            }
+            server_command_response::Which::NotLeader(id) => {
+                ServerCommandResponse::NotLeader(id.into())
+            }
         };
         Ok(message)
     }
 
-    pub fn fill_capnp<'a>(&self, builder: &mut add_server_response::Builder<'a>) {
+    pub fn fill_capnp<'a>(&self, builder: &mut server_command_response::Builder<'a>) {
         match self {
-            &AddServerResponse::Success => builder.set_success(()),
-            &AddServerResponse::UnknownLeader => builder.set_unknown_leader(()),
-            &AddServerResponse::NotLeader(id) => builder.set_not_leader(id.into()),
+            &ServerCommandResponse::Success => builder.set_success(()),
+            &ServerCommandResponse::BadPeer => builder.set_bad_peer(()),
+            &ServerCommandResponse::AlreadyPending => builder.set_already_pending(()),
+            &ServerCommandResponse::UnknownLeader => builder.set_unknown_leader(()),
+            &ServerCommandResponse::NotLeader(id) => builder.set_not_leader(id.into()),
         }
     }
 

@@ -1,3 +1,5 @@
+//!
+//!
 use std::collections::HashMap;
 use std::fmt::Debug;
 
@@ -6,19 +8,25 @@ use crate::state::ConsensusState;
 use crate::{ClientId, ServerId};
 
 /// Handler for actions returned from consensus
+///
+/// ### Note on peer connection handling
+///
 pub trait ConsensusHandler: Debug {
     fn send_peer_message(&mut self, id: ServerId, message: PeerMessage);
     fn send_client_response(&mut self, id: ClientId, message: ClientResponse);
     fn set_timeout(&mut self, timeout: ConsensusTimeout);
     fn clear_timeout(&mut self, timeout: ConsensusTimeout);
 
-    /// Called when new server request is coming.
-    /// Handler may require knowing this to connect to server
-    //fn new_server(&mut self, id: ServerId, info: Vec<u8>);
+    /// Called when AddServer RPC is made
+    /// Handler may require knowing this to connect to this new server
+    fn new_server(&mut self, id: ServerId, info: &[u8]) -> Result<(), ()>;
 
     #[allow(unused_variables)]
     /// Called when consensus goes to new state. Initializing new consensus does not call this function.
     fn state_changed(&mut self, old: ConsensusState, new: &ConsensusState) {}
+
+    /// called when peer caught the error where it should be restarted or failed
+    fn peer_failed(&mut self, id: ServerId);
 
     /// Called when the particular event has been fully processed. Useful for doing actions in batches.
     fn done(&mut self) {}
@@ -80,6 +88,12 @@ impl ConsensusHandler for CollectHandler {
             self.timeouts.push(timeout);
         }
     }
+
+    fn new_server(&mut self, _id: ServerId, _info: &[u8]) -> Result<(), ()> {
+        Ok(())
+    }
+
+    fn peer_failed(&mut self, _id: ServerId) {}
 
     fn clear_timeout(&mut self, timeout: ConsensusTimeout) {
         if !self.clear_timeouts.iter().any(|&t| t == timeout) {

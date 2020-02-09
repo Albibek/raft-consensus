@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::message::ConsensusStateKind;
-use crate::{ClientId, LogIndex, ServerId};
+use crate::{ClientId, LogIndex, Peer, PeerStatus, ServerId};
 /// Consensus modules can be in one of three state:
 ///
 /// * `Follower` - which replicates AppendEntries requests and votes for it's leader.
@@ -10,11 +10,13 @@ use crate::{ClientId, LogIndex, ServerId};
 /// * `Candidate` -  which campaigns in an election and may become a `Leader`
 ///                  (if it gets enough votes) or a `Follower`, if it hears from
 ///                  a `Leader`.
+/// * CatchingUp - which is currently trying to catch up the leader log
 #[derive(Clone, Debug)]
 pub enum ConsensusState {
     Follower(FollowerState),
     Candidate(CandidateState),
     Leader(LeaderState),
+    CatchingUp(CatchingUpState),
 }
 
 impl ConsensusState {
@@ -57,11 +59,47 @@ impl Default for ConsensusState {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct CatchingUpRemote {
+    pub peer: Peer,
+    log_index: LogIndex,
+    rounds_left: usize,
+}
+
+impl CatchingUpRemote {
+    pub fn new(id: ServerId) -> Self {
+        Self {
+            peer: Peer {
+                id,
+                status: PeerStatus::FutureMember,
+            },
+            log_index: LogIndex(0),
+            rounds_left: 10,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct CatchingUpState {
+    log_index: LogIndex,
+    rounds_left: usize,
+}
+
+impl CatchingUpState {
+    pub fn new() -> Self {
+        Self {
+            log_index: LogIndex(0),
+            rounds_left: 10,
+        }
+    }
+}
+
 /// The state associated with a Raft consensus module in the `Leader` state.
 #[derive(Clone, Debug)]
 pub struct LeaderState {
     next_index: HashMap<ServerId, LogIndex>,
     match_index: HashMap<ServerId, LogIndex>,
+    pub(crate) catching_up: Option<CatchingUpRemote>,
     /// Stores in-flight client proposals.
     pub(crate) proposals: VecDeque<(ClientId, LogIndex)>,
 }
@@ -87,14 +125,10 @@ impl LeaderState {
             })
             .last();
 
-        // let match_index = peers
-        //.cloned()
-        //.map(|peer| (peer, LogIndex::from(0)))
-        //.collect();
-
         LeaderState {
             next_index,
             match_index,
+            catching_up: None,
             proposals: VecDeque::new(),
         }
     }
