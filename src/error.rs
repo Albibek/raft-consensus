@@ -27,8 +27,11 @@ pub enum Error {
     #[error("unexpected message")]
     UnexpectedMessage,
 
-    #[error("catching up failed because of leader change")]
+    #[error("catching up failed because of timeout or leader change")]
     CatchUpFailed,
+
+    #[error("catching up failed because of bug")]
+    CatchUpBug,
 
     #[error("BUG: peer leader with matching term detected")]
     AnotherLeader(ServerId, Term),
@@ -47,4 +50,10 @@ pub enum Error {
     #[error("Error in PersistentLog")]
     // TODO: Proper error conversions
     PersistentLog(Box<dyn StdError + 'static + Send + Sync>),
+
+    #[error("Follower node must be in list of peers at start")]
+    MustBootstrap,
+
+    #[error("unable to support {} cluster members", peers)]
+    BadClusterSize,
 }

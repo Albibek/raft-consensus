@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex};
 
-use crate::consensus::HandledConsensus;
+//use crate::consensus::HandledConsensus;
 use crate::error::Error;
 use crate::handler::ConsensusHandler;
 use crate::message::*;
@@ -8,6 +8,8 @@ use crate::persistent_log::Log;
 use crate::state_machine::StateMachine;
 use crate::{ClientId, ServerId};
 
+/*
+ * FIXME: refactor if required
 /// Convenience wrapper for multithreaded handling of consensus packages
 /// Based on standard `Arc<Mutex<_>>` approach
 #[derive(Debug, Clone)]
@@ -62,3 +64,4 @@ where
         self.inner.lock().unwrap().election_timeout()
     }
 }
+*/

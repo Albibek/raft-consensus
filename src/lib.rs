@@ -24,8 +24,17 @@ pub mod consensus;
 #[cfg_attr(feature = "use_capnp", macro_use)]
 pub mod message;
 
-/// Provides consensus state type
-pub mod state;
+/// Contains consensus state transitions trait definition
+mod state;
+
+/// Module with all functions required in follower state
+pub mod candidate;
+/// Module with all functions required in catching-up state
+pub mod catching_up;
+/// Module with all functions required in candidate state
+pub mod follower;
+/// Module with all functions required in leader state
+pub mod leader;
 
 /// Handlers for consensus callbacks
 pub mod handler;
@@ -56,7 +65,6 @@ use crate::error::Error;
 pub use crate::consensus::Consensus;
 pub use crate::handler::ConsensusHandler;
 pub use crate::persistent_log::Log;
-pub use crate::shared::SharedConsensus;
 pub use crate::state_machine::StateMachine;
 
 /// The term of a log entry.
@@ -116,6 +124,9 @@ pub struct LogIndex(pub u64);
 impl LogIndex {
     pub fn as_u64(self) -> u64 {
         self.0
+    }
+    pub fn as_usize(self) -> usize {
+        self.0 as usize
     }
 }
 
@@ -238,6 +249,14 @@ impl fmt::Display for ClientId {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
+pub(crate) struct ConsensusConfig {
+    // we don't want to use just a vector(or a type alias) in case we would want to change
+    // this structure in future
+    peers: Vec<Peer>,
+}
+
 /// Type representing all possible data types that can be appended to a log
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
@@ -311,9 +330,4 @@ impl Entry {
     }
 
     common_capnp!(entry::Builder, entry::Reader);
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub struct ConsensusConfig {
-    peers: Vec<Peer>,
 }

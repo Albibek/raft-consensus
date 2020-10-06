@@ -17,13 +17,15 @@ pub trait ConsensusHandler: Debug {
     fn set_timeout(&mut self, timeout: ConsensusTimeout);
     fn clear_timeout(&mut self, timeout: ConsensusTimeout);
 
-    /// Called when AddServer RPC is made
-    /// Handler may require knowing this to connect to this new server
+    /// Called when AddServer RPC is made, so the connection to remote peer should be made
+    /// After having this method called handler SHOULD make sure peer is connected
+    /// and call consensus' peer_connected even if the peer connection was establlished before
+    /// and even if peer_connected was already called
     fn new_server(&mut self, id: ServerId, info: &[u8]) -> Result<(), ()>;
 
     #[allow(unused_variables)]
     /// Called when consensus goes to new state. Initializing new consensus does not call this function.
-    fn state_changed(&mut self, old: ConsensusState, new: &ConsensusState) {}
+    fn state_changed(&mut self, old: ConsensusStateKind, new: &ConsensusStateKind) {}
 
     /// called when peer caught the error where it should be restarted or failed
     fn peer_failed(&mut self, id: ServerId);
@@ -40,7 +42,7 @@ pub struct CollectHandler {
     pub client_messages: HashMap<ClientId, Vec<ClientResponse>>,
     pub timeouts: Vec<ConsensusTimeout>,
     pub clear_timeouts: Vec<ConsensusTimeout>,
-    pub state: ConsensusState,
+    pub state: ConsensusStateKind,
 }
 
 impl CollectHandler {
@@ -101,7 +103,7 @@ impl ConsensusHandler for CollectHandler {
         }
     }
 
-    fn state_changed(&mut self, _old: ConsensusState, new: &ConsensusState) {
+    fn state_changed(&mut self, _old: ConsensusStateKind, new: &ConsensusStateKind) {
         self.state = new.clone()
     }
 }

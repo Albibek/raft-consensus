@@ -16,7 +16,7 @@ use crate::{Entry, LogIndex, ServerId, Term};
 
 #[cfg(feature = "use_capnp")]
 macro_rules! common_capnp {
-    ($b:ty, $r:ty) =>  {
+    ($b:ty, $r:ty) => {
         pub fn as_capnp<A: Allocator>(&self, allocator: A) -> Builder<A> {
             let mut builder = Builder::new(allocator);
             {
@@ -31,12 +31,10 @@ macro_rules! common_capnp {
         }
 
         pub fn from_capnp_untyped<S: ReaderSegments>(reader: Reader<S>) -> Result<Self, Error> {
-            let message = reader
-                .get_root::<$r>()
-                .map_err(Error::Capnp)?;
+            let message = reader.get_root::<$r>().map_err(Error::Capnp)?;
             Self::from_capnp(message)
         }
-    }
+    };
 }
 
 //================= Consensus state types without internals
@@ -47,6 +45,7 @@ pub enum ConsensusStateKind {
     Follower,
     Candidate,
     Leader,
+    CatchingUp,
 }
 
 #[cfg(feature = "use_capnp")]
@@ -56,6 +55,7 @@ impl ConsensusStateKind {
             consensus_state::Which::Follower(()) => Ok(ConsensusStateKind::Follower),
             consensus_state::Which::Candidate(()) => Ok(ConsensusStateKind::Candidate),
             consensus_state::Which::Leader(()) => Ok(ConsensusStateKind::Leader),
+            consensus_state::Which::CatchingUp(()) => Ok(ConsensusStateKind::CatchingUp),
         }
     }
 
@@ -64,6 +64,7 @@ impl ConsensusStateKind {
             &ConsensusStateKind::Follower => builder.reborrow().set_follower(()),
             &ConsensusStateKind::Candidate => builder.reborrow().set_candidate(()),
             &ConsensusStateKind::Leader => builder.reborrow().set_leader(()),
+            &ConsensusStateKind::CatchingUp => builder.reborrow().set_catchingup(()),
         };
     }
 
@@ -385,6 +386,7 @@ impl AddServerRequest {
 pub enum ServerCommandResponse {
     Success,
     BadPeer,
+    LeaderJustChanged,
     AlreadyPending,
     UnknownLeader,
     NotLeader(ServerId),
@@ -396,6 +398,9 @@ impl ServerCommandResponse {
         let message = match reader.which().map_err(Error::CapnpSchema)? {
             server_command_response::Which::Success(()) => ServerCommandResponse::Success,
             server_command_response::Which::BadPeer(()) => ServerCommandResponse::BadPeer,
+            server_command_response::Which::LeaderJustChanged(()) => {
+                ServerCommandResponse::LeaderJustChanged
+            }
             server_command_response::Which::AlreadyPending(()) => {
                 ServerCommandResponse::AlreadyPending
             }
@@ -413,6 +418,7 @@ impl ServerCommandResponse {
         match self {
             &ServerCommandResponse::Success => builder.set_success(()),
             &ServerCommandResponse::BadPeer => builder.set_bad_peer(()),
+            &ServerCommandResponse::LeaderJustChanged => builder.set_leader_just_changed(()),
             &ServerCommandResponse::AlreadyPending => builder.set_already_pending(()),
             &ServerCommandResponse::UnknownLeader => builder.set_unknown_leader(()),
             &ServerCommandResponse::NotLeader(id) => builder.set_not_leader(id.into()),

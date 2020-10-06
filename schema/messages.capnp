@@ -11,7 +11,7 @@ struct PeerMessage {
    requestVoteResponse @3 :RequestVoteResponse;
 
    addServerRequest @4 :AddServerRequest;
-   addServerResponse @5 :AddServerResponse;
+   serverCommandResponse @5 :ServerCommandResponse;
    }
 }
 
@@ -78,8 +78,9 @@ struct ServerCommandResponse {
         success @0 :Void;
         badPeer @1 :Void;
         alreadyPending @2 :Void;
-        unknownLeader @3 :Void;
-        notLeader @4 :UInt64;
+        leaderJustChanged @3 :Void;
+        unknownLeader @4 :Void;
+        notLeader @5 :UInt64;
     }
 }
 
@@ -105,6 +106,7 @@ struct ConsensusState {
         leader @0 :Void;
         candidate @1 :Void;
         follower @2 :Void;
+        catchingup @3: Void;
     }
 }
 

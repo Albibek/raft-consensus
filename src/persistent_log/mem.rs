@@ -8,7 +8,7 @@ pub struct MemLog {
     current_term: Term,
     voted_for: Option<ServerId>,
     entries: Vec<Entry>,
-    latest_config_index: Option<usize>,
+    latest_config_index: Option<u64>,
 }
 
 impl MemLog {
@@ -64,22 +64,25 @@ impl Log for MemLog {
     }
 
     fn set_latest_config_index(&mut self, index: LogIndex) -> Result<(), Self::Error> {
-        self.latest_config_index = Some(index.0 as usize);
+        self.latest_config_index = Some(index.0);
         Ok(())
     }
 
-    fn read_latest_config(&self, config: &mut ConsensusConfig) -> Result<(), Self::Error> {
-        let index = self
-            .latest_config_index
-            .map(|u| u as usize)
-            .ok_or(Error::BadIndex)?;
-        match self.entries.get(index) {
+    fn latest_config_index(&mut self) -> Result<LogIndex, Self::Error> {
+        self.latest_config_index
+            .map(|i| i.into())
+            .ok_or(Error::NoConfig)
+    }
+
+    fn read_latest_config(&self, config: &mut ConsensusConfig) -> Result<LogIndex, Self::Error> {
+        let index = self.latest_config_index()?;
+        match self.entries.get(index.as_usize()) {
             Some(Entry {
                 data: EntryData::Config(latest_config),
                 ..
             }) => {
                 *config = latest_config.clone();
-                Ok(())
+                Ok(index)
             }
             _ => Err(Error::BadIndex),
         }
@@ -125,7 +128,8 @@ mod test {
 
     use super::*;
 
-    use persistent_log::{append_entries, get_entry, Log};
+    use crate::persistent_log::{append_entries, get_entry, Log};
+
     use {LogIndex, ServerId, Term};
 
     #[test]

@@ -22,6 +22,9 @@ use crate::{ConsensusConfig, Entry, LogIndex, ServerId, Term};
 
 /// A store of persistent Raft state.
 pub trait Log: Clone + Debug + 'static {
+    // FIXME: snapshot should probably be guided by leader(using snapshot flag for example), so all the nodes could have
+    // the snapshot at same point in time (QUESTION: it may not be nesessary actually)
+
     type Error: error::Error + Debug + Sized + 'static + Send + Sync;
 
     /// Returns the latest known term.
@@ -50,8 +53,16 @@ pub trait Log: Clone + Debug + 'static {
     /// to save it's index in the log
     fn set_latest_config_index(&mut self, index: LogIndex) -> Result<(), Self::Error>;
 
-    /// Should put the latest (actual for the current term) config into config provided rerefence
-    fn read_latest_config(&self, config: &mut ConsensusConfig) -> Result<(), Self::Error>;
+    /// Must return the log index of latest config change
+    fn latest_config_index(&mut self) -> Result<LogIndex, Self::Error>;
+
+    // raft 4.1( end of chapter, before 4.2:
+    // server must be prepared to fall back to the previous configuration in it's log
+    /// Must set the previous configuration change to  be the latest
+    //fn revert_config(&self, config: &mut ConsensusConfig) -> Result<LogIndex, Self::Error>;
+
+    /// Must put the latest (actual for the current term) config into config provided rerefence
+    fn read_latest_config(&self, config: &mut ConsensusConfig) -> Result<LogIndex, Self::Error>;
 
     /// Returns term corresponding to log index
     fn term(&self, index: LogIndex) -> Result<Term, Self::Error>;
@@ -74,6 +85,7 @@ pub trait Log: Clone + Debug + 'static {
     //}
 
     /// Appends the provided entries to the log beginning at the given index.
+    /// Note that for configuration change entries, the previous one should also be stored
     fn append_entries<I: Iterator<Item = Entry>>(
         &mut self,
         from: LogIndex,
@@ -86,6 +98,7 @@ pub enum Error {
     Version(u64, u64),
     BadIndex,
     BadLogIndex,
+    NoConfig,
     Io(::std::io::Error),
 }
 

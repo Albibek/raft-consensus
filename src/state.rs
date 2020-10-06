@@ -1,210 +1,238 @@
-use std::collections::{HashMap, HashSet, VecDeque};
-
+use crate::error::Error;
 use crate::message::ConsensusStateKind;
-use crate::{ClientId, LogIndex, Peer, PeerStatus, ServerId};
-/// Consensus modules can be in one of three state:
-///
-/// * `Follower` - which replicates AppendEntries requests and votes for it's leader.
-/// * `Leader` - which leads the cluster by serving incoming requests, ensuring
-///              data is replicated, and issuing heartbeats.
-/// * `Candidate` -  which campaigns in an election and may become a `Leader`
-///                  (if it gets enough votes) or a `Follower`, if it hears from
-///                  a `Leader`.
-/// * CatchingUp - which is currently trying to catch up the leader log
+
+use crate::handler::ConsensusHandler;
+use crate::message::*;
+use crate::{ClientId, ServerId};
+
+use crate::consensus::State;
+use crate::persistent_log::Log;
+
+use crate::candidate::CandidateState;
+use crate::catching_up::CatchingUpState;
+use crate::follower::FollowerState;
+use crate::leader::LeaderState;
+
+pub(crate) enum ConsensusState<L, M> {
+    Leader(State<L, M, LeaderState>),
+    Follower(State<L, M, FollowerState>),
+    Candidate(State<L, M, CandidateState>),
+    CatchingUp(State<L, M, CatchingUpState>),
+}
+
+/// Applies a peer message to the consensus state machine.
+pub(crate) fn apply_peer_message<L, M, S: StateHandler<L, M, H>, H: ConsensusHandler>(
+    s: &mut S,
+    handler: &mut H,
+    from: ServerId,
+    message: PeerMessage,
+) -> Result<(Option<PeerMessage>, Option<ConsensusState<L, M>>), Error> {
+    let message = message; // This enforces a by-value move making clippy happy
+    let result = match message {
+        PeerMessage::AppendEntriesRequest(ref request) => {
+            // request produces response and optionally - new state
+            let (response, new) = s.append_entries_request(handler, from, request)?;
+            (Some(PeerMessage::AppendEntriesResponse(response)), new)
+        }
+
+        PeerMessage::AppendEntriesResponse(ref response) => {
+            // response may produce a new request as an answer
+            let (request, new) = s.append_entries_response(handler, from, response)?;
+            (request.map(PeerMessage::AppendEntriesRequest), new)
+        }
+
+        PeerMessage::RequestVoteRequest(ref request) => {
+            // vote request always produces response and optionally - state change
+            let (response, new) = s.request_vote_request(handler, from, request)?;
+            (Some(PeerMessage::RequestVoteResponse(response)), new)
+        }
+
+        PeerMessage::RequestVoteResponse(ref response) => {
+            // request vote response does not produce new requests, but may produce new state
+            let new = s.request_vote_response(handler, from, response)?;
+            (None, new)
+        }
+    };
+    Ok(result)
+}
+
+pub(crate) fn apply_timeout<L, M, S: StateHandler<L, M, H>, H: ConsensusHandler>(
+    s: &mut S,
+    handler: &mut H,
+    timeout: ConsensusTimeout,
+) -> Result<(), Error> {
+    match timeout {
+        ConsensusTimeout::Election => s.election_timeout(handler)?,
+        ConsensusTimeout::Heartbeat(id) => {
+            let request = s.heartbeat_timeout(id)?;
+            // we get here only if we are leader
+            let request = PeerMessage::AppendEntriesRequest(request);
+            handler.send_peer_message(id, request);
+        }
+    };
+    Ok(())
+}
+
+/// Applies a client message to the consensus state machine.
+pub(crate) fn apply_client_message<L, M, S: StateHandler<L, M, H>, H: ConsensusHandler>(
+    s: &mut S,
+    handler: &mut H,
+    from: ClientId,
+    message: ClientRequest,
+) -> Result<Option<ClientResponse>, Error> {
+    Ok(match message {
+        ClientRequest::Ping => Some(ClientResponse::Ping(s.client_ping_request())),
+        ClientRequest::Proposal(data) => {
+            let response = s.client_proposal_request(handler, from, data)?;
+            response.map(ClientResponse::Proposal)
+        }
+        ClientRequest::Query(data) => {
+            Some(ClientResponse::Query(s.client_query_request(from, &data)))
+        }
+    })
+}
+
+pub fn apply_config_change_message<L, M, S: StateHandler<L, M, H>, H: ConsensusHandler>(
+    s: &mut S,
+    handler: &mut H,
+    request: &AddServerRequest,
+) -> Result<ServerCommandResponse, Error> {
+    s.add_server_request(handler, request)
+}
+
+pub(crate) trait StateHandler<L, M, H: ConsensusHandler> {
+    // Peer messages
+
+    /// Apply an append entries request to the consensus state machine.
+    fn append_entries_request(
+        &mut self,
+        handler: &mut H,
+        from: ServerId,
+        request: &AppendEntriesRequest,
+    ) -> Result<(AppendEntriesResponse, Option<ConsensusState<L, M>>), Error>;
+
+    /// Apply an append entries response to the consensus state machine.
+    ///
+    /// The provided message may be initialized with a new AppendEntries request to send back to
+    /// the follower in the case that the follower's log is behind.
+    fn append_entries_response(
+        &mut self,
+        handler: &mut H,
+        from: ServerId,
+        response: &AppendEntriesResponse,
+    ) -> Result<(Option<AppendEntriesRequest>, Option<ConsensusState<L, M>>), Error>;
+
+    /// Applies a peer request vote request to the consensus state machine.
+    fn request_vote_request(
+        &mut self,
+        handler: &mut H,
+        candidate: ServerId,
+        request: &RequestVoteRequest,
+    ) -> Result<(RequestVoteResponse, Option<ConsensusState<L, M>>), Error>;
+
+    /// Applies a request vote response to the consensus state machine.
+    fn request_vote_response(
+        &mut self,
+        handler: &mut H,
+        from: ServerId,
+        response: &RequestVoteResponse,
+    ) -> Result<Option<ConsensusState<L, M>>, Error>;
+
+    // Timeout handling
+    /// Handles heartbeat timeout event
+    fn heartbeat_timeout(&mut self, peer: ServerId) -> Result<AppendEntriesRequest, Error>;
+    fn election_timeout(&mut self, handler: &mut H) -> Result<(), Error>;
+
+    // Utility messages and actions
+    fn peer_connected(&mut self, handler: &mut H, peer: ServerId) -> Result<(), Error>;
+
+    // Configuration change messages
+    fn add_server_request(
+        &mut self,
+        handler: &mut H,
+        request: &AddServerRequest,
+    ) -> Result<ServerCommandResponse, Error>;
+
+    // Client messages
+    fn client_ping_request(&self) -> PingResponse {
+        PingResponse {
+            term: self.current_term(),
+            index: self.latest_log_index(),
+            state: self.state.kind(),
+        }
+    }
+
+    /// Applies a client proposal to the consensus state machine.
+    fn client_proposal_request(
+        &mut self,
+        handler: &mut H,
+        from: ClientId,
+        request: Vec<u8>,
+    ) -> Result<Option<CommandResponse>, Error>;
+
+    fn client_query_request(&mut self, from: ClientId, request: &[u8]) -> CommandResponse;
+}
+
+/*
+    /// Consensus modules can be in one of three state:
+    ///
+    /// * `Follower` - which replicates AppendEntries requests and votes for it's leader.
+    /// * `Leader` - which leads the cluster by serving incoming requests, ensuring
+    ///              data is replicated, and issuing heartbeats.
+    /// * `Candidate` -  which campaigns in an election and may become a `Leader`
+    ///                  (if it gets enough votes) or a `Follower`, if it hears from
+    ///                  a `Leader`.
+    /// * CatchingUp - which is currently trying to catch up the leader log. The leader is still
+    /// foreign to the node, because node that didn't catch up is not considered to be in cluster yet
 #[derive(Clone, Debug)]
 pub enum ConsensusState {
-    Follower(FollowerState),
-    Candidate(CandidateState),
-    Leader(LeaderState),
-    CatchingUp(CatchingUpState),
+Follower(FollowerState),
+Candidate(CandidateState),
+Leader(LeaderState),
+CatchingUp(CatchingUpState),
 }
 
 impl ConsensusState {
-    pub fn kind(&self) -> ConsensusStateKind {
-        match self {
-            ConsensusState::Follower(_) => ConsensusStateKind::Follower,
-            ConsensusState::Candidate(_) => ConsensusStateKind::Candidate,
-            ConsensusState::Leader(_) => ConsensusStateKind::Leader,
-        }
-    }
+pub fn kind(&self) -> ConsensusStateKind {
+match self {
+ConsensusState::Follower(_) => ConsensusStateKind::Follower,
+ConsensusState::Candidate(_) => ConsensusStateKind::Candidate,
+ConsensusState::Leader(_) => ConsensusStateKind::Leader,
+ConsensusState::CatchingUp(_) => ConsensusStateKind::CatchingUp,
+}
+}
 
-    pub fn is_follower(&self) -> bool {
-        if let ConsensusState::Follower(_) = self {
-            true
-        } else {
-            false
-        }
-    }
+pub fn is_follower(&self) -> bool {
+if let ConsensusState::Follower(_) = self {
+true
+} else {
+false
+}
+}
 
-    pub fn is_candidate(&self) -> bool {
-        if let ConsensusState::Candidate(_) = self {
-            true
-        } else {
-            false
-        }
-    }
+pub fn is_candidate(&self) -> bool {
+if let ConsensusState::Candidate(_) = self {
+true
+} else {
+false
+}
+}
 
-    pub fn is_leader(&self) -> bool {
-        if let ConsensusState::Leader(_) = self {
-            true
-        } else {
-            false
-        }
-    }
+pub fn is_leader(&self) -> bool {
+if let ConsensusState::Leader(_) = self {
+true
+} else {
+false
+}
+}
 }
 
 impl Default for ConsensusState {
-    fn default() -> Self {
-        ConsensusState::Follower(FollowerState::new())
-    }
+fn default() -> Self {
+ConsensusState::Follower(FollowerState::new())
 }
-
-#[derive(Clone, Debug)]
-pub struct CatchingUpRemote {
-    pub peer: Peer,
-    log_index: LogIndex,
-    rounds_left: usize,
 }
-
-impl CatchingUpRemote {
-    pub fn new(id: ServerId) -> Self {
-        Self {
-            peer: Peer {
-                id,
-                status: PeerStatus::FutureMember,
-            },
-            log_index: LogIndex(0),
-            rounds_left: 10,
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct CatchingUpState {
-    log_index: LogIndex,
-    rounds_left: usize,
-}
-
-impl CatchingUpState {
-    pub fn new() -> Self {
-        Self {
-            log_index: LogIndex(0),
-            rounds_left: 10,
-        }
-    }
-}
-
-/// The state associated with a Raft consensus module in the `Leader` state.
-#[derive(Clone, Debug)]
-pub struct LeaderState {
-    next_index: HashMap<ServerId, LogIndex>,
-    match_index: HashMap<ServerId, LogIndex>,
-    pub(crate) catching_up: Option<CatchingUpRemote>,
-    /// Stores in-flight client proposals.
-    pub(crate) proposals: VecDeque<(ClientId, LogIndex)>,
-}
-
-impl LeaderState {
-    /// Returns a new `LeaderState` struct.
-    ///
-    /// # Arguments
-    ///
-    /// * `latest_log_index` - The index of the leader's most recent log entry at the
-    ///                        time of election.
-    /// * `peers` - The set of peer cluster members.
-    pub(crate) fn new<'a, I: Iterator<Item = &'a ServerId>>(
-        latest_log_index: LogIndex,
-        peers: I,
-    ) -> LeaderState {
-        let mut next_index = HashMap::new();
-        let mut match_index = HashMap::new();
-        peers
-            .map(|peer| {
-                next_index.insert(peer.clone(), latest_log_index + 1);
-                match_index.insert(peer.clone(), LogIndex::from(0));
-            })
-            .last();
-
-        LeaderState {
-            next_index,
-            match_index,
-            catching_up: None,
-            proposals: VecDeque::new(),
-        }
-    }
-
-    /// Returns the next log entry index of the follower.
-    pub(crate) fn next_index(&mut self, follower: &ServerId) -> LogIndex {
-        self.next_index[follower]
-    }
-
-    /// Sets the next log entry index of the follower.
-    pub(crate) fn set_next_index(&mut self, follower: ServerId, index: LogIndex) {
-        self.next_index.insert(follower, index);
-    }
-
-    /// Sets the index of the highest log entry known to be replicated on the
-    /// follower.
-    pub(crate) fn set_match_index(&mut self, follower: ServerId, index: LogIndex) {
-        self.match_index.insert(follower, index);
-    }
-
-    /// Counts the number of followers containing the given log index.
-    pub(crate) fn count_match_indexes(&self, index: LogIndex) -> usize {
-        // +1 for self.
-        self.match_index.values().filter(|&&i| i >= index).count() + 1
-    }
-}
-
-/// The state associated with a Raft consensus module in the `Candidate` state.
-#[derive(Clone, Debug)]
-pub struct CandidateState {
-    granted_votes: HashSet<ServerId>,
-}
-
-impl CandidateState {
-    /// Creates a new `CandidateState`.
-    pub(crate) fn new() -> CandidateState {
-        CandidateState {
-            granted_votes: HashSet::new(),
-        }
-    }
-
-    /// Records a vote from `voter`.
-    pub(crate) fn record_vote(&mut self, voter: ServerId) {
-        self.granted_votes.insert(voter);
-    }
-
-    /// Returns the number of votes.
-    pub(crate) fn count_votes(&self) -> usize {
-        self.granted_votes.len()
-    }
-
-    /// Returns whether the peer has voted in the current election.
-    pub(crate) fn peer_voted(&self, voter: ServerId) -> bool {
-        self.granted_votes.contains(&voter)
-    }
-}
-
-/// The state associated with a Raft consensus module in the `Follower` state.
-#[derive(Clone, Debug)]
-pub struct FollowerState {
-    /// The most recent leader of the follower. The leader is not guaranteed to be active, so this
-    /// should only be used as a hint.
-    pub(crate) leader: Option<ServerId>,
-}
-
-impl FollowerState {
-    /// Returns a new `FollowerState`.
-    pub(crate) fn new() -> FollowerState {
-        FollowerState { leader: None }
-    }
-
-    /// Sets a new leader.
-    pub(crate) fn set_leader(&mut self, leader: ServerId) {
-        self.leader = Some(leader);
-    }
-}
+*/
 
 #[cfg(test)]
 mod tests {
