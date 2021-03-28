@@ -21,11 +21,14 @@ pub trait ConsensusHandler: Debug {
     /// After having this method called handler SHOULD make sure peer is connected
     /// and call consensus' peer_connected even if the peer connection was establlished before
     /// and even if peer_connected was already called
-    fn new_server(&mut self, id: ServerId, info: &[u8]) -> Result<(), ()>;
+    fn ensure_connected(&mut self, &[Peer]) -> Result<(), ()>;
 
     #[allow(unused_variables)]
     /// Called when consensus goes to new state. Initializing new consensus does not call this function.
     fn state_changed(&mut self, old: ConsensusStateKind, new: &ConsensusStateKind) {}
+
+    /// called when remote peer should not be connected to the node
+    fn disconnect_peer(&mut self, id: ServerId);
 
     /// called when peer caught the error where it should be restarted or failed
     fn peer_failed(&mut self, id: ServerId);

@@ -29,8 +29,6 @@ mod state;
 
 /// Module with all functions required in follower state
 pub mod candidate;
-/// Module with all functions required in catching-up state
-pub mod catching_up;
 /// Module with all functions required in candidate state
 pub mod follower;
 /// Module with all functions required in leader state

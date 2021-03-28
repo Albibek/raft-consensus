@@ -27,8 +27,22 @@ pub trait Log: Clone + Debug + 'static {
 
     type Error: error::Error + Debug + Sized + 'static + Send + Sync;
 
+    // AppenEntries-related functions
+
     /// Returns the latest known term.
     fn current_term(&self) -> Result<Term, Self::Error>;
+
+    /// Returns term corresponding to log index if such term exists in log
+    fn term(&self, index: LogIndex) -> Result<Option<Term>, Self::Error>;
+
+    /// Returns the index of the latest persisted log entry (0 if the log is empty).
+    fn latest_log_index(&self) -> Result<LogIndex, Self::Error>;
+
+    /// Delete or mark invalid all entries since specified log index
+    /// return the new index, possibly lower, than requested
+    fn discard_since(&self, index: LogIndex) -> Result<(), Self::Error>;
+
+    // Voting-related functions
 
     /// Sets the current term to the provided value. The provided term must be greater than
     /// the current term. The `voted_for` value will be reset.
@@ -42,9 +56,6 @@ pub trait Log: Clone + Debug + 'static {
 
     /// Sets the candidate id voted for in the current term.
     fn set_voted_for(&mut self, server: ServerId) -> Result<(), Self::Error>;
-
-    /// Returns the index of the latest persisted log entry (0 if the log is empty).
-    fn latest_log_index(&self) -> Result<LogIndex, Self::Error>;
 
     /// Returns the term of the latest persisted log entry (0 if the log is empty).
     fn latest_log_term(&self) -> Result<Term, Self::Error>;
@@ -63,9 +74,6 @@ pub trait Log: Clone + Debug + 'static {
 
     /// Must put the latest (actual for the current term) config into config provided rerefence
     fn read_latest_config(&self, config: &mut ConsensusConfig) -> Result<LogIndex, Self::Error>;
-
-    /// Returns term corresponding to log index
-    fn term(&self, index: LogIndex) -> Result<Term, Self::Error>;
 
     /// Reads the entry at the provided log index into entry provided by reference
     fn entry(&self, index: LogIndex, dest: &mut Entry) -> Result<(), Self::Error>;

@@ -24,8 +24,9 @@ pub use crate::state_machine::null::NullStateMachine;
 /// implementation should not use `.unwrap()`, `.expect()` or anything else that likes to `panic!()`
 pub trait StateMachine: Debug + Send + 'static {
     /// Applies a command to the state machine.
-    /// Returns an application-specific result value.
-    fn apply(&mut self, command: &[u8]) -> Vec<u8>;
+    /// if results_required is true, should return an application-specific result value.
+    /// if results are note required, may return empty vector to avoid allocation
+    fn apply(&mut self, command: &[u8], results_required: bool) -> Vec<u8>;
 
     /// Queries a value of the state machine. Does not go through the durable log, or mutate the
     /// state machine.

@@ -17,7 +17,6 @@ pub(crate) enum ConsensusState<L, M> {
     Leader(State<L, M, LeaderState>),
     Follower(State<L, M, FollowerState>),
     Candidate(State<L, M, CandidateState>),
-    CatchingUp(State<L, M, CatchingUpState>),
 }
 
 /// Applies a peer message to the consensus state machine.
@@ -100,6 +99,7 @@ pub fn apply_config_change_message<L, M, S: StateHandler<L, M, H>, H: ConsensusH
     s.add_server_request(handler, request)
 }
 
+/// This trait defines a consensus behaviour in the each
 pub(crate) trait StateHandler<L, M, H: ConsensusHandler> {
     // Peer messages
 
@@ -108,7 +108,7 @@ pub(crate) trait StateHandler<L, M, H: ConsensusHandler> {
         &mut self,
         handler: &mut H,
         from: ServerId,
-        request: &AppendEntriesRequest,
+        request: AppendEntriesRequest,
     ) -> Result<(AppendEntriesResponse, Option<ConsensusState<L, M>>), Error>;
 
     /// Apply an append entries response to the consensus state machine.
@@ -119,7 +119,7 @@ pub(crate) trait StateHandler<L, M, H: ConsensusHandler> {
         &mut self,
         handler: &mut H,
         from: ServerId,
-        response: &AppendEntriesResponse,
+        response: AppendEntriesResponse,
     ) -> Result<(Option<AppendEntriesRequest>, Option<ConsensusState<L, M>>), Error>;
 
     /// Applies a peer request vote request to the consensus state machine.
@@ -154,13 +154,7 @@ pub(crate) trait StateHandler<L, M, H: ConsensusHandler> {
     ) -> Result<ServerCommandResponse, Error>;
 
     // Client messages
-    fn client_ping_request(&self) -> PingResponse {
-        PingResponse {
-            term: self.current_term(),
-            index: self.latest_log_index(),
-            state: self.state.kind(),
-        }
-    }
+    fn client_ping_request(&self) -> PingResponse;
 
     /// Applies a client proposal to the consensus state machine.
     fn client_proposal_request(
@@ -171,6 +165,8 @@ pub(crate) trait StateHandler<L, M, H: ConsensusHandler> {
     ) -> Result<Option<CommandResponse>, Error>;
 
     fn client_query_request(&mut self, from: ClientId, request: &[u8]) -> CommandResponse;
+
+    fn kind(&self) -> ConsensusStateKind;
 }
 
 /*

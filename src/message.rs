@@ -45,7 +45,7 @@ pub enum ConsensusStateKind {
     Follower,
     Candidate,
     Leader,
-    CatchingUp,
+    //    CatchingUp,
 }
 
 #[cfg(feature = "use_capnp")]
@@ -55,7 +55,7 @@ impl ConsensusStateKind {
             consensus_state::Which::Follower(()) => Ok(ConsensusStateKind::Follower),
             consensus_state::Which::Candidate(()) => Ok(ConsensusStateKind::Candidate),
             consensus_state::Which::Leader(()) => Ok(ConsensusStateKind::Leader),
-            consensus_state::Which::CatchingUp(()) => Ok(ConsensusStateKind::CatchingUp),
+            //consensus_state::Which::CatchingUp(()) => Ok(ConsensusStateKind::CatchingUp),
         }
     }
 
@@ -64,7 +64,7 @@ impl ConsensusStateKind {
             &ConsensusStateKind::Follower => builder.reborrow().set_follower(()),
             &ConsensusStateKind::Candidate => builder.reborrow().set_candidate(()),
             &ConsensusStateKind::Leader => builder.reborrow().set_leader(()),
-            &ConsensusStateKind::CatchingUp => builder.reborrow().set_catchingup(()),
+            //&ConsensusStateKind::CatchingUp => builder.reborrow().set_catchingup(()),
         };
     }
 

@@ -2,7 +2,6 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::error::Error;
 use log::{debug, info, trace};
-use std::cmp;
 
 use crate::consensus::State;
 use crate::handler::ConsensusHandler;
@@ -20,12 +19,11 @@ where
     M: StateMachine,
     H: ConsensusHandler,
 {
-    /// Apply an append entries request to the consensus state machine.
     fn append_entries_request(
         &mut self,
         handler: &mut H,
         from: ServerId,
-        request: &AppendEntriesRequest,
+        request: AppendEntriesRequest,
     ) -> Result<(AppendEntriesResponse, Option<ConsensusState<L, M>>), Error> {
         // when leader receives AppendEntries, this means another leader is in action somehow
         let leader_term = request.term;
@@ -39,31 +37,28 @@ where
             // When new leader is at the same term, the single leader-per-term invariant is broken; there is a bug in the Raft
             // implementation.
 
-            panic!("single leader condition is broken");
+            panic!("BUG: single leader condition is broken");
             //return Err(Error::AnotherLeader(from, current_term));
         }
 
-        self.state.reset_catching_up();
-        let ConsensusState::Follower(new_state) = self.to_follower(handler, leader_term)?;
+        let new_state = self.leader_to_follower(handler, leader_term)?;
         let (response, new_state) = new_state.append_entries_request(handler, from, request)?;
 
         Ok((response, new_state))
     }
 
-    /// Apply an append entries response to the consensus state machine.
-    ///
     /// The provided message may be initialized with a new AppendEntries request to send back to
     /// the follower in the case that the follower's log is behind.
     fn append_entries_response(
         &mut self,
         handler: &mut H,
         from: ServerId,
-        response: &AppendEntriesResponse,
+        response: AppendEntriesResponse,
     ) -> Result<(Option<AppendEntriesRequest>, Option<ConsensusState<L, M>>), Error> {
         let current_term = self.current_term()?;
         let local_latest_log_index = self.latest_log_index()?;
 
-        match *response {
+        match response {
             AppendEntriesResponse::Success(term, _)
             | AppendEntriesResponse::StaleTerm(term)
             | AppendEntriesResponse::InconsistentPrevEntry(term, _)
@@ -72,8 +67,8 @@ where
                 // some node has received message with term higher than ours,
                 // that means some other leader appeared in consensus,
                 // we should downgrade to follower immediately
-                let new_state = self.to_follower(handler, current_term)?;
-                return Ok((None, Some(new_state)));
+                let new_state = self.leader_to_follower(handler, current_term)?;
+                return Ok((None, Some(ConsensusState::Follower(new_state))));
             }
             AppendEntriesResponse::Success(term, _)
             | AppendEntriesResponse::StaleTerm(term)
@@ -93,8 +88,15 @@ where
                     return Err(Error::BadFollowerIndex);
                 }
 
+                // catching up node will be handled internally
                 self.state.set_match_index(from, follower_latest_log_index);
-                self.try_advance_commit_index(handler)?;
+
+                if self.state.has_follower(&from) && self.state.is_catching_up(&from) {
+                    // advance commit only if response was from follower
+                    self.try_advance_commit_index(handler)?;
+                } else {
+                    return Err(Error::UnknownPeer(from.clone()));
+                }
             }
             AppendEntriesResponse::InconsistentPrevEntry(_, next_index) => {
                 self.state.set_next_index(from, next_index)?;
@@ -111,7 +113,7 @@ where
             }
         }
 
-        // catching up peer is handled internally by state fucntions
+        // catching up peer is handled internally by state funtion
         let next_index = self.state.next_index(&from)?;
 
         if next_index <= local_latest_log_index {
@@ -126,7 +128,8 @@ where
             let prev_log_term = if prev_log_index == LogIndex(0) {
                 Term(0)
             } else {
-                self.with_log(|log| log.term(prev_log_index))?
+                // non-existence of index is definitely a bug here
+                self.with_log(|log| log.term(prev_log_index))?.unwrap()
             };
 
             let from_index = next_index;
@@ -160,16 +163,14 @@ where
 
             Ok((Some(message), None))
         } else {
-            if let Some(ref mut catching_up) = self.state.catching_up {
-                if from == catching_up.peer.id {
-                    // the catching up remote has catched up
-                    // we should begin committing the new config
-                    self.state.catching_up_ready();
-
-                    //FIXME:
-                    todo!("add config change entry to log and distribute it over cluster");
-                }
+            if self.state.is_catching_up(&from) {
+                // the catching up remote has catched up
+                // we should begin committing the new config
             }
+
+            todo!("remove the election timeout to stop counting rounds for catching up follower");
+            //FIXME:
+            todo!("add config change entry to log and distribute it over cluster");
 
             // since the peer is caught up, set a heartbeat timeout.
             handler.set_timeout(ConsensusTimeout::Heartbeat(from));
@@ -183,8 +184,7 @@ where
         handler: &mut H,
         candidate: ServerId,
         request: &RequestVoteRequest,
-    ) -> Result<(RequestVoteResponse, Option<ConsensusState<L, M>>), Error>
-where {
+    ) -> Result<(RequestVoteResponse, Option<ConsensusState<L, M>>), Error> {
         // FIXME:
         // there is also leader change, meaning all uncommitted configuration changes
         // must be revert (QUESTION: does this repend on candidate's log index or not?)
@@ -199,15 +199,109 @@ where {
         from: ServerId,
         response: &RequestVoteResponse,
     ) -> Result<Option<ConsensusState<L, M>>, Error> {
+        let local_term = self.current_term()?;
+        let voter_term = response.voter_term();
+        if local_term < voter_term {
+            // Responder has a higher term number. The election is compromised; abandon it and
+            // revert to follower state with the updated term number. Any further responses we
+            // receive from this election term will be ignored because the term will be outdated.
+
+            // The responder is not necessarily the leader, but it is somewhat likely, so we will
+            // use it as the leader hint.
+            info!(
+                "received RequestVoteResponse from Consensus {{ id: {}, term: {} }} \
+                with newer term; transitioning to Follower",
+                from, voter_term
+            );
+            let follower_state = self.to_follower(handler, voter_term)?;
+            Ok(Some(follower_state))
+        } else {
+            // local_term > voter_term: ignore the message; it came from a previous election cycle
+            // local_term = voter_term: since state is not candidate, it's ok because some votes
+            // can come after we became follower or leader
+
+            Ok(None)
+        }
     }
 
     // Timeout handling
-    /// Handles heartbeat timeout event
-    fn heartbeat_timeout(&mut self, peer: ServerId) -> Result<AppendEntriesRequest, Error> {}
-    fn election_timeout(&mut self, handler: &mut H) -> Result<(), Error> {}
+    /// Triggered by a heartbeat timeout for the peer.
+    fn heartbeat_timeout(&mut self, peer: ServerId) -> Result<AppendEntriesRequest, Error> {
+        debug!("HeartbeatTimeout for peer: {}", peer);
+        Ok(AppendEntriesRequest {
+            term: self.current_term(),
+            prev_log_index: self.latest_log_index(),
+            prev_log_term: self.with_log(|log| log.latest_log_term())?,
+            leader_commit: self.commit_index,
+            entries: Vec::new(),
+        })
+    }
+
+    fn election_timeout(&mut self, handler: &mut H) -> Result<(), Error> {
+        if state.config_change.is_some() {
+            // TODO option for number of timeouts
+            if state.config_change.add_timeout().ok_or(Error::CatchUpBug)? >= 8 {
+                // let handler know peer has failed
+                handler.peer_failed(state.config_change.peer);
+                // allowed number of timeouts passed without catching up
+                state.config_change = None;
+                return Err(Error::CatchUpFailed);
+            } else {
+                // remote still has time to catch up
+                handler.set_timeout(ConsensusTimeout::Election);
+            }
+        } else {
+            return Err(Error::MustNotLeader);
+        }
+    }
 
     // Utility messages and actions
-    fn peer_connected(&mut self, handler: &mut H, peer: ServerId) -> Result<(), Error> {}
+    fn peer_connected(&mut self, handler: &mut H, peer: ServerId) -> Result<(), Error> {
+        //
+        let new_peer = !self.peers.iter().any(|&p| p.id == peer);
+        if new_peer {
+            // This may still be correct peer, but it is was not added using AddServer API or was
+            // removed already
+            // the peer still can be the one that is going to catch up, so we skip this
+            // check for a leader state
+            // By this reason we don't panic here, returning an error
+            debug!("New peer connected, but not found in consensus: {:?}", peer);
+        }
+        let peer_index = state.next_index(&peer)?;
+
+        // Send any outstanding entries to the peer, or an empty heartbeat if there are no
+        // outstanding entries.
+        let until_index = self.latest_log_index() + 1;
+
+        let prev_log_index = peer_index - 1;
+        let prev_log_term = if prev_log_index == LogIndex::from(0) {
+            Term::from(0)
+        } else {
+            self.with_log(|log| log.term(prev_log_index))?
+        };
+
+        let mut message = AppendEntriesRequest {
+            term: self.current_term(),
+            prev_log_index,
+            prev_log_term,
+            leader_commit: self.commit_index,
+            entries: Vec::new(),
+        };
+
+        for idx in peer_index.as_u64()..until_index.as_u64() {
+            let mut entry = Entry::default();
+            self.with_log_mut(|log| log.entry(LogIndex(idx), &mut entry))?;
+
+            message.entries.push(entry);
+        }
+
+        // For stateless/lossy connections we cannot be sure if peer has received
+        // our entries, so we call set_next_index only after response, which
+        // is done in response processing code
+        //self.leader_state.set_next_index(peer, until_index);
+        handler.send_peer_message(peer, PeerMessage::AppendEntriesRequest(message));
+        handler.done();
+    }
 
     // Configuration change messages
     fn add_server_request(
@@ -215,6 +309,12 @@ where {
         handler: &mut H,
         request: &AddServerRequest,
     ) -> Result<ServerCommandResponse, Error> {
+        //
+        todo!("process add_server request")
+    }
+
+    fn client_ping_request(&self) -> PingResponse {
+        self.common_client_ping_request()
     }
 
     /// Applies a client proposal to the consensus state machine.
@@ -224,9 +324,63 @@ where {
         from: ClientId,
         request: Vec<u8>,
     ) -> Result<Option<CommandResponse>, Error> {
+        let prev_log_index = self.latest_log_index();
+        let prev_log_term = self.latest_log_term();
+        let term = self.current_term();
+
+        let log_index = prev_log_index + 1;
+        debug!("ProposalRequest from client {}: entry {}", from, log_index);
+        let leader_commit = self.commit_index;
+        self.log
+            .append_entries(
+                log_index,
+                Some(Entry::new(term, EntryData::Client(request.clone()))).into_iter(),
+            )
+            .map_err(|e| Error::PersistentLog(Box::new(e)))?;
+
+        state.proposals.push_back((from, log_index));
+
+        // the order of messages could broke here if we return Queued after calling
+        // advance_commit_index since it queues some more packets for client,
+        // we must first of all let client know that proposal has been received
+        // and only confirm commits after that
+        handler.send_client_response(from, ClientResponse::Proposal(CommandResponse::Queued));
+        if self.peers.is_empty() {
+            self.advance_commit_index(handler)?;
+        } else {
+            let message = AppendEntriesRequest {
+                term,
+                prev_log_index,
+                prev_log_term,
+                leader_commit,
+                entries: vec![Entry::new(term, EntryData::Client(request))],
+            };
+            for &peer in &self.peers {
+                if state.next_index(&peer.id) == log_index {
+                    handler.send_peer_message(
+                        peer.id,
+                        PeerMessage::AppendEntriesRequest(message.clone()),
+                    );
+                    state.set_next_index(peer.id, log_index + 1);
+                }
+            }
+            self.advance_commit_index(handler)?;
+        }
+        // Since queued is already sent, we need no more messages for client
+        Ok(None)
     }
 
-    fn client_query_request(&mut self, from: ClientId, request: &[u8]) -> CommandResponse {}
+    fn client_query_request(&mut self, from: ClientId, request: &[u8]) -> CommandResponse {
+        trace!("query from Client({})", from);
+
+        // TODO(from original raft): This is probably not exactly safe.
+        let result = self.state_machine.query(&request);
+        CommandResponse::Success(result)
+    }
+
+    fn kind(&self) -> ConsensusStateKind {
+        ConsensusStateKind::Leader
+    }
 }
 
 impl<L, M> State<L, M, LeaderState>
@@ -234,6 +388,22 @@ where
     L: Log,
     M: StateMachine,
 {
+    fn leader_to_follower<H: ConsensusHandler>(
+        &self,
+        handler: &mut H,
+        leader_term: Term,
+    ) -> Result<State<L, M, FollowerState>, Error> {
+        if let Some(catching) = self.state.catching_up {
+            handler.clear_timeout(ConsensusTimeout::Heartbeat(catching.peer.id));
+            handler.disconnect_peer(catching.peer.id);
+        }
+
+        let ConsensusState::Follower(new_state) =
+            self.to_follower(handler, ConsensusStateKind::Leader, leader_term)?;
+
+        Ok(new_state)
+    }
+
     fn try_advance_commit_index<H: ConsensusHandler>(
         &mut self,
         handler: &mut H,
@@ -251,21 +421,33 @@ where
             }
         }
 
-        let results = self.apply_commits();
+        let results = self.apply_commits(true);
 
         // As long as we know it, we send the connected clients the notification
         // about their proposals being committed
-        // TODO: fix client proposals being out of order (think if it is possible)
+        //
+        // Anote about client proposals ordering: they may come out of order obviously (via parallel
+        // TCP connectinos, for example),
+        // but the consensus should not be responsible for that ordering
+        // because state machine may or may not depend on it
+        //
+        // What the consensus shlud really be responsible is the same ordering on the followers.
+        // And since it is leader that applies and commits the commands, the order
+        // they come will be kept as indended, as it's enqueued in self.state.proposals
+        // so we don't need to do any special handling of it outside the client state machine aplication
         while let Some(&(client, index)) = self.state.proposals.get(0) {
             if index <= self.commit_index {
                 trace!("responding to client {} for entry {}", client, index);
-
+                // state machine's apply have to return a vector, that means the
+                // results will always contain the index required, so we
+                // can safely unwrap it, otherwise it's a bug and we should panic
                 // We know that there will be an index here since it was commited
                 // and the index is less than that which has been commited.
-                let result = &results[&index];
                 handler.send_client_response(
                     client,
-                    ClientResponse::Proposal(CommandResponse::Success(result.clone())),
+                    ClientResponse::Proposal(CommandResponse::Success(
+                        results.remove(&index).unwrap(),
+                    )),
                 );
                 self.state.proposals.pop_front();
             } else {
@@ -314,6 +496,18 @@ impl LeaderState {
             match_index,
             catching_up: None,
             proposals: VecDeque::new(),
+        }
+    }
+
+    pub(crate) fn has_follower(&mut self, follower: &ServerId) -> bool {
+        self.match_index.contains_key(follower)
+    }
+
+    pub(crate) fn is_catching_up(&mut self, node: &ServerId) -> bool {
+        if let Some(catching_up) = self.catching_up {
+            node == &catching_up.peer.id
+        } else {
+            false
         }
     }
 
@@ -370,6 +564,12 @@ impl LeaderState {
         Err(Error::UnknownPeer(follower))
     }
 
+    /// Sets the index of the highest log entry known to be replicated on the
+    /// follower.
+    pub(crate) fn set_match_index(&mut self, follower: ServerId, index: LogIndex) {
+        self.match_index.insert(follower, index);
+    }
+
     pub(crate) fn update_rounds(&mut self, catching_up: ServerId) -> Result<(), Error> {
         if let Some(
             ref mut
@@ -396,15 +596,9 @@ impl LeaderState {
         Ok(())
     }
 
-    /// Sets the index of the highest log entry known to be replicated on the
-    /// follower.
-    pub(crate) fn set_match_index(&mut self, follower: ServerId, index: LogIndex) {
-        self.match_index.insert(follower, index);
-    }
-
     /// Counts the number of followers containing the given log index.
     pub(crate) fn count_match_indexes(&self, index: LogIndex) -> usize {
-        // +1 for self.
+        // +1 is for self
         self.match_index.values().filter(|&&i| i >= index).count() + 1
     }
 
