@@ -266,6 +266,10 @@ pub struct RequestVoteRequest {
 
     /// The term of the candidate's last log entry.
     pub last_log_term: Term,
+
+    /// If this request was done due to leadership given away by leader
+    /// by it's own will
+    pub is_voluntary_step_down: bool,
 }
 
 impl From<RequestVoteRequest> for PeerMessage {
@@ -281,6 +285,7 @@ impl RequestVoteRequest {
             term: reader.get_term().into(),
             last_log_index: reader.get_last_log_index().into(),
             last_log_term: reader.get_last_log_term().into(),
+            is_voluntary_step_down: reader.get_is_voluntaery_step_down(),
         })
     }
 
@@ -288,6 +293,7 @@ impl RequestVoteRequest {
         builder.set_term(self.term.into());
         builder.set_last_log_term(self.last_log_term.into());
         builder.set_last_log_index(self.last_log_index.into());
+        builder.set_is_voluntary_step_down(self.is_voluntary_step_down);
     }
 
     common_capnp!(request_vote_request::Builder, request_vote_request::Reader);

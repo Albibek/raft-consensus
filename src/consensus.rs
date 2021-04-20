@@ -28,7 +28,6 @@ macro_rules! all_states {
             ConsensusState::Leader($state) => $e,
             ConsensusState::Follower($state) => $e,
             ConsensusState::Candidate($state) => $e,
-            //            ConsensusState::CatchingUp($state) => $e,
         };
     };
 }
@@ -49,7 +48,6 @@ where
             st,
             apply_config_change_message(&mut st, handler, request)
         );
-        handler.done();
         response
     }
 }
@@ -63,16 +61,16 @@ where
 #[derive(Debug, Clone)]
 pub struct State<L, M, S> {
     // The ID of this consensus instance.
-    id: ServerId,
+    pub(crate) id: ServerId,
 
     // The IDs of peers in the consensus group.
-    peers: Vec<Peer>,
+    pub(crate) peers: Vec<Peer>,
 
     // The persistent log.
-    log: L,
+    pub(crate) log: L,
 
     // The client state machine to which client commands are applied.
-    state_machine: M,
+    pub(crate) state_machine: M,
 
     // Index of the latest entry known to be committed.
     pub(crate) commit_index: LogIndex,
@@ -82,10 +80,10 @@ pub struct State<L, M, S> {
     // when messages arrive out of order. It is reset on set_leader() and
     // otherwise left untouched.
     // See see ktoso/akka-raft#66.
-    min_index: LogIndex,
+    pub(crate) min_index: LogIndex,
 
     // Index of the latest entry applied to the state machine.
-    last_applied: LogIndex,
+    pub(crate) last_applied: LogIndex,
 
     // The current state of the `Consensus` (`Leader`, `Candidate`, or `Follower`).
     pub(crate) state: S,
@@ -97,111 +95,6 @@ where
     L: Log,
     M: StateMachine,
 {
-    /// AppendEntries processing function for both follower and catching up node
-    pub(crate) fn follower_append_entries<H: ConsensusHandler>(
-        &mut self,
-        request: AppendEntriesRequest,
-        handler: &mut H,
-        current_term: Term,
-    ) -> Result<AppendEntriesResponse, Error> {
-        let leader_term = request.term;
-        if current_term < leader_term {
-            self.log
-                .set_current_term(leader_term)
-                .map_err(|e| Error::PersistentLog(Box::new(e)))?;
-        }
-
-        let leader_prev_log_index = request.prev_log_index;
-        let leader_prev_log_term = request.prev_log_term;
-        let current_term = self.current_term()?;
-
-        let latest_log_index = self.latest_log_index()?;
-
-        // check for gaps
-        if latest_log_index < leader_prev_log_index {
-            // If the previous entries index was not the same we'd leave a gap! Reply failure.
-            return Ok(AppendEntriesResponse::InconsistentPrevEntry(
-                current_term,
-                leader_prev_log_index,
-            ));
-        }
-
-        let existing_term = if leader_prev_log_index == LogIndex::from(0) {
-            // zeroes mean the very start, when everything is empty at leader and follower
-            // we better leave this here as special case rather than requiring it from
-            // persistent log implementation
-            Some(Term::from(0))
-        } else {
-            // try to find term of specified log index and check if there is such entry
-            self.log
-                .term(leader_prev_log_index)
-                .map_err(|e| Error::PersistentLog(Box::new(e)))?
-        };
-
-        if existing_term
-            .map(|term| term != leader_prev_log_term)
-            .unwrap_or(true)
-        {
-            // If an existing entry conflicts with a new one (same index but different terms),
-            // delete the existing entry and all that follow it
-
-            self.log
-                .discard_since(leader_prev_log_index)
-                .map_err(|e| Error::PersistentLog(Box::new(e)))?;
-
-            // TODO we could send a hint to a leader about existing index, so leader
-            // could send the entries starting from this index instead of decrementing it each time
-            return Ok(AppendEntriesResponse::InconsistentPrevEntry(
-                current_term,
-                leader_prev_log_index,
-            ));
-        }
-
-        // empty entries means heartbeat message
-        if request.entries.is_empty() {
-            // reply success right away
-            return Ok(AppendEntriesResponse::Success(
-                current_term,
-                latest_log_index,
-            ));
-        }
-
-        // now, for non-empty entries
-        // append only those that needs to be applied
-        let AppendEntriesRequest {
-            entries,
-            ..
-                //term , prev_log_index, prev_log_term, leader_commit, entries
-        }
-        = request;
-        let num_entries = entries.len();
-        let new_latest_log_index = leader_prev_log_index + num_entries as u64;
-        if new_latest_log_index < self.min_index {
-            // Stale entry; ignore. This guards against overwriting a
-            // possibly committed part of the log if messages get
-            // rearranged; see ktoso/akka-raft#66.
-            return Ok(AppendEntriesResponse::StaleEntry);
-        }
-
-        self.log
-            .append_entries(leader_prev_log_index + 1, entries.into_iter())
-            .map_err(|e| Error::PersistentLog(Box::new(e)))?;
-        self.min_index = new_latest_log_index;
-        // We are matching the leader's log up to and including `new_latest_log_index`.
-        self.commit_index = cmp::min(request.leader_commit, new_latest_log_index);
-        self.apply_commits(false);
-
-        // among the changes a config change may have come
-        // so we ask the handler to check it and maybe do the connection
-        // with new peers or disconnect the removed ones
-        handler.ensure_connected(&self.peers);
-
-        Ok(AppendEntriesResponse::Success(
-            current_term,
-            new_latest_log_index,
-        ))
-    }
-
     /// Applies all committed but unapplied log entries to the state machine. Returns the set of
     /// return values from the commits applied.
     /// if results are not required, returns an empty map
@@ -229,7 +122,7 @@ where
                     // according to raft paper, nodes do not need to
                     // wait for entries to be committed by majority
                     // and can apply configuration right away as it goes to the log
-                    if let &EntryData::Config(ConsensusConfig { peers: peers }) = &entry.data {
+                    if let &EntryData::Config(ConsensusConfig { peers }) = &entry.data {
                         self.peers = peers.clone();
                     }
                 }
@@ -319,22 +212,33 @@ where
         Ok(ConsensusState::Follower(follower_state))
     }
 
-    // All candidates behave in the same way regardless of their current state
+    pub(crate) fn reset_uncommitted_config<H: ConsensusHandler>(
+        &mut self,
+        handler: &mut H,
+    ) -> Result<(), Error> {
+        todo!("set current config to last committed config");
+        handler.ensure_connected(&self.peers);
+    }
+
+    // All nodes behave in the same way regardless of their current state
+    // we receive this message when some node got timeout reaching leader and considers leader
+    // dead
     pub(crate) fn common_request_vote_request<H>(
         &mut self,
         handler: &mut H,
-        candidate: ServerId,
-        request: &RequestVoteRequest,
-    ) -> Result<(RequestVoteResponse, Option<ConsensusState<L, M>>), Error>
+        from: ServerId,
+        request: RequestVoteRequest,
+        from_state: ConsensusStateKind,
+    ) -> Result<(Option<RequestVoteResponse>, Option<ConsensusState<L, M>>), Error>
     where
         H: ConsensusHandler,
     {
-        // we receive this message when some node got timeout reaching leader and considers leader
-        // dead
-
-        // FIXME: 4.2.2 in raft paper, the last paragraph
-        // when voting, node should not count itself as majority if it was removed from cluster by
-        // latest configuration change, it should still start the vote to reach the majority
+        // for correct manual leadership change, node should ignore or delay vote requests
+        // coming within election timeout unless there is special flag set signalling
+        // the leadership was given away voluntarily
+        if !request.is_voluntary_step_down && !self.is_within_election() {
+            return Ok((None, None));
+        }
 
         let candidate_term = request.term;
         let candidate_log_term = request.last_log_term;
@@ -343,7 +247,7 @@ where
         debug!(
             "RequestVoteRequest from Consensus {{ id: {}, term: {}, latest_log_term: \
              {}, latest_log_index: {} }}",
-            &candidate, candidate_term, candidate_log_term, candidate_log_index
+            &from, candidate_term, candidate_log_term, candidate_log_index
         );
 
         let current_term = self.current_term()?;
@@ -351,12 +255,13 @@ where
             info!(
                 "received RequestVoteRequest from Consensus {{ id: {}, term: {} }} \
                  with newer term; transitioning to Follower",
-                candidate, candidate_term
+                from, candidate_term
             );
 
+            self.reset_uncommitted_config(handler)?;
             (
                 candidate_term,
-                Some(self.to_follower(handler, candidate_term)?),
+                Some(self.to_follower(handler, from_state, candidate_term)?),
             )
         } else {
             (current_term, None)

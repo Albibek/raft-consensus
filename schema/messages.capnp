@@ -39,6 +39,7 @@ struct RequestVoteRequest {
     term @0 :UInt64;
     lastLogIndex @1 :UInt64;
     lastLogTerm @2 :UInt64;
+    isVoluntaryStepDown @3 :Bool;
 }
 
 struct RequestVoteResponse {

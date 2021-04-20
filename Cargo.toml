@@ -23,8 +23,8 @@ pretty_env_logger="^0.2"
 serde_json = "^1.0"
 
 [build-dependencies]
-capnpc = { version="^0.12", optional = true }
-capnp = { version="^0.12", optional = true }
+capnpc = { version="^0.14", optional = true }
+capnp = { version="^0.14", optional = true }
 
 [features]
 default = []

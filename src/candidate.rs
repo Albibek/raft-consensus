@@ -13,6 +13,7 @@ use crate::state::{ConsensusState, StateHandler};
 use crate::state_machine::StateMachine;
 
 use crate::consensus::State;
+use crate::leader::LeaderState;
 
 impl<L, M, H> StateHandler<L, M, H> for State<L, M, CandidateState>
 where
@@ -24,7 +25,7 @@ where
         &mut self,
         handler: &mut H,
         from: ServerId,
-        request: &AppendEntriesRequest,
+        request: AppendEntriesRequest,
     ) -> Result<(AppendEntriesResponse, Option<ConsensusState<L, M>>), Error> {
         let leader_term = request.term;
         let current_term = self.current_term()?;
@@ -36,7 +37,8 @@ where
         // receiving AppendEntries for candidate means new leader was found,
         // so it must become follower now
         //
-        let ConsensusState::Follower(new_state) = self.to_follower(handler, leader_term)?;
+        let ConsensusState::Follower(new_state) =
+            self.to_follower(handler, ConsensusStateKind::Candidate, leader_term)?;
         let (response, new_state) = new_state.append_entries_request(handler, from, request)?;
         Ok((response, new_state))
     }
@@ -45,7 +47,7 @@ where
         &mut self,
         handler: &mut H,
         from: ServerId,
-        response: &AppendEntriesResponse,
+        response: AppendEntriesResponse,
     ) -> Result<(Option<AppendEntriesRequest>, Option<ConsensusState<L, M>>), Error> {
         // the candidate can only receive responses in case the node was a leader some time ago
         // and sent requests which triggered the reponse while response was held somewhere in network
@@ -59,9 +61,9 @@ where
         &mut self,
         handler: &mut H,
         candidate: ServerId,
-        request: &RequestVoteRequest,
-    ) -> Result<(RequestVoteResponse, Option<ConsensusState<L, M>>), Error> {
-        self.common_request_vote_request(handler, candidate, request)
+        request: RequestVoteRequest,
+    ) -> Result<(Option<RequestVoteResponse>, Option<ConsensusState<L, M>>), Error> {
+        self.common_request_vote_request(handler, candidate, request, ConsensusStateKind::Candidate)
     }
 
     /// Applies a request vote response to the consensus state machine.
@@ -69,13 +71,13 @@ where
         &mut self,
         handler: &mut H,
         from: ServerId,
-        response: &RequestVoteResponse,
+        response: RequestVoteResponse,
     ) -> Result<Option<ConsensusState<L, M>>, Error> {
         debug!("RequestVoteResponse from peer {}", from);
 
-        let local_term = self.current_term();
+        let local_term = self.current_term()?;
         let voter_term = response.voter_term();
-        let majority = self.majority();
+        let majority = self.majority()?;
         if local_term < voter_term {
             // Responder has a higher term number. The election is compromised; abandon it and
             // revert to follower state with the updated term number. Any further responses we
@@ -88,12 +90,14 @@ where
                 with newer term; transitioning to Follower",
                 from, voter_term
             );
-            let follower_state = self.to_follower(handler, voter_term)?;
+            let follower_state =
+                self.to_follower(handler, ConsensusStateKind::Candidate, voter_term)?;
             Ok(Some(follower_state))
         } else if local_term > voter_term {
             // Ignore this message; it came from a previous election cycle.
             Ok(None)
         } else {
+            // local_term == voter_term
             // A vote was received!
             if let RequestVoteResponse::Granted(_) = response {
                 self.state.record_vote(from);
@@ -102,7 +106,7 @@ where
                         "election for term {} won; transitioning to Leader",
                         local_term
                     );
-                    let new_state = self.into_leader(handler)?;
+                    let new_state = self.into_leader(handler, voter_term)?;
                     Ok(Some(new_state))
                 } else {
                     Ok(None)
@@ -119,44 +123,25 @@ where
         Err(Error::MustLeader)
     }
 
-    fn election_timeout(&mut self, handler: &mut H) -> Result<(), Error> {
+    fn election_timeout(&mut self, handler: &mut H) -> Result<Option<ConsensusState<L, M>>, Error> {
         if self.peers.is_empty() || self.peers.len() == 1 && self.peers[0].id == self.id {
             // Solitary replica special case: we are the only peer in consensus
             // jump straight to Leader state.
-            info!("Election timeout: transitioning to Leader due do solitary replica condition");
-            assert!(self.log.voted_for().unwrap().is_none());
+            info!("election timeout: transitioning to leader due do solitary replica condition");
+            assert!(self.with_log(|log| log.voted_for())?.is_none()); // there cannot be anyone to vote for us
 
-            self.log
-                .inc_current_term()
-                .map_err(|e| Error::PersistentLog(Box::new(e)))?;
-            self.log
-                .set_voted_for(self.id)
-                .map_err(|e| Error::PersistentLog(Box::new(e)))?;
+            //self.with_log(|log| log.inc_current_term())?;
+            //self.with_log(|log| log.set_voted_for(self.id))?;
+            let current_term = self.with_log(|log| log.current_term())?;
+            let new_state = self.into_leader(handler, current_term)?;
+            return Ok(Some(new_state));
         } else {
-            info!("Election timeout: transitioning to Candidate");
-            self.transition_to_candidate(handler)?;
-
+            info!("election timeout on candidate: restarting election");
+            self.with_log(|log| log.inc_current_term())?;
+            self.with_log(|log| log.set_voted_for(self.id))?;
+            handler.set_timeout(ConsensusTimeout::Election);
             return Ok(());
         }
-
-        handler.done();
-        todo!("become leader?");
-        // we only get here if we are candidate, and we need to release self.state before
-        //            let old_state = self.state.clone();
-        //let latest_log_index = self
-        //.log
-        //.latest_log_index()
-        //.map_err(|e| Error::PersistentLog(Box::new(e)))?;
-
-        //self.state = ConsensusState::Leader(LeaderState::new(
-        //latest_log_index,
-        //self.peers.iter().map(|peer| &peer.id),
-        //));
-
-        //handler.state_changed(old_state, &self.state);
-        //handler.clear_timeout(ConsensusTimeout::Election);
-
-        Ok(())
     }
 
     // Utility messages and actions
@@ -218,9 +203,9 @@ where
         CommandResponse::UnknownLeader
     }
 
-    fn kind(&self) -> ConsensusStateKind {
-        ConsensusStateKind::Candidate
-    }
+    //    fn kind(&self) -> ConsensusStateKind {
+    //ConsensusStateKind::Candidate
+    //}
 }
 
 impl<L, M> State<L, M, CandidateState>
@@ -228,6 +213,33 @@ where
     L: Log,
     M: StateMachine,
 {
+    // Checks if consensus is solitary, allowing instant transition to the leader without waiting
+    // an additional election timeout
+    //
+    // Must be used only from follower placed in candidate handler to avoid breaking the state transitioning:
+    // direct follower -> leader is only possible in solitary consensus condition,
+    // so we expect follower to call this right after transitioning to candidate
+    // rather than making into_leader usable in any state being callable from anywhere
+    pub(crate) fn try_solitary_leader<H: ConsensusHandler>(
+        &mut self,
+        handler: &mut H,
+    ) -> Result<Option<ConsensusState<L, M>>, Error> {
+        if self.peers.is_empty() || self.peers.len() == 1 && self.peers[0].id == self.id {
+            // Solitary replica special case: we are the only peer in consensus
+            // jump straight to Leader state.
+            info!("election timeout: transitioning to Leader due do solitary replica condition");
+            assert!(self.with_log(|log| log.voted_for())?.is_none());
+
+            self.with_log(|log| log.inc_current_term())?;
+            self.with_log(|log| log.set_voted_for(self.id))?;
+            let current_term = self.with_log(|log| log.current_term())?;
+            let new_state = self.into_leader(handler, current_term)?;
+            return Ok(Some(new_state));
+        } else {
+            Ok(None)
+        }
+    }
+
     // Only candidates can transition to leader
     pub(crate) fn into_leader<H: ConsensusHandler>(
         &mut self,
@@ -235,35 +247,34 @@ where
         leader_term: Term,
     ) -> Result<ConsensusState<L, M>, Error> {
         trace!("transitioning to Leader");
-        let latest_log_index = self
-            .log
-            .latest_log_index()
-            .map_err(|e| Error::PersistentLog(Box::new(e)))?;
-        let old_state = self.state.clone();
+        let latest_log_index = self.with_log(|log| log.latest_log_index())?;
 
-        self.state = ConsensusState::Leader(LeaderState::new(
-            latest_log_index,
-            self.peers.iter().map(|peer| &peer.id),
-        ));
-        handler.state_changed(old_state, &self.state);
+        let leader_state = State {
+            id: self.id,
+            peers: self.peers.clone(),
+            log: self.log,
+            state_machine: self.state_machine,
+            commit_index: self.commit_index,
+            min_index: self.min_index,
+            last_applied: self.last_applied,
+            state: LeaderState::new(latest_log_index, self.peers.iter().map(|peer| &peer.id)),
+        };
+        handler.state_changed(ConsensusStateKind::Candidate, &ConsensusStateKind::Leader);
 
         let message = AppendEntriesRequest {
-            term: self.current_term(),
+            term: self.current_term()?,
             prev_log_index: latest_log_index,
-            prev_log_term: self
-                .log
-                .latest_log_term()
-                .map_err(|e| Error::PersistentLog(Box::new(e)))?,
+            prev_log_term: self.with_log(|log| log.latest_log_term())?,
             leader_commit: self.commit_index,
             entries: Vec::new(),
         };
 
         for &peer in &self.peers {
             handler.send_peer_message(peer.id, PeerMessage::AppendEntriesRequest(message.clone()));
-            handler.clear_timeout(ConsensusTimeout::Heartbeat(peer.id));
+            handler.set_timeout(ConsensusTimeout::Heartbeat(peer.id));
         }
         handler.clear_timeout(ConsensusTimeout::Election);
-        Ok(())
+        Ok(ConsensusState::Leader(leader_state))
     }
 }
 /// The state associated with a Raft consensus module in the `Candidate` state.

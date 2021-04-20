@@ -5,7 +5,7 @@ use std::fmt::Debug;
 
 use crate::message::*;
 use crate::state::ConsensusState;
-use crate::{ClientId, ServerId};
+use crate::{ClientId, Peer, ServerId};
 
 /// Handler for actions returned from consensus
 ///
@@ -21,7 +21,7 @@ pub trait ConsensusHandler: Debug {
     /// After having this method called handler SHOULD make sure peer is connected
     /// and call consensus' peer_connected even if the peer connection was establlished before
     /// and even if peer_connected was already called
-    fn ensure_connected(&mut self, &[Peer]) -> Result<(), ()>;
+    fn ensure_connected(&mut self, peers: &[Peer]) -> Result<(), ()>;
 
     #[allow(unused_variables)]
     /// Called when consensus goes to new state. Initializing new consensus does not call this function.
@@ -32,9 +32,6 @@ pub trait ConsensusHandler: Debug {
 
     /// called when peer caught the error where it should be restarted or failed
     fn peer_failed(&mut self, id: ServerId);
-
-    /// Called when the particular event has been fully processed. Useful for doing actions in batches.
-    fn done(&mut self) {}
 }
 
 /// A handler that collects all messages leaving processing of them untouched.
@@ -94,10 +91,6 @@ impl ConsensusHandler for CollectHandler {
         }
     }
 
-    fn new_server(&mut self, _id: ServerId, _info: &[u8]) -> Result<(), ()> {
-        Ok(())
-    }
-
     fn peer_failed(&mut self, _id: ServerId) {}
 
     fn clear_timeout(&mut self, timeout: ConsensusTimeout) {
@@ -108,5 +101,13 @@ impl ConsensusHandler for CollectHandler {
 
     fn state_changed(&mut self, _old: ConsensusStateKind, new: &ConsensusStateKind) {
         self.state = new.clone()
+    }
+
+    fn ensure_connected(&mut self, peers: &[Peer]) -> Result<(), ()> {
+        Ok(())
+    }
+
+    fn disconnect_peer(&mut self, id: ServerId) {
+        Ok(())
     }
 }

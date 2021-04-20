@@ -153,7 +153,6 @@ where
 
                 message.entries.push(entry);
             }
-
             self.state
                 .set_next_index(from, local_latest_log_index + 1)?;
 
@@ -183,13 +182,10 @@ where
         &mut self,
         handler: &mut H,
         candidate: ServerId,
-        request: &RequestVoteRequest,
-    ) -> Result<(RequestVoteResponse, Option<ConsensusState<L, M>>), Error> {
-        // FIXME:
-        // there is also leader change, meaning all uncommitted configuration changes
-        // must be revert (QUESTION: does this repend on candidate's log index or not?)
+        request: RequestVoteRequest,
+    ) -> Result<(Option<RequestVoteResponse>, Option<ConsensusState<L, M>>), Error> {
         self.state.reset_catching_up(handler)?;
-        self.common_request_vote_request(handler, candidate, request)
+        self.common_request_vote_request(handler, candidate, request, ConsensusStateKind::Leader)
     }
 
     /// Applies a request vote response to the consensus state machine.
@@ -197,7 +193,7 @@ where
         &mut self,
         handler: &mut H,
         from: ServerId,
-        response: &RequestVoteResponse,
+        response: RequestVoteResponse,
     ) -> Result<Option<ConsensusState<L, M>>, Error> {
         let local_term = self.current_term()?;
         let voter_term = response.voter_term();
@@ -209,11 +205,11 @@ where
             // The responder is not necessarily the leader, but it is somewhat likely, so we will
             // use it as the leader hint.
             info!(
-                "received RequestVoteResponse from Consensus {{ id: {}, term: {} }} \
-                with newer term; transitioning to Follower",
+                "received RequestVoteResponse from {{ id: {}, term: {} }} with newer term; transitioning to follower",
                 from, voter_term
             );
-            let follower_state = self.to_follower(handler, voter_term)?;
+            let follower_state =
+                self.to_follower(handler, ConsensusStateKind::Leader, voter_term)?;
             Ok(Some(follower_state))
         } else {
             // local_term > voter_term: ignore the message; it came from a previous election cycle
@@ -225,49 +221,61 @@ where
     }
 
     // Timeout handling
-    /// Triggered by a heartbeat timeout for the peer.
     fn heartbeat_timeout(&mut self, peer: ServerId) -> Result<AppendEntriesRequest, Error> {
-        debug!("HeartbeatTimeout for peer: {}", peer);
+        debug!("heartbeat timeout for peer: {}", peer);
         Ok(AppendEntriesRequest {
-            term: self.current_term(),
-            prev_log_index: self.latest_log_index(),
+            term: self.current_term()?,
+            prev_log_index: self.latest_log_index()?,
             prev_log_term: self.with_log(|log| log.latest_log_term())?,
             leader_commit: self.commit_index,
             entries: Vec::new(),
         })
     }
 
-    fn election_timeout(&mut self, handler: &mut H) -> Result<(), Error> {
-        if state.config_change.is_some() {
+    fn election_timeout(&mut self, handler: &mut H) -> Result<Option<ConsensusState<L, M>>, Error> {
+        if self.state.config_change.is_some() {
             // TODO option for number of timeouts
-            if state.config_change.add_timeout().ok_or(Error::CatchUpBug)? >= 8 {
+            if self
+                .state
+                .config_change
+                .add_timeout()
+                .ok_or(Error::CatchUpBug)?
+                >= 8
+            {
                 // let handler know peer has failed
-                handler.peer_failed(state.config_change.peer);
+                handler.peer_failed(self.state.config_change.peer);
                 // allowed number of timeouts passed without catching up
-                state.config_change = None;
+                self.state.config_change = None;
                 return Err(Error::CatchUpFailed);
             } else {
                 // remote still has time to catch up
                 handler.set_timeout(ConsensusTimeout::Election);
+                Ok(())
             }
         } else {
+            debug!("BUG: election timeout called on leader without catch up node");
             return Err(Error::MustNotLeader);
         }
     }
 
     // Utility messages and actions
     fn peer_connected(&mut self, handler: &mut H, peer: ServerId) -> Result<(), Error> {
-        //
-        let new_peer = !self.peers.iter().any(|&p| p.id == peer);
+        // According to Raft 4.1 last paragraph, servers should receive any RPC call
+        // from any server, because they may be a new ones which current server doesn't know
+        // about yet
+
+        let new_peer =
+            !self.peers.iter().any(|&p| p.id == peer) && !self.state.is_catching_up(&peer);
         if new_peer {
             // This may still be correct peer, but it is was not added using AddServer API or was
             // removed already
             // the peer still can be the one that is going to catch up, so we skip this
             // check for a leader state
-            // By this reason we don't panic here, returning an error
+            // By this reason we do not panic here,nor return an error
             debug!("New peer connected, but not found in consensus: {:?}", peer);
+            return Ok(());
         }
-        let peer_index = state.next_index(&peer)?;
+        let peer_index = self.state.next_index(&peer)?;
 
         // Send any outstanding entries to the peer, or an empty heartbeat if there are no
         // outstanding entries.
@@ -378,9 +386,9 @@ where
         CommandResponse::Success(result)
     }
 
-    fn kind(&self) -> ConsensusStateKind {
-        ConsensusStateKind::Leader
-    }
+    //    fn kind(&self) -> ConsensusStateKind {
+    //ConsensusStateKind::Leader
+    //}
 }
 
 impl<L, M> State<L, M, LeaderState>
@@ -503,12 +511,16 @@ impl LeaderState {
         self.match_index.contains_key(follower)
     }
 
-    pub(crate) fn is_catching_up(&mut self, node: &ServerId) -> bool {
+    pub(crate) fn is_catching_up(&self, node: &ServerId) -> bool {
         if let Some(catching_up) = self.catching_up {
             node == &catching_up.peer.id
         } else {
             false
         }
+    }
+
+    pub(crate) fn reset_catching_up(&mut self, node: &ServerId) {
+        self.catching_up = None
     }
 
     /// Returns the next log entry index of the follower or a catching up peer.

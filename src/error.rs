@@ -54,6 +54,6 @@ pub enum Error {
     #[error("Follower node must be in list of peers at start")]
     MustBootstrap,
 
-    #[error("unable to support {} cluster members", peers)]
-    BadClusterSize,
+    #[error("unable to support {} cluster members", _0)]
+    BadClusterSize(usize),
 }

@@ -6,20 +6,27 @@ use crate::message::*;
 use crate::{ClientId, ServerId};
 
 use crate::consensus::State;
-use crate::persistent_log::Log;
 
 use crate::candidate::CandidateState;
-use crate::catching_up::CatchingUpState;
 use crate::follower::FollowerState;
 use crate::leader::LeaderState;
 
+/// Consensus can be in one of three state:
+///
+/// * `Follower` - which replicates AppendEntries requests and votes for it's leader.
+/// * `Leader` - which leads the cluster by serving incoming requests, ensuring
+///              data is replicated, and issuing heartbeats.
+/// * `Candidate` -  which campaigns in an election and may become a `Leader`
+///                  (if it gets enough votes) or a `Follower`, if it hears from
+///                  a `Leader`.
+/// foreign to the node, because node that didn't catch up is not considered to be in cluster yet
 pub(crate) enum ConsensusState<L, M> {
     Leader(State<L, M, LeaderState>),
     Follower(State<L, M, FollowerState>),
     Candidate(State<L, M, CandidateState>),
 }
 
-/// Applies a peer message to the consensus state machine.
+/// Applies a peer message to the consensus
 pub(crate) fn apply_peer_message<L, M, S: StateHandler<L, M, H>, H: ConsensusHandler>(
     s: &mut S,
     handler: &mut H,
@@ -28,25 +35,25 @@ pub(crate) fn apply_peer_message<L, M, S: StateHandler<L, M, H>, H: ConsensusHan
 ) -> Result<(Option<PeerMessage>, Option<ConsensusState<L, M>>), Error> {
     let message = message; // This enforces a by-value move making clippy happy
     let result = match message {
-        PeerMessage::AppendEntriesRequest(ref request) => {
+        PeerMessage::AppendEntriesRequest(request) => {
             // request produces response and optionally - new state
             let (response, new) = s.append_entries_request(handler, from, request)?;
             (Some(PeerMessage::AppendEntriesResponse(response)), new)
         }
 
-        PeerMessage::AppendEntriesResponse(ref response) => {
+        PeerMessage::AppendEntriesResponse(response) => {
             // response may produce a new request as an answer
             let (request, new) = s.append_entries_response(handler, from, response)?;
             (request.map(PeerMessage::AppendEntriesRequest), new)
         }
 
-        PeerMessage::RequestVoteRequest(ref request) => {
+        PeerMessage::RequestVoteRequest(request) => {
             // vote request always produces response and optionally - state change
             let (response, new) = s.request_vote_request(handler, from, request)?;
-            (Some(PeerMessage::RequestVoteResponse(response)), new)
+            (response.map(PeerMessage::RequestVoteResponse), new)
         }
 
-        PeerMessage::RequestVoteResponse(ref response) => {
+        PeerMessage::RequestVoteResponse(response) => {
             // request vote response does not produce new requests, but may produce new state
             let new = s.request_vote_response(handler, from, response)?;
             (None, new)
@@ -59,17 +66,16 @@ pub(crate) fn apply_timeout<L, M, S: StateHandler<L, M, H>, H: ConsensusHandler>
     s: &mut S,
     handler: &mut H,
     timeout: ConsensusTimeout,
-) -> Result<(), Error> {
+) -> Result<Option<ConsensusState<L, M>>, Error> {
     match timeout {
-        ConsensusTimeout::Election => s.election_timeout(handler)?,
+        ConsensusTimeout::Election => s.election_timeout(handler),
         ConsensusTimeout::Heartbeat(id) => {
             let request = s.heartbeat_timeout(id)?;
-            // we get here only if we are leader
             let request = PeerMessage::AppendEntriesRequest(request);
             handler.send_peer_message(id, request);
+            Ok(None)
         }
-    };
-    Ok(())
+    }
 }
 
 /// Applies a client message to the consensus state machine.
@@ -101,8 +107,7 @@ pub fn apply_config_change_message<L, M, S: StateHandler<L, M, H>, H: ConsensusH
 
 /// This trait defines a consensus behaviour in the each
 pub(crate) trait StateHandler<L, M, H: ConsensusHandler> {
-    // Peer messages
-
+    // AppendEntriesRPC
     /// Apply an append entries request to the consensus state machine.
     fn append_entries_request(
         &mut self,
@@ -122,38 +127,36 @@ pub(crate) trait StateHandler<L, M, H: ConsensusHandler> {
         response: AppendEntriesResponse,
     ) -> Result<(Option<AppendEntriesRequest>, Option<ConsensusState<L, M>>), Error>;
 
+    // RequestVoteRPC
     /// Applies a peer request vote request to the consensus state machine.
     fn request_vote_request(
         &mut self,
         handler: &mut H,
         candidate: ServerId,
-        request: &RequestVoteRequest,
-    ) -> Result<(RequestVoteResponse, Option<ConsensusState<L, M>>), Error>;
+        request: RequestVoteRequest,
+    ) -> Result<(Option<RequestVoteResponse>, Option<ConsensusState<L, M>>), Error>;
 
     /// Applies a request vote response to the consensus state machine.
     fn request_vote_response(
         &mut self,
         handler: &mut H,
         from: ServerId,
-        response: &RequestVoteResponse,
+        response: RequestVoteResponse,
     ) -> Result<Option<ConsensusState<L, M>>, Error>;
 
-    // Timeout handling
+    // Timeouts
     /// Handles heartbeat timeout event
     fn heartbeat_timeout(&mut self, peer: ServerId) -> Result<AppendEntriesRequest, Error>;
-    fn election_timeout(&mut self, handler: &mut H) -> Result<(), Error>;
+    fn election_timeout(&mut self, handler: &mut H) -> Result<Option<ConsensusState<L, M>>, Error>;
 
-    // Utility messages and actions
-    fn peer_connected(&mut self, handler: &mut H, peer: ServerId) -> Result<(), Error>;
-
-    // Configuration change messages
+    // Configuration change RPC
     fn add_server_request(
         &mut self,
         handler: &mut H,
         request: &AddServerRequest,
     ) -> Result<ServerCommandResponse, Error>;
 
-    // Client messages
+    // Client RPC messages
     fn client_ping_request(&self) -> PingResponse;
 
     /// Applies a client proposal to the consensus state machine.
@@ -166,69 +169,9 @@ pub(crate) trait StateHandler<L, M, H: ConsensusHandler> {
 
     fn client_query_request(&mut self, from: ClientId, request: &[u8]) -> CommandResponse;
 
-    fn kind(&self) -> ConsensusStateKind;
+    // Utility messages and actions
+    fn peer_connected(&mut self, handler: &mut H, peer: ServerId) -> Result<(), Error>;
 }
-
-/*
-    /// Consensus modules can be in one of three state:
-    ///
-    /// * `Follower` - which replicates AppendEntries requests and votes for it's leader.
-    /// * `Leader` - which leads the cluster by serving incoming requests, ensuring
-    ///              data is replicated, and issuing heartbeats.
-    /// * `Candidate` -  which campaigns in an election and may become a `Leader`
-    ///                  (if it gets enough votes) or a `Follower`, if it hears from
-    ///                  a `Leader`.
-    /// * CatchingUp - which is currently trying to catch up the leader log. The leader is still
-    /// foreign to the node, because node that didn't catch up is not considered to be in cluster yet
-#[derive(Clone, Debug)]
-pub enum ConsensusState {
-Follower(FollowerState),
-Candidate(CandidateState),
-Leader(LeaderState),
-CatchingUp(CatchingUpState),
-}
-
-impl ConsensusState {
-pub fn kind(&self) -> ConsensusStateKind {
-match self {
-ConsensusState::Follower(_) => ConsensusStateKind::Follower,
-ConsensusState::Candidate(_) => ConsensusStateKind::Candidate,
-ConsensusState::Leader(_) => ConsensusStateKind::Leader,
-ConsensusState::CatchingUp(_) => ConsensusStateKind::CatchingUp,
-}
-}
-
-pub fn is_follower(&self) -> bool {
-if let ConsensusState::Follower(_) = self {
-true
-} else {
-false
-}
-}
-
-pub fn is_candidate(&self) -> bool {
-if let ConsensusState::Candidate(_) = self {
-true
-} else {
-false
-}
-}
-
-pub fn is_leader(&self) -> bool {
-if let ConsensusState::Leader(_) = self {
-true
-} else {
-false
-}
-}
-}
-
-impl Default for ConsensusState {
-fn default() -> Self {
-ConsensusState::Follower(FollowerState::new())
-}
-}
-*/
 
 #[cfg(test)]
 mod tests {
