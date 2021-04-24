@@ -229,17 +229,10 @@ where
         from: ServerId,
         request: RequestVoteRequest,
         from_state: ConsensusStateKind,
-    ) -> Result<(Option<RequestVoteResponse>, Option<ConsensusState<L, M>>), Error>
+    ) -> Result<(RequestVoteResponse, Option<ConsensusState<L, M>>), Error>
     where
         H: ConsensusHandler,
     {
-        // for correct manual leadership change, node should ignore or delay vote requests
-        // coming within election timeout unless there is special flag set signalling
-        // the leadership was given away voluntarily
-        if !request.is_voluntary_step_down && !self.is_within_election() {
-            return Ok((None, None));
-        }
-
         let candidate_term = request.term;
         let candidate_log_term = request.last_log_term;
         let candidate_log_index = request.last_log_index;
@@ -253,8 +246,8 @@ where
         let current_term = self.current_term()?;
         let (new_local_term, new_state) = if candidate_term > current_term {
             info!(
-                "received RequestVoteRequest from Consensus {{ id: {}, term: {} }} \
-                 with newer term; transitioning to Follower",
+                "received RequestVoteRequest with newer term from Consensus {{ id: {}, term: {} }}; \
+                 transitioning to Follower",
                 from, candidate_term
             );
 
@@ -277,11 +270,11 @@ where
         } else {
             match self.with_log(|log| log.voted_for())? {
                 None => {
-                    self.with_log_mut(|log| log.set_voted_for(candidate))?;
+                    self.with_log_mut(|log| log.set_voted_for(from))?;
                     RequestVoteResponse::Granted(new_local_term)
                 }
                 Some(voted_for) => {
-                    if voted_for == candidate {
+                    if voted_for == from {
                         RequestVoteResponse::Granted(new_local_term)
                     } else {
                         RequestVoteResponse::AlreadyVoted(new_local_term)
@@ -300,130 +293,6 @@ where
         })
     }
 }
-
-//impl<L, M> State<L, M, ()>
-//where
-//L: Log,
-//M: StateMachine,
-//{
-
-///// Applies a peer request vote request to the consensus state machine.
-//pub(crate) fn request_vote_request<H: ConsensusHandler>(
-//&mut self,
-//handler: &mut H,
-//candidate: ServerId,
-//request: &RequestVoteRequest,
-//) -> Result<RequestVoteResponse, Error> {
-//// FIXME:
-//// if candidate node's index is less than last committed configuration change index,
-//// we should not vote for this node
-////
-//// FIXME:
-//// there is also leader change, meaning all uncommitted configuration changes
-//// must be revert (QUESTION: does this repend on candidate's log index or not?)
-//// FIXME: when voting, node should not count itself as majority
-//self.reset_catching_up(handler)?;
-//let candidate_term = request.term;
-//let candidate_log_term = request.last_log_term;
-//let candidate_log_index = request.last_log_index;
-//debug!(
-//"RequestVoteRequest from Consensus {{ id: {}, term: {}, latest_log_term: \
-//{}, latest_log_index: {} }}",
-//&candidate, candidate_term, candidate_log_term, candidate_log_index
-//);
-//let local_term = self.current_term();
-
-//let new_local_term = if candidate_term > local_term {
-//info!(
-//"received RequestVoteRequest from Consensus {{ id: {}, term: {} }} \
-//with newer term; transitioning to Follower",
-//candidate, candidate_term
-//);
-//self.transition_to_follower(handler, candidate_term, candidate)?;
-//candidate_term
-//} else {
-//local_term
-//};
-
-//let message = if candidate_term < local_term {
-//RequestVoteResponse::StaleTerm(new_local_term)
-//} else if candidate_log_term < self.latest_log_term()
-//|| candidate_log_index < self.latest_log_index()
-//{
-//RequestVoteResponse::InconsistentLog(new_local_term)
-//} else {
-//match self.with_log(|log| log.voted_for())? {
-//None => {
-//self.with_log_mut(|log| log.set_voted_for(candidate))?;
-//RequestVoteResponse::Granted(new_local_term)
-//}
-//Some(voted_for) => {
-//if voted_for == candidate {
-//RequestVoteResponse::Granted(new_local_term)
-//} else {
-//RequestVoteResponse::AlreadyVoted(new_local_term)
-//}
-//}
-//}
-//};
-//Ok(message)
-//}
-
-///// Applies a request vote response to the consensus state machine.
-//pub(crate) fn request_vote_response<H: ConsensusHandler>(
-//&mut self,
-//handler: &mut H,
-//from: ServerId,
-//response: &RequestVoteResponse,
-//) -> Result<(), Error> {
-//debug!("RequestVoteResponse from peer {}", from);
-
-//let response = response;
-//let local_term = self.current_term();
-//let voter_term = response.voter_term();
-//let majority = self.majority();
-//if local_term < voter_term {
-//// Responder has a higher term number. The election is compromised; abandon it and
-//// revert to follower state with the updated term number. Any further responses we
-//// receive from this election term will be ignored because the term will be outdated.
-
-//// The responder is not necessarily the leader, but it is somewhat likely, so we will
-//// use it as the leader hint.
-//info!(
-//"received RequestVoteResponse from Consensus {{ id: {}, term: {} }} \
-//with newer term; transitioning to Follower",
-//from, voter_term
-//);
-//self.transition_to_follower(handler, voter_term, from)
-//} else if local_term > voter_term {
-//// Ignore this message; it came from a previous election cycle.
-//Ok(())
-//} else {
-//// local_term == voter_term
-//if let ConsensusState::Candidate(ref mut state) = self.state {
-//// A vote was received!
-//if let RequestVoteResponse::Granted(_) = response {
-//state.record_vote(from);
-//if state.count_votes() >= majority {
-//info!(
-//"election for term {} won; transitioning to Leader",
-//local_term
-//);
-//self.transition_to_leader(handler)
-//} else {
-//Ok(())
-//}
-//} else {
-//Ok(())
-//}
-//} else {
-//// received response with local_term = voter_term, but state is not candidate
-//// It's ok because some votes can come after we became follower or leader
-//Ok(())
-//}
-//}
-//}
-//}
 
 /// Cluster membership change processing
 impl<L, M> Consensus<L, M>
@@ -627,214 +496,6 @@ Ok(())
 //}
 }
 */
-
-/// Timeout handling
-impl<L, M> Consensus<L, M>
-where
-    L: Log,
-    M: StateMachine,
-{
-    /*
-        /// Triggered by external timeouts.
-        /// Convenience function for handling any timeout.
-        /// Will call either `heartbeat_timeout` or `election_timeout`
-        pub fn apply_timeout<H: ConsensusHandler>(
-        &mut self,
-        handler: &mut H,
-        timeout: ConsensusTimeout,
-        ) -> Result<(), Error> {
-        match timeout {
-        ConsensusTimeout::Election => self.election_timeout(handler)?,
-        ConsensusTimeout::Heartbeat(id) => {
-        let request = self.heartbeat_timeout(id)?;
-        // we get here only if we are leader
-        let request = PeerMessage::AppendEntriesRequest(request);
-        handler.send_peer_message(id, request);
-        }
-        };
-        handler.done();
-        Ok(())
-        }
-
-        /// Triggered by a heartbeat timeout for the peer.
-        pub fn heartbeat_timeout(&mut self, peer: ServerId) -> Result<AppendEntriesRequest, Error> {
-        if let ConsensusState::Leader(_) = self.state {
-        debug!("HeartbeatTimeout for peer: {}", peer);
-        Ok(AppendEntriesRequest {
-        term: self.current_term(),
-        prev_log_index: self.latest_log_index(),
-        prev_log_term: self.with_log(|log| log.latest_log_term())?,
-        leader_commit: self.commit_index,
-        entries: Vec::new(),
-        })
-        } else {
-        Err(Error::MustLeader)
-        }
-        }
-
-        /// Triggered by an election timeout.
-        pub fn election_timeout<H: ConsensusHandler>(&mut self, handler: &mut H) -> Result<(), Error> {
-        match &mut self.state {
-        ConsensusState::Leader(state) => {
-        // leader uses election timeout when it has a remote being catched up
-        if state.config_change.is_some() {
-        // TODO option for number of timeouts
-        if state.config_change.add_timeout().ok_or(Error::CatchUpBug)? >= 8 {
-        // let handler know peer has failed
-        handler.peer_failed(state.config_change.peer);
-        // allowed number of timeouts passed without catching up
-        state.config_change = None;
-        return Err(Error::CatchUpFailed);
-        } else {
-        // remote still has time to catch up
-        handler.set_timeout(ConsensusTimeout::Election);
-        }
-        } else {
-        return Err(Error::MustNotLeader);
-        }
-        }
-        ConsensusState::Follower(_) => unreachable!(),
-        ConsensusState::Candidate(_) => {
-        if self.peers.is_empty() || self.peers.len() == 1 && self.peers[0].id == self.id {
-        // Solitary replica special case: we are the only peer in consensus
-        // jump straight to Leader state.
-        info!("Election timeout: transitioning to Leader due do solitary replica condition");
-        assert!(self.log.voted_for().unwrap().is_none());
-
-        self.log
-        .inc_current_term()
-        .map_err(|e| Error::PersistentLog(Box::new(e)))?;
-        self.log
-        .set_voted_for(self.id)
-            .map_err(|e| Error::PersistentLog(Box::new(e)))?;
-    } else {
-        info!("Election timeout: transitioning to Candidate");
-        self.transition_to_candidate(handler)?;
-
-        return Ok(());
-    }
-
-    handler.done();
-    }
-    };
-
-    // we only get here if we are candidate, and we need to release self.state before
-    let old_state = self.state.clone();
-    let latest_log_index = self
-        .log
-    .latest_log_index()
-        .map_err(|e| Error::PersistentLog(Box::new(e)))?;
-
-        self.state = ConsensusState::Leader(LeaderState::new(
-                latest_log_index,
-                self.peers.iter().map(|peer| &peer.id),
-        ));
-
-    handler.state_changed(old_state, &self.state);
-    handler.clear_timeout(ConsensusTimeout::Election);
-    Ok(())
-        }
-    */
-}
-
-/// State transitions handling
-impl<L, M> State<L, M, ()>
-where
-    L: Log,
-    M: StateMachine,
-{
-    //    /// Transitions the consensus state machine to Follower state with the provided term. The
-    ///// `voted_for` field will be reset. The provided leader hint will replace the last known
-    ///// leader.
-    //fn transition_to_follower<H: ConsensusHandler>(
-    //&mut self,
-    //handler: &mut H,
-    //term: Term,
-    //leader: ServerId,
-    //) -> Result<(), Error> {
-    //self.log
-    //.set_current_term(term)
-    //.map_err(|e| Error::PersistentLog(Box::new(e)))?;
-    //let old_state = self.state.clone();
-    //self.state = ConsensusState::Follower(FollowerState {
-    //leader: Some(leader),
-    //});
-    //handler.state_changed(old_state, &self.state);
-
-    //for &peer in &self.peers {
-    //handler.clear_timeout(ConsensusTimeout::Heartbeat(peer.id));
-    //}
-
-    //handler.set_timeout(ConsensusTimeout::Election);
-    //Ok(())
-    //}
-
-    //    /// Transitions this consensus state machine to Leader state.
-    //fn transition_to_leader<H: ConsensusHandler>(&mut self, handler: &mut H) -> Result<(), Error> {
-    //trace!("transitioning to Leader");
-    //let latest_log_index = self
-    //.log
-    //.latest_log_index()
-    //.map_err(|e| Error::PersistentLog(Box::new(e)))?;
-    //let old_state = self.state.clone();
-
-    //self.state = ConsensusState::Leader(LeaderState::new(
-    //latest_log_index,
-    //self.peers.iter().map(|peer| &peer.id),
-    //));
-    //handler.state_changed(old_state, &self.state);
-
-    //let message = AppendEntriesRequest {
-    //term: self.current_term(),
-    //prev_log_index: latest_log_index,
-    //prev_log_term: self
-    //.log
-    //.latest_log_term()
-    //.map_err(|e| Error::PersistentLog(Box::new(e)))?,
-    //leader_commit: self.commit_index,
-    //entries: Vec::new(),
-    //};
-
-    //for &peer in &self.peers {
-    //handler.send_peer_message(peer.id, PeerMessage::AppendEntriesRequest(message.clone()));
-    //handler.clear_timeout(ConsensusTimeout::Heartbeat(peer.id));
-    //}
-    //handler.clear_timeout(ConsensusTimeout::Election);
-    //Ok(())
-    //}
-
-    /// Transitions the consensus state machine to Candidate state.
-    fn transition_to_candidate<H: ConsensusHandler>(
-        &mut self,
-        handler: &mut H,
-    ) -> Result<(), Error> {
-        trace!("transitioning to Candidate");
-        self.with_log_mut(|log| log.inc_current_term())?;
-        let id = self.id;
-        self.with_log_mut(|log| log.set_voted_for(id))?;
-        let last_log_term = self.with_log(|log| log.latest_log_term())?;
-
-        let old_state = self.state.clone();
-        self.state = ConsensusState::Candidate(CandidateState::new());
-        handler.state_changed(old_state, &self.state);
-        if let ConsensusState::Candidate(ref mut state) = self.state {
-            // always true
-            state.record_vote(self.id);
-        }
-
-        let message = RequestVoteRequest {
-            term: self.current_term(),
-            last_log_index: self.latest_log_index(),
-            last_log_term,
-        };
-
-        for &peer in &self.peers {
-            handler.send_peer_message(peer.id, PeerMessage::RequestVoteRequest(message.clone()));
-        }
-        handler.set_timeout(ConsensusTimeout::Election);
-        Ok(())
-    }
-}
 
 ///// Utility functions
 //impl<L, M> State<L, M, ()>

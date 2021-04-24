@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::error::Error;
-use log::{debug, info, trace};
+use log::{debug, info, trace, warn};
 
 use crate::consensus::State;
 use crate::handler::ConsensusHandler;
@@ -184,8 +184,24 @@ where
         candidate: ServerId,
         request: RequestVoteRequest,
     ) -> Result<(Option<RequestVoteResponse>, Option<ConsensusState<L, M>>), Error> {
-        self.state.reset_catching_up(handler)?;
-        self.common_request_vote_request(handler, candidate, request, ConsensusStateKind::Leader)
+        // To avoid disrupting leader while configuration changes, node should ignore or delay vote requests
+        // coming within election timeout unless there is special flag set signalling
+        // a remote node is allowed such disruption
+        //
+        // But leader does not set the election timeout, so receiving such a packet is only valid
+        // when disruption was allowed explicitly
+        if request.is_voluntary_step_down {
+            self.state.reset_catching_up(handler)?;
+            let (response, new_state) = self.common_request_vote_request(
+                handler,
+                candidate,
+                request,
+                ConsensusStateKind::Leader,
+            )?;
+            Ok((Some(response), new_state))
+        } else {
+            Ok((None, None))
+        }
     }
 
     /// Applies a request vote response to the consensus state machine.

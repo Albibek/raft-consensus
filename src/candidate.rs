@@ -63,7 +63,19 @@ where
         candidate: ServerId,
         request: RequestVoteRequest,
     ) -> Result<(Option<RequestVoteResponse>, Option<ConsensusState<L, M>>), Error> {
-        self.common_request_vote_request(handler, candidate, request, ConsensusStateKind::Candidate)
+        // To avoid disrupting leader while configuration changes, node should ignore or delay vote requests
+        // coming within election timeout unless there is special flag set signalling
+        // the leadership was given away voluntarily
+
+        // On candidate node disrupting of a leader is not possible because voting has
+        // already started, so the flag has no meaning
+        let (response, new_state) = self.common_request_vote_request(
+            handler,
+            candidate,
+            request,
+            ConsensusStateKind::Candidate,
+        )?;
+        Ok((Some(response), new_state))
     }
 
     /// Applies a request vote response to the consensus state machine.

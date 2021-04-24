@@ -10,6 +10,7 @@ use crate::{ClientId, ConsensusConfig, Entry, EntryData, LogIndex, Peer, ServerI
 use crate::persistent_log::Log;
 use crate::state_machine::StateMachine;
 
+use crate::candidate::CandidateState;
 use crate::consensus::State;
 use crate::state::{ConsensusState, StateHandler};
 
@@ -39,6 +40,12 @@ where
 
         // ensure to reset timer at the very end of potentially long disk operation
         handler.set_timeout(ConsensusTimeout::Election);
+        // heartbeat invalidates all the delayed voting requests because receiving it
+        // means leader is not lost for this node therefore voting should not start
+        if self.state.delayed_vote_request.is_some() {
+            self.state.delayed_vote_request = None
+        }
+
         Ok((message, None))
     }
 
@@ -61,7 +68,38 @@ where
         candidate: ServerId,
         request: RequestVoteRequest,
     ) -> Result<(Option<RequestVoteResponse>, Option<ConsensusState<L, M>>), Error> {
-        self.common_request_vote_request(handler, candidate, request, ConsensusStateKind::Follower)
+        // To avoid disrupting leader while configuration changes, node should ignore or delay vote requests
+        // coming within election timeout unless there is special flag set signalling
+        // the leadership was given away voluntarily
+
+        // Followers are always "inside" the election timeout (because they become candidates
+        // otherwise). So for a follower this request means it was given a possibility to become a
+        // leader faster than others.
+        if request.is_voluntary_step_down {
+            self.common_request_vote_request(
+                handler,
+                candidate,
+                request,
+                ConsensusStateKind::Follower,
+            )
+        } else {
+            // Otherwise, the follower can either ignore/deny or delay the voting request.
+            //
+            // The ignoring/denying scenario makes first election unlikely to be finished effectively
+            // (because all other followers would ignore the request), so the voting will require
+            // additional requests from each of the followers having the election timeout expiring.
+            //
+            // The delaying scenario makes the request on non-first followers unneeded, because
+            // they already know who to vote for and can vote immediately
+
+            if self.state.delayed_vote_request.is_none() {
+                // rewriting request or not does not bring any difference, because election timeout
+                // is randomized, so there is no preference for a follower
+                // so we only avoid some negligible byte copying
+                self.state.delayed_vote_request = Some((candidate, request));
+            }
+            Ok((None, None))
+        }
     }
 
     fn request_vote_response(
@@ -103,10 +141,32 @@ where
     }
 
     fn election_timeout(&mut self, handler: &mut H) -> Result<Option<ConsensusState<L, M>>, Error> {
-        todo!("handle election timeout on follower")
-
-            debug!("election timeout on follower: transitioning to candidate");
-        let new_state = self.into_candidate(
+        if let Some((from, request)) = self.state.delayed_vote_request.take() {
+            // voting has started already, process the vote request first
+            let (response, new_state) = self.common_request_vote_request(
+                handler,
+                from,
+                request,
+                ConsensusStateKind::Follower,
+            )?;
+            handler.send_peer_message(from, PeerMessage::RequestVoteResponse(response));
+            if new_state.is_some() {
+                // new state means we must become totally new follower, meaning becoming candidate
+                // is not required
+                Ok(new_state)
+            } else {
+                // Even though we have voted for another candidate, there stil may be things to be
+                // done, like increasing local term.
+                // Most probably this branch is unreachable, because delayed request will
+                // always have the term greater than ours.
+                // TODO: think the cases this branch could be reached (candidate_term <= local_term)
+                // At the moment we choose the safer way of starting the election in a regular way
+                // rather than staying a follower
+                Ok(Some(self.into_candidate(handler)?))
+            }
+        } else {
+            Ok(Some(self.into_candidate(handler)?))
+        }
     }
 
     // Utility messages and actions
@@ -193,8 +253,8 @@ where
         if latest_log_index < leader_prev_log_index {
             // If the previous entries index was not the same we'd leave a gap! Reply failure.
             return Ok(AppendEntriesResponse::InconsistentPrevEntry(
-                    current_term,
-                    leader_prev_log_index,
+                current_term,
+                leader_prev_log_index,
             ));
         }
 
@@ -210,7 +270,7 @@ where
 
         if existing_term
             .map(|term| term != leader_prev_log_term)
-                .unwrap_or(true)
+            .unwrap_or(true)
         {
             // If an existing entry conflicts with a new one (same index but different terms),
             // delete the existing entry and all that follow it
@@ -220,8 +280,8 @@ where
             // TODO we could send a hint to a leader about existing index, so leader
             // could send the entries starting from this index instead of decrementing it each time
             return Ok(AppendEntriesResponse::InconsistentPrevEntry(
-                    current_term,
-                    leader_prev_log_index,
+                current_term,
+                leader_prev_log_index,
             ));
         }
 
@@ -229,8 +289,8 @@ where
         if request.entries.is_empty() {
             // reply success right away
             return Ok(AppendEntriesResponse::Success(
-                    current_term,
-                    latest_log_index,
+                current_term,
+                latest_log_index,
             ));
         }
 
@@ -263,43 +323,49 @@ where
         handler.ensure_connected(&self.peers);
 
         Ok(AppendEntriesResponse::Success(
-                current_term,
-                new_latest_log_index,
+            current_term,
+            new_latest_log_index,
         ))
     }
-
-    /// Transitions the consensus state machine to Candidate state.
 
     fn into_candidate<H: ConsensusHandler>(
         &mut self,
         handler: &mut H,
     ) -> Result<ConsensusState<L, M>, Error> {
-        todo!("write candidate transitioning");
-        trace!("transitioning to Candidate");
+        //todo!("write candidate transitioning");
         self.with_log_mut(|log| log.inc_current_term())?;
         let id = self.id;
         self.with_log_mut(|log| log.set_voted_for(id))?;
         let last_log_term = self.with_log(|log| log.latest_log_term())?;
 
-        let old_state = self.state.clone();
-        self.state = ConsensusState::Candidate(CandidateState::new());
-        handler.state_changed(old_state, &self.state);
-        if let ConsensusState::Candidate(ref mut state) = self.state {
-            // always true
-            state.record_vote(self.id);
-        }
+        let mut state = CandidateState::new();
+        state.record_vote(self.id);
 
         let message = RequestVoteRequest {
-            term: self.current_term(),
-            last_log_index: self.latest_log_index(),
+            term: self.current_term()?,
+            last_log_index: self.latest_log_index()?,
             last_log_term,
+            is_voluntary_step_down: false,
         };
 
         for &peer in &self.peers {
             handler.send_peer_message(peer.id, PeerMessage::RequestVoteRequest(message.clone()));
         }
+
+        let candidate_state = State {
+            id: self.id,
+            peers: self.peers.clone(),
+            log: self.log,
+            state_machine: self.state_machine,
+            commit_index: self.commit_index,
+            min_index: self.min_index,
+            last_applied: self.last_applied,
+            state,
+        };
+        let candidate_state = ConsensusState::Candidate(candidate_state);
+        handler.state_changed(ConsensusStateKind::Follower, &ConsensusStateKind::Candidate);
         handler.set_timeout(ConsensusTimeout::Election);
-        Ok(())
+        Ok(candidate_state)
     }
 }
 
@@ -309,12 +375,17 @@ pub struct FollowerState {
     /// The most recent leader of the follower. The leader is not guaranteed to be active, so this
     /// should only be used as a hint.
     pub(crate) leader: Option<ServerId>,
+
+    delayed_vote_request: Option<(ServerId, RequestVoteRequest)>,
 }
 
 impl FollowerState {
     /// Returns a new `FollowerState`.
     pub(crate) fn new() -> FollowerState {
-        FollowerState { leader: None }
+        FollowerState {
+            leader: None,
+            delayed_vote_request: None,
+        }
     }
 
     /// Sets a new leader.
