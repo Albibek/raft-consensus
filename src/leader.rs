@@ -295,7 +295,7 @@ where
 
         // Send any outstanding entries to the peer, or an empty heartbeat if there are no
         // outstanding entries.
-        let until_index = self.latest_log_index() + 1;
+        let until_index = self.latest_log_index()? + 1;
 
         let prev_log_index = peer_index - 1;
         let prev_log_term = if prev_log_index == LogIndex::from(0) {
@@ -305,7 +305,7 @@ where
         };
 
         let mut message = AppendEntriesRequest {
-            term: self.current_term(),
+            term: self.current_term()?,
             prev_log_index,
             prev_log_term,
             leader_commit: self.commit_index,
@@ -324,7 +324,6 @@ where
         // is done in response processing code
         //self.leader_state.set_next_index(peer, until_index);
         handler.send_peer_message(peer, PeerMessage::AppendEntriesRequest(message));
-        handler.done();
     }
 
     // Configuration change messages
@@ -337,8 +336,8 @@ where
         todo!("process add_server request")
     }
 
-    fn client_ping_request(&self) -> PingResponse {
-        self.common_client_ping_request()
+    fn client_ping_request(&self) -> Result<PingResponse, Error> {
+        self.common_client_ping_request(ConsensusStateKind::Leader)
     }
 
     /// Applies a client proposal to the consensus state machine.
@@ -347,31 +346,27 @@ where
         handler: &mut H,
         from: ClientId,
         request: Vec<u8>,
-    ) -> Result<Option<CommandResponse>, Error> {
-        let prev_log_index = self.latest_log_index();
-        let prev_log_term = self.latest_log_term();
-        let term = self.current_term();
+    ) -> Result<CommandResponse, Error> {
+        let prev_log_index = self.latest_log_index()?;
+        let prev_log_term = self.latest_log_term()?;
+        let term = self.current_term()?;
 
         let log_index = prev_log_index + 1;
-        debug!("ProposalRequest from client {}: entry {}", from, log_index);
+        debug!("proposal request from client {}: entry {}", from, log_index);
         let leader_commit = self.commit_index;
-        self.log
-            .append_entries(
+        self.with_log(|log| {
+            log.append_entries(
                 log_index,
                 Some(Entry::new(term, EntryData::Client(request.clone()))).into_iter(),
             )
-            .map_err(|e| Error::PersistentLog(Box::new(e)))?;
+        })?;
 
-        state.proposals.push_back((from, log_index));
+        self.state.proposals.push_back((from, log_index));
 
-        // the order of messages could broke here if we return Queued after calling
-        // advance_commit_index since it queues some more packets for client,
-        // we must first of all let client know that proposal has been received
-        // and only confirm commits after that
-        handler.send_client_response(from, ClientResponse::Proposal(CommandResponse::Queued));
-        if self.peers.is_empty() {
-            self.advance_commit_index(handler)?;
-        } else {
+        if !self.peers.is_empty() {
+            // solitary consensus can just advance, no messages required
+            //
+            // fan out the request to all followers that are catched up enough
             let message = AppendEntriesRequest {
                 term,
                 prev_log_index,
@@ -379,32 +374,35 @@ where
                 leader_commit,
                 entries: vec![Entry::new(term, EntryData::Client(request))],
             };
+
             for &peer in &self.peers {
-                if state.next_index(&peer.id) == log_index {
+                if self.state.next_index(&peer.id)? == log_index {
                     handler.send_peer_message(
                         peer.id,
                         PeerMessage::AppendEntriesRequest(message.clone()),
                     );
-                    state.set_next_index(peer.id, log_index + 1);
+                    self.state.set_next_index(peer.id, log_index + 1);
                 }
             }
-            self.advance_commit_index(handler)?;
         }
-        // Since queued is already sent, we need no more messages for client
-        Ok(None)
+
+        if self.peers.len() <= 2 {
+            // for a solitary consensus or a 2-peer cluster we aready have a majority,
+            // so there is a reason to advance the index in case the proposal queue is empty
+            //
+            // otherwise, there is no point in this because the majority is not achieved yet
+            self.try_advance_commit_index(handler)?;
+        }
+
+        Ok(CommandResponse::Queued)
     }
 
     fn client_query_request(&mut self, from: ClientId, request: &[u8]) -> CommandResponse {
-        trace!("query from Client({})", from);
+        trace!("query from client {}", from);
 
-        // TODO(from original raft): This is probably not exactly safe.
         let result = self.state_machine.query(&request);
         CommandResponse::Success(result)
     }
-
-    //    fn kind(&self) -> ConsensusStateKind {
-    //ConsensusStateKind::Leader
-    //}
 }
 
 impl<L, M> State<L, M, LeaderState>
@@ -450,14 +448,14 @@ where
         // As long as we know it, we send the connected clients the notification
         // about their proposals being committed
         //
-        // Anote about client proposals ordering: they may come out of order obviously (via parallel
-        // TCP connectinos, for example),
-        // but the consensus should not be responsible for that ordering
-        // because state machine may or may not depend on it
+        // A note about client proposals ordering: they may come out of order obviously (via parallel
+        // TCP connectinos, for example), but the consensus should not be responsible for that ordering
+        // because state machine may or may not depend on it. Consensus still tries to help the
+        // client with the ordering sending a ClientResponse::Queued for each request
         //
-        // What the consensus shlud really be responsible is the same ordering on the followers.
+        // What the consensus should really be responsible is the same ordering on the followers.
         // And since it is leader that applies and commits the commands, the order
-        // they come will be kept as indended, as it's enqueued in self.state.proposals
+        // they come will be kept as intended, as it's enqueued in self.state.proposals
         // so we don't need to do any special handling of it outside the client state machine aplication
         while let Some(&(client, index)) = self.state.proposals.get(0) {
             if index <= self.commit_index {

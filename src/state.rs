@@ -84,16 +84,14 @@ pub(crate) fn apply_client_message<L, M, S: StateHandler<L, M, H>, H: ConsensusH
     handler: &mut H,
     from: ClientId,
     message: ClientRequest,
-) -> Result<Option<ClientResponse>, Error> {
+) -> Result<ClientResponse, Error> {
     Ok(match message {
-        ClientRequest::Ping => Some(ClientResponse::Ping(s.client_ping_request())),
+        ClientRequest::Ping => ClientResponse::Ping(s.client_ping_request()?),
         ClientRequest::Proposal(data) => {
             let response = s.client_proposal_request(handler, from, data)?;
-            response.map(ClientResponse::Proposal)
+            ClientResponse::Proposal(response)
         }
-        ClientRequest::Query(data) => {
-            Some(ClientResponse::Query(s.client_query_request(from, &data)))
-        }
+        ClientRequest::Query(data) => ClientResponse::Query(s.client_query_request(from, &data)),
     })
 }
 
@@ -157,16 +155,17 @@ pub(crate) trait StateHandler<L, M, H: ConsensusHandler> {
     ) -> Result<ServerCommandResponse, Error>;
 
     // Client RPC messages
-    fn client_ping_request(&self) -> PingResponse;
+    fn client_ping_request(&self) -> Result<PingResponse, Error>;
 
-    /// Applies a client proposal to the consensus state machine.
+    // Applies a client proposal to the state machine handled by consensus
     fn client_proposal_request(
         &mut self,
         handler: &mut H,
         from: ClientId,
         request: Vec<u8>,
-    ) -> Result<Option<CommandResponse>, Error>;
+    ) -> Result<CommandResponse, Error>;
 
+    // Requests some client state from the state machine handled by consensus
     fn client_query_request(&mut self, from: ClientId, request: &[u8]) -> CommandResponse;
 
     // Utility messages and actions

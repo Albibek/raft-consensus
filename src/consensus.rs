@@ -285,11 +285,14 @@ where
         Ok((message, new_state))
     }
 
-    pub(crate) fn common_client_ping_request(&self) -> Result<PingResponse, Error> {
+    pub(crate) fn common_client_ping_request(
+        &self,
+        kind: ConsensusStateKind,
+    ) -> Result<PingResponse, Error> {
         Ok(PingResponse {
             term: self.current_term()?,
             index: self.latest_log_index()?,
-            state: self.state.kind(),
+            state: kind,
         })
     }
 }

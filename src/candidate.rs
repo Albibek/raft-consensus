@@ -193,8 +193,8 @@ where
         todo!("process add_server request")
     }
 
-    fn client_ping_request(&self) -> PingResponse {
-        self.common_client_ping_request()
+    fn client_ping_request(&self) -> Result<PingResponse, Error> {
+        self.common_client_ping_request(ConsensusStateKind::Candidate)
     }
 
     /// Applies a client proposal to the consensus state machine.
@@ -203,21 +203,17 @@ where
         handler: &mut H,
         from: ClientId,
         request: Vec<u8>,
-    ) -> Result<Option<CommandResponse>, Error> {
-        //        let prev_log_index = self.latest_log_index();
-        //let prev_log_term = self.latest_log_term();
-        //        let term = self.current_term();
-        Ok(Some(CommandResponse::UnknownLeader))
+    ) -> Result<CommandResponse, Error> {
+        Ok(CommandResponse::UnknownLeader)
     }
 
     fn client_query_request(&mut self, from: ClientId, request: &[u8]) -> CommandResponse {
-        trace!("query from Client({})", from);
+        // TODO: introduce an option for allowing the response from the potentially
+        // older state of the machine
+        // With such option it could be possible to reply the machine on the follower
+        trace!("query from client {}", from);
         CommandResponse::UnknownLeader
     }
-
-    //    fn kind(&self) -> ConsensusStateKind {
-    //ConsensusStateKind::Candidate
-    //}
 }
 
 impl<L, M> State<L, M, CandidateState>

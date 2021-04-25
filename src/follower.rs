@@ -191,8 +191,9 @@ where
     ) -> Result<ServerCommandResponse, Error> {
         todo!("process add_server request")
     }
-    fn client_ping_request(&self) -> PingResponse {
-        self.common_client_ping_request()
+
+    fn client_ping_request(&self) -> Result<PingResponse, Error> {
+        self.common_client_ping_request(ConsensusStateKind::Follower)
     }
 
     /// Applies a client proposal to the consensus state machine.
@@ -201,29 +202,28 @@ where
         handler: &mut H,
         from: ClientId,
         request: Vec<u8>,
-    ) -> Result<Option<CommandResponse>, Error> {
+    ) -> Result<CommandResponse, Error> {
         let prev_log_index = self.latest_log_index();
         let prev_log_term = self.latest_log_term();
         let term = self.current_term();
-        state
+        self.state
             .leader
-            .map_or(Ok(Some(CommandResponse::UnknownLeader)), |leader| {
-                Ok(Some(CommandResponse::NotLeader(leader)))
+            .map_or(Ok(CommandResponse::UnknownLeader), |leader| {
+                Ok(CommandResponse::NotLeader(leader))
             })
     }
 
     fn client_query_request(&mut self, from: ClientId, request: &[u8]) -> CommandResponse {
-        trace!("query from Client({})", from);
+        // TODO: introduce an option for allowing the response from the potentially
+        // older state of the machine
+        // With such option it could be possible to reply the machine on the follower
+        trace!("query from client {}", from);
         self.state
             .leader
             .map_or(CommandResponse::UnknownLeader, |leader| {
                 CommandResponse::NotLeader(leader)
             })
     }
-
-    //    fn kind(&self) -> ConsensusStateKind {
-    //ConsensusStateKind::Follower
-    //}
 }
 
 impl<L, M> State<L, M, FollowerState>
