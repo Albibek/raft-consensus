@@ -18,7 +18,8 @@ use std::fmt::{self, Debug};
 //pub use persistent_log::fs::FsLog;
 pub use crate::persistent_log::mem::MemLog;
 
-use crate::{ConsensusConfig, Entry, LogIndex, ServerId, Term};
+use crate::entry::{ConsensusConfig, Entry};
+use crate::{LogIndex, ServerId, Term};
 
 /// A store of persistent Raft state.
 pub trait Log: Clone + Debug + 'static {
@@ -32,7 +33,8 @@ pub trait Log: Clone + Debug + 'static {
     /// Returns the latest known term.
     fn current_term(&self) -> Result<Term, Self::Error>;
 
-    /// Returns term corresponding to log index if such term exists in log
+    /// Should return term corresponding to log index if such term and index exists in log
+    /// Shoult NOT return an error on non-existence
     fn term(&self, index: LogIndex) -> Result<Option<Term>, Self::Error>;
 
     /// Returns the index of the latest persisted log entry (0 if the log is empty).
@@ -60,17 +62,10 @@ pub trait Log: Clone + Debug + 'static {
     /// Returns the term of the latest persisted log entry (0 if the log is empty).
     fn latest_log_term(&self) -> Result<Term, Self::Error>;
 
-    /// Since the config is written as a separate entry, it is already in the log, we only need
-    /// to save it's index in the log
-    fn set_latest_config_index(&mut self, index: LogIndex) -> Result<(), Self::Error>;
+    // Consensus config related functions
 
-    /// Must return the log index of latest config change
-    fn latest_config_index(&mut self) -> Result<LogIndex, Self::Error>;
-
-    // raft 4.1( end of chapter, before 4.2:
-    // server must be prepared to fall back to the previous configuration in it's log
-    /// Must set the previous configuration change to  be the latest
-    //fn revert_config(&self, config: &mut ConsensusConfig) -> Result<LogIndex, Self::Error>;
+    /// Must return the log index of latest config applied to the log
+    fn latest_config_index(&self) -> Result<LogIndex, Self::Error>;
 
     /// Must put the latest (actual for the current term) config into config provided rerefence
     fn read_latest_config(&self, config: &mut ConsensusConfig) -> Result<LogIndex, Self::Error>;
@@ -78,23 +73,9 @@ pub trait Log: Clone + Debug + 'static {
     /// Reads the entry at the provided log index into entry provided by reference
     fn entry(&self, index: LogIndex, dest: &mut Entry) -> Result<(), Self::Error>;
 
-    // /// Returns the given range of entries (excluding the right endpoint). Allocates.
-    //fn entries(
-    //&self,
-    //lo: LogIndex,
-    //hi: LogIndex,
-    //) -> Result<Vec<(Term, Vec<u8>)>, Self::Error> {
-    //let mut v = Vec::new();
-    //for index in lo.as_u64()..hi.as_u64() {
-    //let mut entry = Vec::new();
-    //let term = self.entry(LogIndex::from(index), &mut entry)?;
-    //v.push((term, v));
-    //}
-    //}
-
     /// Appends the provided entries to the log beginning at the given index.
     /// Note that for configuration change entries, the previous one should also be stored
-    fn append_entries<I: Iterator<Item = Entry>>(
+    fn append_entries<'a, I: Iterator<Item = &'a Entry>>(
         &mut self,
         from: LogIndex,
         entries: I,

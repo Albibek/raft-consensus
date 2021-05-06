@@ -5,7 +5,8 @@ use crate::state_machine::StateMachine;
 
 /// A state machine that simply redirects all commands to a channel.
 ///
-/// This state machine is chiefly meant for testing.
+/// This state machine is chiefly meant for testing and is not able to return any results to the
+/// client.
 pub struct ChannelStateMachine {
     tx: mpsc::Sender<Vec<u8>>,
 }
@@ -18,7 +19,7 @@ impl ChannelStateMachine {
 }
 
 impl StateMachine for ChannelStateMachine {
-    fn apply(&mut self, command: &[u8]) -> Vec<u8> {
+    fn apply(&mut self, command: &[u8], results_required: bool) -> Vec<u8> {
         self.tx
             .send(command.to_vec())
             .map(|_| Vec::new())

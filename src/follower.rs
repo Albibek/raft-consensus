@@ -1,52 +1,57 @@
 use std::cmp;
 
+use crate::error::*;
 use log::{debug, info, trace};
 
-use crate::error::Error;
-use crate::handler::ConsensusHandler;
-use crate::message::*;
-use crate::{ClientId, ConsensusConfig, Entry, EntryData, LogIndex, Peer, ServerId, Term};
+use crate::{ClientId, LogIndex, Peer, ServerId, Term};
 
+use crate::handler::Handler;
+use crate::message::*;
 use crate::persistent_log::Log;
+use crate::raft::CurrentState;
+use crate::state::State;
+use crate::state_impl::StateImpl;
 use crate::state_machine::StateMachine;
 
-use crate::candidate::CandidateState;
-use crate::consensus::State;
-use crate::state::{ConsensusState, StateHandler};
+use crate::candidate::Candidate;
 
-impl<L, M, H> StateHandler<L, M, H> for State<L, M, FollowerState>
+/// Follower replicates AppendEntries requests and votes for it's leader.
+impl<L, M, H> StateImpl<L, M, H> for State<L, M, H, Follower>
 where
     L: Log,
     M: StateMachine,
-    H: ConsensusHandler,
+    H: Handler,
 {
     fn append_entries_request(
-        &mut self,
+        self,
         handler: &mut H,
         from: ServerId,
-        request: AppendEntriesRequest,
-    ) -> Result<(AppendEntriesResponse, Option<ConsensusState<L, M>>), Error> {
+        request: &AppendEntriesRequest,
+    ) -> Result<(AppendEntriesResponse, CurrentState<L, M, H>), Error> {
         let leader_term = request.term;
         let current_term = self.current_term()?;
 
         if leader_term < current_term {
-            return Ok((AppendEntriesResponse::StaleTerm(current_term), None));
+            return Ok((
+                AppendEntriesResponse::StaleTerm(current_term),
+                self.into_consensus_state(),
+            ));
         }
 
-        self.state.set_leader(from);
+        self.state_data.set_leader(from);
 
-        // this function is shared between follower and catching_up states
         let message = self.append_entries(request, handler, current_term)?;
 
         // ensure to reset timer at the very end of potentially long disk operation
         handler.set_timeout(ConsensusTimeout::Election);
+
         // heartbeat invalidates all the delayed voting requests because receiving it
         // means leader is not lost for this node therefore voting should not start
-        if self.state.delayed_vote_request.is_some() {
-            self.state.delayed_vote_request = None
+        if self.state_data.delayed_vote_request.is_some() {
+            self.state_data.delayed_vote_request = None
         }
 
-        Ok((message, None))
+        Ok((message, self.into_consensus_state()))
     }
 
     fn append_entries_response(
@@ -54,7 +59,7 @@ where
         handler: &mut H,
         from: ServerId,
         response: AppendEntriesResponse,
-    ) -> Result<(Option<AppendEntriesRequest>, Option<ConsensusState<L, M>>), Error> {
+    ) -> Result<(Option<AppendEntriesRequest>, Option<CurrentState<L, M, H>>), Error> {
         // the follower can only receive responses in case the node was a leader some time ago
         // and sent requests which triggered the reponse while response was held somewhere in network
         //
@@ -67,7 +72,11 @@ where
         handler: &mut H,
         candidate: ServerId,
         request: RequestVoteRequest,
-    ) -> Result<(Option<RequestVoteResponse>, Option<ConsensusState<L, M>>), Error> {
+    ) -> Result<(Option<RequestVoteResponse>, Option<CurrentState<L, M, H>>), Error> {
+        if !self.state_data.can_vote {
+            debug!("catching up node received a voting request");
+            return Ok((None, None));
+        }
         // To avoid disrupting leader while configuration changes, node should ignore or delay vote requests
         // coming within election timeout unless there is special flag set signalling
         // the leadership was given away voluntarily
@@ -76,12 +85,13 @@ where
         // otherwise). So for a follower this request means it was given a possibility to become a
         // leader faster than others.
         if request.is_voluntary_step_down {
-            self.common_request_vote_request(
+            let (response, new_state) = self.common_request_vote_request(
                 handler,
                 candidate,
                 request,
                 ConsensusStateKind::Follower,
-            )
+            )?;
+            Ok((Some(response), new_state))
         } else {
             // Otherwise, the follower can either ignore/deny or delay the voting request.
             //
@@ -92,11 +102,11 @@ where
             // The delaying scenario makes the request on non-first followers unneeded, because
             // they already know who to vote for and can vote immediately
 
-            if self.state.delayed_vote_request.is_none() {
+            if self.state_data.delayed_vote_request.is_none() {
                 // rewriting request or not does not bring any difference, because election timeout
                 // is randomized, so there is no preference for a follower
                 // so we only avoid some negligible byte copying
-                self.state.delayed_vote_request = Some((candidate, request));
+                self.state_data.delayed_vote_request = Some((candidate, request));
             }
             Ok((None, None))
         }
@@ -107,7 +117,7 @@ where
         handler: &mut H,
         from: ServerId,
         response: RequestVoteResponse,
-    ) -> Result<Option<ConsensusState<L, M>>, Error> {
+    ) -> Result<Option<CurrentState<L, M, H>>, Error> {
         let local_term = self.current_term()?;
         let voter_term = response.voter_term();
         if local_term < voter_term {
@@ -140,8 +150,8 @@ where
         Err(Error::MustLeader)
     }
 
-    fn election_timeout(&mut self, handler: &mut H) -> Result<Option<ConsensusState<L, M>>, Error> {
-        if let Some((from, request)) = self.state.delayed_vote_request.take() {
+    fn election_timeout(mut self, handler: &mut H) -> Result<CurrentState<L, M, H>, Error> {
+        if let Some((from, request)) = self.state_data.delayed_vote_request.take() {
             // voting has started already, process the vote request first
             let (response, new_state) = self.common_request_vote_request(
                 handler,
@@ -150,10 +160,11 @@ where
                 ConsensusStateKind::Follower,
             )?;
             handler.send_peer_message(from, PeerMessage::RequestVoteResponse(response));
+
             if new_state.is_some() {
                 // new state means we must become totally new follower, meaning becoming candidate
                 // is not required
-                Ok(new_state)
+                Ok(new_state.unwrap())
             } else {
                 // Even though we have voted for another candidate, there stil may be things to be
                 // done, like increasing local term.
@@ -162,24 +173,18 @@ where
                 // TODO: think the cases this branch could be reached (candidate_term <= local_term)
                 // At the moment we choose the safer way of starting the election in a regular way
                 // rather than staying a follower
-                Ok(Some(self.into_candidate(handler)?))
+                Ok(self.into_candidate(handler)?)
             }
         } else {
-            Ok(Some(self.into_candidate(handler)?))
+            Ok(self.into_candidate(handler)?)
         }
+
+        //Ok(StateHandler::<L, M, H>::into_consensus_state(self))
     }
 
     // Utility messages and actions
     fn peer_connected(&mut self, handler: &mut H, peer: ServerId) -> Result<(), Error> {
-        // According to Raft 4.1 last paragraph, servers should receive any RPC call
-        // from any server, because they may be a new ones which current server doesn't know
-        // about yet
-
-        let new_peer = !self.peers.iter().any(|&p| p.id == peer);
-        if new_peer {
-            debug!("new peer connected, but not found in consensus: {:?}", peer);
-        }
-
+        // followers don't send messages, so they don't care about other peers' connections
         Ok(())
     }
 
@@ -188,8 +193,13 @@ where
         &mut self,
         handler: &mut H,
         request: &AddServerRequest,
-    ) -> Result<ServerCommandResponse, Error> {
-        todo!("process add_server request")
+    ) -> Result<AdminCommandResponse, Error> {
+        self.state_data
+            .leader
+            .map_or(Ok(AdminCommandResponse::UnknownLeader), |leader| {
+                Ok(AdminCommandResponse::NotLeader(leader))
+            })
+        //TODO: Proxy a command to leader if it is known
     }
 
     fn client_ping_request(&self) -> Result<PingResponse, Error> {
@@ -206,7 +216,7 @@ where
         let prev_log_index = self.latest_log_index();
         let prev_log_term = self.latest_log_term();
         let term = self.current_term();
-        self.state
+        self.state_data
             .leader
             .map_or(Ok(CommandResponse::UnknownLeader), |leader| {
                 Ok(CommandResponse::NotLeader(leader))
@@ -218,29 +228,34 @@ where
         // older state of the machine
         // With such option it could be possible to reply the machine on the follower
         trace!("query from client {}", from);
-        self.state
+        self.state_data
             .leader
             .map_or(CommandResponse::UnknownLeader, |leader| {
                 CommandResponse::NotLeader(leader)
             })
     }
+
+    fn into_consensus_state(self) -> CurrentState<L, M, H> {
+        CurrentState::Follower(self)
+    }
 }
 
-impl<L, M> State<L, M, FollowerState>
+impl<L, M, H> State<L, M, H, Follower>
 where
     L: Log,
     M: StateMachine,
+    H: Handler,
 {
-    /// AppendEntries processing function for both follower and catching up node
-    pub(crate) fn append_entries<H: ConsensusHandler>(
+    /// AppendEntries processing function for
+    pub(crate) fn append_entries(
         &mut self,
-        request: AppendEntriesRequest,
+        request: &AppendEntriesRequest,
         handler: &mut H,
         current_term: Term,
     ) -> Result<AppendEntriesResponse, Error> {
         let leader_term = request.term;
         if current_term < leader_term {
-            self.with_log(|log| log.set_current_term(leader_term))?;
+            self.with_log_mut(|log| log.set_current_term(leader_term))?;
         }
 
         let leader_prev_log_index = request.prev_log_index;
@@ -254,7 +269,7 @@ where
             // If the previous entries index was not the same we'd leave a gap! Reply failure.
             return Ok(AppendEntriesResponse::InconsistentPrevEntry(
                 current_term,
-                leader_prev_log_index,
+                latest_log_index,
             ));
         }
 
@@ -281,7 +296,7 @@ where
             // could send the entries starting from this index instead of decrementing it each time
             return Ok(AppendEntriesResponse::InconsistentPrevEntry(
                 current_term,
-                leader_prev_log_index,
+                latest_log_index,
             ));
         }
 
@@ -311,16 +326,12 @@ where
             return Ok(AppendEntriesResponse::StaleEntry);
         }
 
-        self.with_log(|log| log.append_entries(leader_prev_log_index + 1, entries.into_iter()))?;
+        self.with_log_mut(|log| log.append_entries(leader_prev_log_index + 1, entries.iter()))?;
         self.min_index = new_latest_log_index;
+
         // We are matching the leader's log up to and including `new_latest_log_index`.
         self.commit_index = cmp::min(request.leader_commit, new_latest_log_index);
         self.apply_commits(false);
-
-        // among the changes a config change may have come
-        // so we ask the handler to check it and maybe do the connection
-        // with new peers or disconnect the removed ones
-        handler.ensure_connected(&self.peers);
 
         Ok(AppendEntriesResponse::Success(
             current_term,
@@ -328,17 +339,13 @@ where
         ))
     }
 
-    fn into_candidate<H: ConsensusHandler>(
-        &mut self,
-        handler: &mut H,
-    ) -> Result<ConsensusState<L, M>, Error> {
-        //todo!("write candidate transitioning");
+    fn into_candidate(mut self, handler: &mut H) -> Result<CurrentState<L, M, H>, Error> {
         self.with_log_mut(|log| log.inc_current_term())?;
         let id = self.id;
         self.with_log_mut(|log| log.set_voted_for(id))?;
         let last_log_term = self.with_log(|log| log.latest_log_term())?;
 
-        let mut state = CandidateState::new();
+        let mut state = Candidate::new();
         state.record_vote(self.id);
 
         let message = RequestVoteRequest {
@@ -348,21 +355,23 @@ where
             is_voluntary_step_down: false,
         };
 
-        for &peer in &self.peers {
-            handler.send_peer_message(peer.id, PeerMessage::RequestVoteRequest(message.clone()));
-        }
+        self.config.with_remote_peers(&self.id, |id| {
+            handler.send_peer_message(*id, PeerMessage::RequestVoteRequest(message.clone()));
+            Ok(())
+        });
 
-        let candidate_state = State {
-            id: self.id,
-            peers: self.peers.clone(),
-            log: self.log,
-            state_machine: self.state_machine,
-            commit_index: self.commit_index,
-            min_index: self.min_index,
-            last_applied: self.last_applied,
-            state,
-        };
-        let candidate_state = ConsensusState::Candidate(candidate_state);
+        let candidate_state = self.transition(state)?;
+        //let candidate_state = State {
+        //id: self.id,
+        //config: self.config.clone(),
+        //log: self.log,
+        //state_machine: self.state_machine,
+        //commit_index: self.commit_index,
+        //min_index: self.min_index,
+        //last_applied: self.last_applied,
+        //state,
+        //};
+        let candidate_state = CurrentState::Candidate(candidate_state);
         handler.state_changed(ConsensusStateKind::Follower, &ConsensusStateKind::Candidate);
         handler.set_timeout(ConsensusTimeout::Election);
         Ok(candidate_state)
@@ -371,20 +380,22 @@ where
 
 /// The state associated with a Raft consensus module in the `Follower` state.
 #[derive(Clone, Debug)]
-pub struct FollowerState {
+pub struct Follower {
     /// The most recent leader of the follower. The leader is not guaranteed to be active, so this
     /// should only be used as a hint.
     pub(crate) leader: Option<ServerId>,
 
     delayed_vote_request: Option<(ServerId, RequestVoteRequest)>,
+    can_vote: bool,
 }
 
-impl FollowerState {
+impl Follower {
     /// Returns a new `FollowerState`.
-    pub(crate) fn new() -> FollowerState {
-        FollowerState {
+    pub(crate) fn new(can_vote: bool) -> Follower {
+        Follower {
             leader: None,
             delayed_vote_request: None,
+            can_vote,
         }
     }
 

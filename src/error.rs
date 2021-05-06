@@ -1,5 +1,5 @@
 //! Error type with all possible errors
-use crate::{ServerId, Term};
+use crate::{LogIndex, ServerId, Term};
 use std::error::Error as StdError;
 use thiserror::Error as ThisError;
 use uuid::BytesError;
@@ -12,6 +12,9 @@ use capnp::NotInSchema;
 #[error("Consensus error")]
 #[derive(ThisError, Debug)]
 pub enum Error {
+    #[error("Consensus have reached unrecoverable error: {}", _0)]
+    Critical(#[from] CriticalError),
+
     #[error("Consensus state was not Leader while it had to be.")]
     MustLeader,
 
@@ -27,14 +30,8 @@ pub enum Error {
     #[error("unexpected message")]
     UnexpectedMessage,
 
-    #[error("catching up failed because of timeout or leader change")]
-    CatchUpFailed,
-
-    #[error("catching up failed because of bug")]
-    CatchUpBug,
-
-    #[error("BUG: peer leader with matching term detected")]
-    AnotherLeader(ServerId, Term),
+    #[error("trying to removing last node makes cluster unable to being restored")]
+    LastNodeRemoval,
 
     #[error("UUID conversion")]
     Uuid(#[from] BytesError),
@@ -56,4 +53,40 @@ pub enum Error {
 
     #[error("unable to support {} cluster members", _0)]
     BadClusterSize(usize),
+}
+
+impl Error {
+    pub fn is_critical(&self) -> bool {
+        if let Error::Critical(_) = self {
+            true
+        } else {
+            false
+        }
+    }
+
+    #[inline]
+    pub(crate) fn unreachable(at: &'static str) -> Error {
+        Error::Critical(CriticalError::Unreachable(at))
+    }
+
+    #[inline]
+    pub(crate) fn log_broken(index: LogIndex, at: &'static str) -> Error {
+        Error::Critical(CriticalError::LeaderLogBroken(index, at))
+    }
+}
+
+#[error("Critical error in consensus")]
+#[derive(ThisError, Debug)]
+pub enum CriticalError {
+    #[error("BUG: unreachable condition at {}", _0)]
+    Unreachable(&'static str),
+
+    #[error("BUG: leader's log could not find term for index {} at {}", _0, _1)]
+    LeaderLogBroken(LogIndex, &'static str),
+
+    #[error("Consensus state become unrecoverable after last error, consensus cannot proceed")]
+    Unrecoverable,
+
+    #[error("BUG: peer leader with matching term detected")]
+    AnotherLeader(ServerId, Term),
 }

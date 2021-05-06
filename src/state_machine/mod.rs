@@ -25,7 +25,9 @@ pub use crate::state_machine::null::NullStateMachine;
 pub trait StateMachine: Debug + Send + 'static {
     /// Applies a command to the state machine.
     /// if results_required is true, should return an application-specific result value.
-    /// if results are note required, may return empty vector to avoid allocation
+    /// The situation when results are not requred happens on follower who only applies the log ant does not
+    /// send any response to client).
+    /// In such case the function may return empty vector to avoid allocation
     fn apply(&mut self, command: &[u8], results_required: bool) -> Vec<u8>;
 
     /// Queries a value of the state machine. Does not go through the durable log, or mutate the

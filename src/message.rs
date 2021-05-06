@@ -10,9 +10,10 @@ use crate::messages_capnp::*;
 #[cfg(feature = "use_capnp")]
 use capnp::message::{Allocator, Builder, HeapAllocator, Reader, ReaderSegments};
 
+use crate::entry::Entry;
 /// Module contains message types used in consensus
 /// Any network message have to be converted to theese enums to be processed
-use crate::{Entry, LogIndex, ServerId, Term};
+use crate::{LogIndex, ServerId, Term};
 
 #[cfg(feature = "use_capnp")]
 macro_rules! common_capnp {
@@ -45,7 +46,6 @@ pub enum ConsensusStateKind {
     Follower,
     Candidate,
     Leader,
-    //    CatchingUp,
 }
 
 #[cfg(feature = "use_capnp")]
@@ -55,7 +55,6 @@ impl ConsensusStateKind {
             consensus_state::Which::Follower(()) => Ok(ConsensusStateKind::Follower),
             consensus_state::Which::Candidate(()) => Ok(ConsensusStateKind::Candidate),
             consensus_state::Which::Leader(()) => Ok(ConsensusStateKind::Leader),
-            //consensus_state::Which::CatchingUp(()) => Ok(ConsensusStateKind::CatchingUp),
         }
     }
 
@@ -64,7 +63,6 @@ impl ConsensusStateKind {
             &ConsensusStateKind::Follower => builder.reborrow().set_follower(()),
             &ConsensusStateKind::Candidate => builder.reborrow().set_candidate(()),
             &ConsensusStateKind::Leader => builder.reborrow().set_leader(()),
-            //&ConsensusStateKind::CatchingUp => builder.reborrow().set_catchingup(()),
         };
     }
 
@@ -359,87 +357,20 @@ impl RequestVoteResponse {
     );
 }
 
-//================= Cluster membership change messages
-#[derive(Clone, Debug, PartialEq)]
-#[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
-/// Request for adding new server to cluster
-pub struct AddServerRequest {
-    /// The id of new server being added
-    pub id: ServerId,
-    pub info: Vec<u8>,
-}
-
-#[cfg(feature = "use_capnp")]
-impl AddServerRequest {
-    pub fn from_capnp<'a>(reader: add_server_request::Reader<'a>) -> Result<Self, Error> {
-        Ok(Self {
-            id: reader.get_id().into(),
-            info: reader.get_info()?.to_vec(),
-        })
-    }
-
-    pub fn fill_capnp<'a>(&self, builder: &mut add_server_request::Builder<'a>) {
-        builder.set_id(self.id.into());
-        builder.set_info(&self.info);
-    }
-
-    common_capnp!(add_server_request::Builder, add_server_request::Reader);
-}
-
-#[derive(Clone, Debug, PartialEq)]
-#[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
-/// Response when adding new server to cluster
-pub enum ServerCommandResponse {
-    Success,
-    BadPeer,
-    LeaderJustChanged,
-    AlreadyPending,
-    UnknownLeader,
-    NotLeader(ServerId),
-}
-
-#[cfg(feature = "use_capnp")]
-impl ServerCommandResponse {
-    pub fn from_capnp<'a>(reader: add_server_response::Reader<'a>) -> Result<Self, Error> {
-        let message = match reader.which().map_err(Error::CapnpSchema)? {
-            server_command_response::Which::Success(()) => ServerCommandResponse::Success,
-            server_command_response::Which::BadPeer(()) => ServerCommandResponse::BadPeer,
-            server_command_response::Which::LeaderJustChanged(()) => {
-                ServerCommandResponse::LeaderJustChanged
-            }
-            server_command_response::Which::AlreadyPending(()) => {
-                ServerCommandResponse::AlreadyPending
-            }
-            server_command_response::Which::UnknownLeader(()) => {
-                ServerCommandResponse::UnknownLeader
-            }
-            server_command_response::Which::NotLeader(id) => {
-                ServerCommandResponse::NotLeader(id.into())
-            }
-        };
-        Ok(message)
-    }
-
-    pub fn fill_capnp<'a>(&self, builder: &mut server_command_response::Builder<'a>) {
-        match self {
-            &ServerCommandResponse::Success => builder.set_success(()),
-            &ServerCommandResponse::BadPeer => builder.set_bad_peer(()),
-            &ServerCommandResponse::LeaderJustChanged => builder.set_leader_just_changed(()),
-            &ServerCommandResponse::AlreadyPending => builder.set_already_pending(()),
-            &ServerCommandResponse::UnknownLeader => builder.set_unknown_leader(()),
-            &ServerCommandResponse::NotLeader(id) => builder.set_not_leader(id.into()),
-        }
-    }
-
-    common_capnp!(add_server_response::Builder, add_server_response::Reader);
-}
-
 //================= Client messages
+#[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
+#[derive(Clone, Debug, PartialEq)]
+/// Any message related to client requests and responses
+pub enum ClientMessage {
+    ClientRequest(ClientRequest),
+    ClientResponse(ClientResponse),
+    PingRequest(PingRequest),
+}
+
 #[derive(Clone, Debug, PartialEq)]
 #[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
 /// Request from client.
 pub enum ClientRequest {
-    Ping,
     Proposal(Vec<u8>),
     Query(Vec<u8>),
 }
@@ -474,9 +405,8 @@ impl ClientRequest {
 
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
-/// Response to clienti request.
+/// Response to client request.
 pub enum ClientResponse {
-    Ping(PingResponse),
     Proposal(CommandResponse),
     Query(CommandResponse),
 }
@@ -523,6 +453,11 @@ impl ClientResponse {
 
     common_capnp!(client_response::Builder, client_response::Reader);
 }
+
+#[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
+/// A ping request, not to be confused with heartbeats
+pub struct PingRequest;
 
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
@@ -608,15 +543,99 @@ impl CommandResponse {
 
     common_capnp!(command_response::Builder, command_response::Reader);
 }
+//================= Cluster membership change messages
+#[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
+#[derive(Clone, Debug, PartialEq)]
+/// Any message related to client requests and responses
+pub enum AdminMessage {
+    AddServerRequest(AddServerRequest),
+    AdminCommandResponse(AdminCommandResponse),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
+/// Request for adding new server to cluster
+pub struct AddServerRequest {
+    /// The id of new server being added
+    pub id: ServerId,
+    pub info: Vec<u8>,
+}
+
+#[cfg(feature = "use_capnp")]
+impl AddServerRequest {
+    pub fn from_capnp<'a>(reader: add_server_request::Reader<'a>) -> Result<Self, Error> {
+        Ok(Self {
+            id: reader.get_id().into(),
+            info: reader.get_info()?.to_vec(),
+        })
+    }
+
+    pub fn fill_capnp<'a>(&self, builder: &mut add_server_request::Builder<'a>) {
+        builder.set_id(self.id.into());
+        builder.set_info(&self.info);
+    }
+
+    common_capnp!(add_server_request::Builder, add_server_request::Reader);
+}
+
+#[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
+/// Response when adding new server to cluster
+pub enum AdminCommandResponse {
+    Success,
+    Started,
+    BadPeer,
+    LeaderJustChanged,
+    AlreadyPending,
+    UnknownLeader,
+    NotLeader(ServerId),
+}
+
+#[cfg(feature = "use_capnp")]
+impl AdminCommandResponse {
+    pub fn from_capnp<'a>(reader: add_server_response::Reader<'a>) -> Result<Self, Error> {
+        let message = match reader.which().map_err(Error::CapnpSchema)? {
+            server_command_response::Which::Success(()) => AdminCommandResponse::Success,
+            server_command_response::Which::BadPeer(()) => AdminCommandResponse::BadPeer,
+            server_command_response::Which::LeaderJustChanged(()) => {
+                AdminCommandResponse::LeaderJustChanged
+            }
+            server_command_response::Which::AlreadyPending(()) => {
+                AdminCommandResponse::AlreadyPending
+            }
+            server_command_response::Which::UnknownLeader(()) => {
+                AdminCommandResponse::UnknownLeader
+            }
+            server_command_response::Which::NotLeader(id) => {
+                AdminCommandResponse::NotLeader(id.into())
+            }
+        };
+        Ok(message)
+    }
+
+    pub fn fill_capnp<'a>(&self, builder: &mut server_command_response::Builder<'a>) {
+        match self {
+            &AdminCommandResponse::Success => builder.set_success(()),
+            &AdminCommandResponse::BadPeer => builder.set_bad_peer(()),
+            &AdminCommandResponse::LeaderJustChanged => builder.set_leader_just_changed(()),
+            &AdminCommandResponse::AlreadyPending => builder.set_already_pending(()),
+            &AdminCommandResponse::UnknownLeader => builder.set_unknown_leader(()),
+            &AdminCommandResponse::NotLeader(id) => builder.set_not_leader(id.into()),
+        }
+    }
+
+    common_capnp!(add_server_response::Builder, add_server_response::Reader);
+}
+
 //================= other messages
 
 /// Consensus timeout types.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 #[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
 pub enum ConsensusTimeout {
-    // An election timeout. Randomized value.
+    /// An election timeout. Randomized value.
     Election,
-    // A heartbeat timeout. Stable value.
+    /// A heartbeat timeout. Stable value, set by leader separately for each peer.
     Heartbeat(ServerId),
 }
 

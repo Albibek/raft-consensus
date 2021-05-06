@@ -1,5 +1,6 @@
+use crate::entry::{ConsensusConfig, Entry, EntryData};
 use crate::persistent_log::{Error, Log};
-use crate::{ConsensusConfig, Entry, EntryData, LogIndex, ServerId, Term};
+use crate::{LogIndex, ServerId, Term};
 
 /// This is a `Log` implementation that stores entries in a simple in-memory vector. Other data
 /// is stored in a struct. It is chiefly intended for testing.
@@ -63,12 +64,16 @@ impl Log for MemLog {
         }
     }
 
-    fn set_latest_config_index(&mut self, index: LogIndex) -> Result<(), Self::Error> {
-        self.latest_config_index = Some(index.0);
-        Ok(())
+    //    fn set_latest_config_index(&mut self, index: LogIndex) -> Result<(), Self::Error> {
+    //self.latest_config_index = Some(index.0);
+    //Ok(())
+    //}
+
+    fn discard_since(&self, index: LogIndex) -> Result<(), Self::Error> {
+        todo!()
     }
 
-    fn latest_config_index(&mut self) -> Result<LogIndex, Self::Error> {
+    fn latest_config_index(&self) -> Result<LogIndex, Self::Error> {
         self.latest_config_index
             .map(|i| i.into())
             .ok_or(Error::NoConfig)
@@ -78,7 +83,7 @@ impl Log for MemLog {
         let index = self.latest_config_index()?;
         match self.entries.get(index.as_usize()) {
             Some(Entry {
-                data: EntryData::Config(latest_config),
+                data: EntryData::Config(latest_config, _),
                 ..
             }) => {
                 *config = latest_config.clone();
@@ -88,10 +93,11 @@ impl Log for MemLog {
         }
     }
 
-    fn term(&self, index: LogIndex) -> Result<Term, Error> {
+    fn term(&self, index: LogIndex) -> Result<Option<Term>, Error> {
+        todo!();
         self.entries
             .get((index - 1).as_u64() as usize)
-            .map(|entry| entry.term)
+            .map(|entry| Some(entry.term))
             .ok_or(Error::BadIndex)
     }
 
@@ -102,7 +108,7 @@ impl Log for MemLog {
             .ok_or(Error::BadIndex)
     }
 
-    fn append_entries<I: Iterator<Item = Entry>>(
+    fn append_entries<'a, I: Iterator<Item = &'a Entry>>(
         &mut self,
         from: LogIndex,
         entries: I,
@@ -118,7 +124,7 @@ impl Log for MemLog {
             self.entries.truncate(start);
         }
 
-        self.entries.extend(entries);
+        self.entries.extend(entries.cloned());
         Ok(())
     }
 }

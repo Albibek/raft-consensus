@@ -18,27 +18,30 @@ pub mod persistent_log;
 pub mod state_machine;
 
 /// Implementation of Raft consensus API
-pub mod consensus;
+pub mod raft;
 
 /// Messages that are passed during consensus work
 #[cfg_attr(feature = "use_capnp", macro_use)]
 pub mod message;
 
-/// Contains consensus state transitions trait definition
+// Data and functions for all states
 mod state;
 
+// Trait and helpers for internal state handling API
+mod state_impl;
+
+/// Definition of a persistent log entry
+pub mod entry;
+
 /// Module with all functions required in follower state
-pub mod candidate;
+mod candidate;
 /// Module with all functions required in candidate state
-pub mod follower;
+mod follower;
 /// Module with all functions required in leader state
-pub mod leader;
+mod leader;
 
 /// Handlers for consensus callbacks
 pub mod handler;
-
-/// Handle consensus from many threads
-pub mod shared;
 
 #[cfg(feature = "use_capnp")]
 pub mod messages_capnp {
@@ -52,17 +55,11 @@ use std::{fmt, ops};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-#[cfg(feature = "use_capnp")]
-use capnp::message::{Allocator, Builder, HeapAllocator, Reader, ReaderSegments};
-
-#[cfg(feature = "use_capnp")]
-use crate::messages_capnp::{entry, entry_data};
-
 use crate::error::Error;
 
-pub use crate::consensus::Consensus;
-pub use crate::handler::ConsensusHandler;
+pub use crate::handler::Handler;
 pub use crate::persistent_log::Log;
+pub use crate::raft::Raft;
 pub use crate::state_machine::StateMachine;
 
 /// The term of a log entry.
@@ -182,16 +179,15 @@ impl fmt::Display for LogIndex {
 #[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
 pub struct Peer {
     id: ServerId,
-    status: PeerStatus,
+    //    status: PeerStatus,
 }
 
-#[derive(Copy, Clone, Hash, PartialEq, Eq, Ord, PartialOrd, Debug)]
-#[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
-pub enum PeerStatus {
-    Member,
-    FutureMember,
-    NonVoter,
-}
+//#[derive(Copy, Clone, Hash, PartialEq, Eq, Ord, PartialOrd, Debug)]
+//#[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
+//pub enum PeerStatus {
+//Member,
+//NonVoter,
+//}
 
 /// The ID of a Raft server. Must be unique among the participants in a
 /// consensus group.
@@ -245,87 +241,4 @@ impl fmt::Display for ClientId {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         fmt::Display::fmt(&self.0, f)
     }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
-pub(crate) struct ConsensusConfig {
-    // we don't want to use just a vector(or a type alias) in case we would want to change
-    // this structure in future
-    peers: Vec<Peer>,
-}
-
-/// Type representing all possible data types that can be appended to a log
-#[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
-pub enum EntryData {
-    Heartbeat,
-    Client(Vec<u8>),
-    Config(ConsensusConfig),
-    // TODO:
-    // RegisterClient
-    // RemoveClient
-}
-
-/// Type representing a log entry
-/// The internal data in vectors is not used in consensus, only proxied to persistent log and state
-/// machine correspondingly
-#[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
-pub struct Entry {
-    pub term: Term,
-    pub data: EntryData,
-}
-
-impl Entry {
-    pub fn new(term: Term, data: EntryData) -> Self {
-        Self { term, data }
-    }
-}
-
-impl Default for Entry {
-    fn default() -> Self {
-        Self {
-            term: 0.into(),
-            data: EntryData::Client(Vec::new()),
-        }
-    }
-}
-
-#[cfg(feature = "use_capnp")]
-impl Entry {
-    pub fn from_capnp<'a>(reader: entry::Reader<'a>) -> Result<Self, Error> {
-        let data = match reader.get_data()?.which()? {
-            entry_data::Which::Client(reader) => EntryData::Client(reader?.to_vec()),
-            entry_data::Which::AddServer(reader) => {
-                let add_server_entry = reader?;
-                EntryData::AddServer(
-                    add_server_entry.get_id().into(),
-                    add_server_entry.get_info()?.to_vec(),
-                )
-            }
-            entry_data::Which::RemoveServer(id) => EntryData::RemoveServer(id.into()),
-        };
-
-        Ok(Entry {
-            term: reader.get_term().into(),
-            data,
-        })
-    }
-
-    pub fn fill_capnp<'a>(&self, builder: &mut entry::Builder<'a>) {
-        builder.set_term(self.term.as_u64());
-        let mut data_builder = builder.reborrow().init_data();
-        match self.data {
-            EntryData::Client(ref data) => data_builder.set_client(data),
-            EntryData::AddServer(id, ref info) => {
-                let mut add_server_builder = data_builder.init_add_server();
-                add_server_builder.set_id(id.into());
-                add_server_builder.set_info(info);
-            }
-            EntryData::RemoveServer(id) => data_builder.set_remove_server(id.into()),
-        }
-    }
-
-    common_capnp!(entry::Builder, entry::Reader);
 }

@@ -1,41 +1,29 @@
-//!
-//!
 use std::collections::HashMap;
 use std::fmt::Debug;
 
 use crate::message::*;
-use crate::state::ConsensusState;
 use crate::{ClientId, Peer, ServerId};
 
 /// Handler for actions returned from consensus
 ///
-/// ### Note on peer connection handling
-///
-pub trait ConsensusHandler: Debug {
+/// Timeout setting and clearing is expected to be overwriting, i.e. setting one if it was not set
+/// and resetting otherwise, i.e. setting the new one from the start
+pub trait Handler: Debug {
     fn send_peer_message(&mut self, id: ServerId, message: PeerMessage);
     fn send_client_response(&mut self, id: ClientId, message: ClientResponse);
     fn set_timeout(&mut self, timeout: ConsensusTimeout);
     fn clear_timeout(&mut self, timeout: ConsensusTimeout);
 
-    /// Called when AddServer RPC is made, so the connection to remote peer should be made
-    /// After having this method called handler SHOULD make sure peer is connected
-    /// and call consensus' peer_connected even if the peer connection was establlished before
-    /// and even if peer_connected was already called
-    fn ensure_connected(&mut self, peers: &[Peer]) -> Result<(), ()>;
-
     #[allow(unused_variables)]
     /// Called when consensus goes to new state. Initializing new consensus does not call this function.
     fn state_changed(&mut self, old: ConsensusStateKind, new: &ConsensusStateKind) {}
-
-    /// called when remote peer should not be connected to the node
-    fn disconnect_peer(&mut self, id: ServerId);
 
     /// called when peer caught the error where it should be restarted or failed
     fn peer_failed(&mut self, id: ServerId);
 }
 
 /// A handler that collects all messages leaving processing of them untouched.
-/// Note that timeouts vectors may intersect, that means both - clearing and setting a new timeout was requested.
+/// Note that `timeouts` vectors may intersect, that means both - clearing and setting a new timeout was requested.
 #[derive(Debug)]
 pub struct CollectHandler {
     pub peer_messages: HashMap<ServerId, Vec<PeerMessage>>,
@@ -52,7 +40,7 @@ impl CollectHandler {
             client_messages: HashMap::new(),
             timeouts: Vec::new(),
             clear_timeouts: Vec::new(),
-            state: ConsensusState::default(),
+            state: ConsensusStateKind::Follower,
         }
     }
 
@@ -71,7 +59,7 @@ impl Default for CollectHandler {
     }
 }
 
-impl ConsensusHandler for CollectHandler {
+impl Handler for CollectHandler {
     /// Saves peer message to a vector
     fn send_peer_message(&mut self, id: ServerId, message: PeerMessage) {
         let peer = self.peer_messages.entry(id).or_insert_with(Vec::new);
@@ -103,11 +91,7 @@ impl ConsensusHandler for CollectHandler {
         self.state = new.clone()
     }
 
-    fn ensure_connected(&mut self, peers: &[Peer]) -> Result<(), ()> {
-        Ok(())
-    }
-
-    fn disconnect_peer(&mut self, id: ServerId) {
-        Ok(())
-    }
+    //    fn ensure_connected(&mut self, peers: &[Peer]) -> Result<(), ()> {
+    //Ok(())
+    //    }
 }
