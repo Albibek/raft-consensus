@@ -16,7 +16,7 @@ use crate::{LogIndex, Peer, ServerId, Term};
 
 use crate::follower::Follower;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct State<L, M, H, S>
 where
     L: Log,
@@ -138,13 +138,13 @@ where
     H: Handler,
     Self: StateImpl<L, M, H>,
 {
-    pub(crate) fn to_follower(
+    pub(crate) fn into_follower(
         self,
         handler: &mut H,
-        from: ConsensusStateKind,
+        from: ConsensusState,
         leader_term: Term,
-    ) -> Result<CurrentState<L, M, H>, Error> {
-        handler.state_changed(from, &ConsensusStateKind::Follower);
+    ) -> Result<State<L, M, H, Follower>, Error> {
+        handler.state_changed(from, &ConsensusState::Follower);
 
         let mut follower_state = State {
             id: self.id,
@@ -165,10 +165,10 @@ where
         follower_state.with_log_mut(|log| log.set_current_term(leader_term))?;
 
         follower_state.config.clear_heartbeats(handler);
-        handler.set_timeout(ConsensusTimeout::Election);
+        handler.set_timeout(Timeout::Election);
         follower_state.with_log_mut(|log| log.read_latest_config(&mut follower_state.config))?;
 
-        Ok(CurrentState::Follower(follower_state))
+        Ok(follower_state)
     }
 
     // At some point all nodes behave in the same way regardless of their state
@@ -177,7 +177,7 @@ where
         handler: &mut H,
         from: ServerId,
         request: &RequestVoteRequest,
-        from_state: ConsensusStateKind,
+        from_state: ConsensusState,
     ) -> Result<(RequestVoteResponse, CurrentState<L, M, H>), Error> {
         let candidate_term = request.term;
         let candidate_log_term = request.last_log_term;
@@ -226,16 +226,16 @@ where
         };
 
         if change_to_follower {
-            let new_state = self.to_follower(handler, from_state, candidate_term)?;
-            Ok((message, new_state))
+            let new_state = self.into_follower(handler, from_state, candidate_term)?;
+            Ok((message, new_state.into()))
         } else {
-            Ok((message, self.into_consensus_state()))
+            Ok((message, self.into()))
         }
     }
 
     pub(crate) fn common_client_ping_request(
         &self,
-        kind: ConsensusStateKind,
+        kind: ConsensusState,
     ) -> Result<PingResponse, Error> {
         Ok(PingResponse {
             term: self.current_term()?,

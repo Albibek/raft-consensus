@@ -35,10 +35,7 @@ where
         let current_term = self.current_term()?;
 
         if leader_term < current_term {
-            return Ok((
-                AppendEntriesResponse::StaleTerm(current_term),
-                self.into_consensus_state(),
-            ));
+            return Ok((AppendEntriesResponse::StaleTerm(current_term), self.into()));
         }
 
         if leader_term == current_term {
@@ -49,7 +46,7 @@ where
             //return Err(Error::AnotherLeader(from, current_term));
         }
 
-        let mut new_state = self.leader_to_follower(handler, leader_term)?;
+        let mut new_state = self.leader_into_follower(handler, leader_term)?;
         let (response, new_state) = new_state.append_entries_request(handler, from, request)?;
 
         Ok((response, new_state))
@@ -77,8 +74,8 @@ where
                 // some node has received message with term higher than ours,
                 // that means some other leader appeared in consensus,
                 // we should downgrade to follower immediately
-                let new_state = self.leader_to_follower(handler, current_term)?;
-                return Ok((None, new_state.into_consensus_state()));
+                let new_state = self.leader_into_follower(handler, current_term)?;
+                return Ok((None, new_state.into()));
             }
 
             AppendEntriesResponse::Success(term, _)
@@ -88,17 +85,17 @@ where
             {
                 // some follower confirmed message we've sent at previous term
                 // it is ok for us
-                return Ok((None, self.into_consensus_state()));
+                return Ok((None, self.into()));
             }
             AppendEntriesResponse::StaleEntry => {
-                return Ok((None, self.into_consensus_state()));
+                return Ok((None, self.into()));
             }
             AppendEntriesResponse::StaleTerm(_) => {
                 // The peer is reporting a stale term, but the term number matches the local term.
                 // Ignore the response, since it is to a message from a prior term, and this server
                 // has already transitioned to the new term.
 
-                return Ok((None, self.into_consensus_state()));
+                return Ok((None, self.into()));
             }
             AppendEntriesResponse::InconsistentPrevEntry(_, next_index) => {
                 self.state_data.set_next_index(from, *next_index)?;
@@ -138,7 +135,7 @@ where
                                 self.add_next_entry(EntryData::Config(self.config.clone(), true))?;
 
                             self.send_append_entries_request(handler, log_index, message)?;
-                            return Ok((None, self.into_consensus_state()));
+                            return Ok((None, self.into()));
                         }
                         CatchUpStatus::NotYet => {
                             trace!("catching up node did not catch this round, continuing the catching up process");
@@ -151,7 +148,7 @@ where
                             let mut config = self.config.clone();
                             self.with_log_mut(|log| log.read_latest_config(&mut config))?;
                             self.state_data.reset_config_change(handler);
-                            return Ok((None, self.into_consensus_state()));
+                            return Ok((None, self.into()));
                         }
                     }
                 } else {
@@ -182,7 +179,7 @@ where
                 Term(0)
             } else {
                 // non-existence of index is definitely a bug here
-                self.with_log(|log| log.term(prev_log_index))?
+                self.with_log(|log| log.term_at(prev_log_index))?
                     .ok_or(Error::log_broken(prev_log_index, module_path!()))?
             };
 
@@ -210,7 +207,7 @@ where
             self.state_data
                 .set_next_index(from, local_latest_log_index + 1)?;
 
-            Ok((Some(message), self.into_consensus_state()))
+            Ok((Some(message), self.into()))
         } else {
             if self.state_data.is_catching_up(&from) {
                 // the catching up remote has catched up
@@ -222,8 +219,8 @@ where
             todo!("add config change entry to log and distribute it over cluster");
 
             // since the peer is caught up, set a heartbeat timeout.
-            handler.set_timeout(ConsensusTimeout::Heartbeat(from));
-            Ok((None, self.into_consensus_state()))
+            handler.set_timeout(Timeout::Heartbeat(from));
+            Ok((None, self.into()))
         }
     }
 
@@ -246,21 +243,21 @@ where
                 handler,
                 candidate,
                 request,
-                ConsensusStateKind::Leader,
+                ConsensusState::Leader,
             )?;
             Ok((Some(response), new_state))
         } else {
-            Ok((None, None))
+            Ok((None, self.into()))
         }
     }
 
     /// Applies a request vote response to the consensus state machine.
     fn request_vote_response(
-        &mut self,
+        self,
         handler: &mut H,
         from: ServerId,
-        response: RequestVoteResponse,
-    ) -> Result<Option<CurrentState<L, M, H>>, Error> {
+        response: &RequestVoteResponse,
+    ) -> Result<CurrentState<L, M, H>, Error> {
         let local_term = self.current_term()?;
         let voter_term = response.voter_term();
         if local_term < voter_term {
@@ -274,15 +271,14 @@ where
                 "received RequestVoteResponse from {{ id: {}, term: {} }} with newer term; transitioning to follower",
                 from, voter_term
             );
-            let follower_state =
-                self.to_follower(handler, ConsensusStateKind::Leader, voter_term)?;
-            Ok(Some(follower_state))
+            let follower = self.into_follower(handler, ConsensusState::Leader, voter_term)?;
+            Ok(follower.into())
         } else {
             // local_term > voter_term: ignore the message; it came from a previous election cycle
             // local_term = voter_term: since state is not candidate, it's ok because some votes
             // can come after we became follower or leader
 
-            Ok(None)
+            Ok(self.into())
         }
     }
 
@@ -353,9 +349,9 @@ where
         &mut self,
         handler: &mut H,
         request: &AddServerRequest,
-    ) -> Result<AdminCommandResponse, Error> {
+    ) -> Result<ConfigurationChangeResponse, Error> {
         if self.state_data.config_change.is_some() {
-            Ok(AdminCommandResponse::AlreadyPending)
+            Ok(ConfigurationChangeResponse::AlreadyPending)
         } else {
             self.state_data.config_change = Some(ConfigChange::new(request.id));
             // we can send a ping request to receive the log index at the catching up node
@@ -378,13 +374,9 @@ where
             };
 
             handler.send_peer_message(request.id, PeerMessage::AppendEntriesRequest(message));
-            handler.set_timeout(ConsensusTimeout::Election);
-            Ok(AdminCommandResponse::Started)
+            handler.set_timeout(Timeout::Election);
+            Ok(ConfigurationChangeResponse::Started)
         }
-    }
-
-    fn client_ping_request(&self) -> Result<PingResponse, Error> {
-        self.common_client_ping_request(ConsensusStateKind::Leader)
     }
 
     /// Applies a client proposal to the consensus state machine.
@@ -392,23 +384,27 @@ where
         &mut self,
         handler: &mut H,
         from: ClientId,
-        request: Vec<u8>,
-    ) -> Result<CommandResponse, Error> {
-        let (log_index, message) = self.add_next_entry(EntryData::Client(request))?;
+        request: &ClientRequest,
+    ) -> Result<ClientResponse, Error> {
+        let (log_index, message) = self.add_next_entry(EntryData::Client(request.data))?;
 
         debug!("proposal request from client {}: entry {}", from, log_index);
         self.state_data.proposals.push_back((from, log_index));
         self.send_append_entries_request(handler, log_index, message)?;
 
-        Ok(CommandResponse::Queued)
+        Ok(ClientResponse::Queued)
     }
 
-    fn client_query_request(&mut self, from: ClientId, request: &[u8]) -> CommandResponse {
+    fn client_query_request(&mut self, from: ClientId, request: &ClientRequest) -> ClientReponse {
         // TODO: this is not totally safe because we don't implement RegisterClientRPC yet
         // so messages can be duplicated
         trace!("query from client {}", from);
-        let result = self.state_machine.query(&request);
-        CommandResponse::Success(result)
+        let result = self.state_machine.query(request.data);
+        ClientResponse::Success(result)
+    }
+
+    fn ping_request(&self) -> Result<PingResponse, Error> {
+        self.common_client_ping_request(ConsensusState::Leader)
     }
 
     fn into_consensus_state(self) -> CurrentState<L, M, H> {
@@ -422,20 +418,13 @@ where
     M: StateMachine,
     H: Handler,
 {
-    fn leader_to_follower(
-        &mut self,
+    fn leader_into_follower(
+        self,
         handler: &mut H,
         leader_term: Term,
     ) -> Result<State<L, M, H, Follower>, Error> {
         self.state_data.reset_config_change(handler);
-
-        if let CurrentState::Follower(new_state) =
-            self.to_follower(handler, ConsensusStateKind::Leader, leader_term)?
-        {
-            Ok(new_state)
-        } else {
-            Err(Error::unreachable(module_path!()))
-        }
+        self.into_follower(handler, ConsensusState::Leader, leader_term)
     }
 
     fn try_advance_commit_index(&mut self, handler: &mut H) -> Result<(), Error> {
@@ -474,9 +463,9 @@ where
                 // can safely unwrap it, otherwise it's a bug and we should panic
                 // We know that there will be an index here since it was commited
                 // and the index is less than that which has been commited.
-                handler.send_client_response(
+                handler.send_client_message(
                     client,
-                    ClientResponse::Proposal(CommandResponse::Success(
+                    ClientMessage::ClientProposalResponse(ClientResponse::Success(
                         results.remove(&index).unwrap(),
                     )),
                 );
@@ -620,8 +609,8 @@ impl Leader {
             }) => {
                 //trace!("configuration change cancelled because of leader changing to follower");
                 // TODO: notify admin about cancelling
-                handler.clear_timeout(ConsensusTimeout::Heartbeat(peer.id));
-                handler.clear_timeout(ConsensusTimeout::Election);
+                handler.clear_timeout(Timeout::Heartbeat(peer.id));
+                handler.clear_timeout(Timeout::Election);
             }
             Some(ConfigChange {
                 peer,

@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::marker::PhantomData;
 
 use crate::error::*;
 use log::{debug, info, trace};
@@ -11,7 +12,7 @@ use crate::raft::CurrentState;
 use crate::state::State;
 use crate::state_impl::StateImpl;
 use crate::state_machine::StateMachine;
-use crate::{ClientId, LogIndex, Peer, ServerId, Term};
+use crate::{ClientId, ServerId, Term};
 
 impl<L, M, H> StateImpl<L, M, H> for State<L, M, H, Candidate>
 where
@@ -29,44 +30,37 @@ where
         let current_term = self.current_term()?;
 
         if leader_term < current_term {
-            return Ok((
-                AppendEntriesResponse::StaleTerm(current_term),
-                self.into_consensus_state(),
-            ));
+            return Ok((AppendEntriesResponse::StaleTerm(current_term), self.into()));
         }
 
         // receiving AppendEntries for candidate means new leader was found,
         // so it must become follower now
-        if let CurrentState::Follower(mut new_state) =
-            self.to_follower(handler, ConsensusStateKind::Candidate, leader_term)?
-        {
-            let (response, new_state) = new_state.append_entries_request(handler, from, request)?;
-            Ok((response, new_state))
-        } else {
-            Err(Error::unreachable(module_path!()))
-        }
+        let follower = self.into_follower(handler, ConsensusState::Candidate, leader_term)?;
+
+        // after becoming follower it should process the request
+        follower.append_entries_request(handler, from, request)
     }
 
     fn append_entries_response(
-        &mut self,
+        self,
         handler: &mut H,
         from: ServerId,
-        response: AppendEntriesResponse,
-    ) -> Result<(Option<AppendEntriesRequest>, Option<CurrentState<L, M, H>>), Error> {
+        response: &AppendEntriesResponse,
+    ) -> Result<(Option<AppendEntriesRequest>, CurrentState<L, M, H>), Error> {
         // the candidate can only receive responses in case the node was a leader some time ago
         // and sent requests which triggered the reponse while response was held somewhere in network
         //
         // at the moment of being non-leader it has nothing to do with them, expept ignoring
-        Ok((None, None))
+        Ok((None, self.into()))
     }
 
     /// Applies a peer request vote request to the consensus state machine.
     fn request_vote_request(
-        &mut self,
+        self,
         handler: &mut H,
         candidate: ServerId,
-        request: RequestVoteRequest,
-    ) -> Result<(Option<RequestVoteResponse>, Option<CurrentState<L, M, H>>), Error> {
+        request: &RequestVoteRequest,
+    ) -> Result<(Option<RequestVoteResponse>, CurrentState<L, M, H>), Error> {
         // To avoid disrupting leader while configuration changes, node should ignore or delay vote requests
         // coming within election timeout unless there is special flag set signalling
         // the leadership was given away voluntarily
@@ -77,18 +71,18 @@ where
             handler,
             candidate,
             request,
-            ConsensusStateKind::Candidate,
+            ConsensusState::Candidate,
         )?;
         Ok((Some(response), new_state))
     }
 
     /// Applies a request vote response to the consensus state machine.
     fn request_vote_response(
-        &mut self,
+        self,
         handler: &mut H,
         from: ServerId,
-        response: RequestVoteResponse,
-    ) -> Result<Option<CurrentState<L, M, H>>, Error> {
+        response: &RequestVoteResponse,
+    ) -> Result<CurrentState<L, M, H>, Error> {
         debug!("RequestVoteResponse from peer {}", from);
 
         let local_term = self.current_term()?;
@@ -106,12 +100,11 @@ where
                 with newer term; transitioning to Follower",
                 from, voter_term
             );
-            let follower_state =
-                self.to_follower(handler, ConsensusStateKind::Candidate, voter_term)?;
-            Ok(Some(follower_state))
+            let follower = self.into_follower(handler, ConsensusState::Candidate, voter_term)?;
+            Ok(follower.into())
         } else if local_term > voter_term {
             // Ignore this message; it came from a previous election cycle.
-            Ok(None)
+            Ok(self.into())
         } else {
             // local_term == voter_term
             // A vote was received!
@@ -123,12 +116,12 @@ where
                         local_term
                     );
                     let new_state = self.into_leader(handler, voter_term)?;
-                    Ok(Some(new_state))
+                    Ok(new_state.into())
                 } else {
-                    Ok(None)
+                    Ok(self.into())
                 }
             } else {
-                Ok(None)
+                Ok(self.into())
             }
         }
     }
@@ -149,32 +142,20 @@ where
             //self.with_log(|log| log.inc_current_term())?;
             //self.with_log(|log| log.set_voted_for(self.id))?;
             let current_term = self.with_log(|log| log.current_term())?;
-            let new_state = self.into_leader(handler, current_term)?;
-            Ok(new_state)
+            let leader = self.into_leader(handler, current_term)?;
+            Ok(leader.into())
         } else {
             info!("election timeout on candidate: restarting election");
             self.with_log_mut(|log| log.inc_current_term())?;
             self.with_log_mut(|log| log.set_voted_for(self.id))?;
-            handler.set_timeout(ConsensusTimeout::Election);
+            handler.set_timeout(Timeout::Election);
             todo!("send vote requests");
-            Ok(StateImpl::<L, M, H>::into_consensus_state(self))
+            Ok(self.into())
         }
     }
 
     // Utility messages and actions
     fn peer_connected(&mut self, handler: &mut H, peer: ServerId) -> Result<(), Error> {
-        //  let new_peer = !self.peers.iter().any(|&p| p.id == peer);
-        //if new_peer {
-        //// This may still be correct peer, but it is was not added using AddServer API or was
-        //// removed already
-        //// the peer still can be the one that is going to catch up, so we skip this
-        //// check for a leader state
-        //// By this reason we don't panic here, returning an error
-        //debug!("New peer connected, but not found in consensus: {:?}", peer);
-        //}
-        //if new_peer {
-        //return Err(Error::UnknownPeer(peer));
-        //}
         //// Resend the request vote request if a response has not yet been receieved.
         //if state.peer_voted(peer) {
         //return Ok(());
@@ -186,13 +167,12 @@ where
         //last_log_term: self.log.latest_log_term().unwrap(),
         //};
         //handler.send_peer_message(peer, PeerMessage::RequestVoteRequest(message));
-        //handler.done();
 
         // TODO: we could resend some data to a peer, but we intentionally do not do this,
         // leaving this to the implementation which may decide to have different startegies
         // of retrying
         // Sending nothing should not break the consensus, except probably delaying the
-        // voting process for one more iteration
+        // voting process for one more election timeout
 
         Ok(())
     }
@@ -202,12 +182,8 @@ where
         &mut self,
         handler: &mut H,
         request: &AddServerRequest,
-    ) -> Result<AdminCommandResponse, Error> {
+    ) -> Result<ConfigurationChangeResponse, Error> {
         todo!("process add_server request")
-    }
-
-    fn client_ping_request(&self) -> Result<PingResponse, Error> {
-        self.common_client_ping_request(ConsensusStateKind::Candidate)
     }
 
     /// Applies a client proposal to the consensus state machine.
@@ -215,17 +191,21 @@ where
         &mut self,
         handler: &mut H,
         from: ClientId,
-        request: Vec<u8>,
-    ) -> Result<CommandResponse, Error> {
-        Ok(CommandResponse::UnknownLeader)
+        request: &ClientRequest,
+    ) -> Result<ClientResponse, Error> {
+        Ok(ClientResponse::UnknownLeader)
     }
 
-    fn client_query_request(&mut self, from: ClientId, request: &[u8]) -> CommandResponse {
+    fn client_query_request(&mut self, from: ClientId, request: &ClientRequest) -> ClientResponse {
         // TODO: introduce an option for allowing the response from the potentially
         // older state of the machine
         // With such option it could be possible to reply the machine on the follower
         trace!("query from client {}", from);
-        CommandResponse::UnknownLeader
+        ClientResponse::UnknownLeader
+    }
+
+    fn ping_request(&self) -> Result<PingResponse, Error> {
+        self.common_client_ping_request(ConsensusState::Candidate)
     }
 
     fn into_consensus_state(self) -> CurrentState<L, M, H> {
@@ -247,9 +227,9 @@ where
     // so we expect follower to call this right after transitioning to candidate
     // rather than making into_leader usable in any state being callable from anywhere
     pub(crate) fn try_solitary_leader(
-        &mut self,
+        self,
         handler: &mut H,
-    ) -> Result<Option<CurrentState<L, M, H>>, Error> {
+    ) -> Result<CurrentState<L, M, H>, Error> {
         if self.config.is_solitary(&self.id) {
             // Solitary replica special case: we are the only peer in consensus
             // jump straight to Leader state.
@@ -259,52 +239,62 @@ where
             self.with_log_mut(|log| log.inc_current_term())?;
             self.with_log_mut(|log| log.set_voted_for(self.id))?;
             let current_term = self.with_log(|log| log.current_term())?;
-            let new_state = self.into_leader(handler, current_term)?;
-            return Ok(Some(new_state));
+            let leader = self.into_leader(handler, current_term)?;
+            Ok(leader.into())
         } else {
-            Ok(None)
+            Ok(self.into())
         }
     }
 
     // Only candidates can transition to leader
     pub(crate) fn into_leader(
-        &mut self,
+        self,
         handler: &mut H,
         leader_term: Term,
-    ) -> Result<CurrentState<L, M, H>, Error> {
+    ) -> Result<State<L, M, H, Leader>, Error> {
         trace!("transitioning to Leader");
         let latest_log_index = self.with_log(|log| log.latest_log_index())?;
+        let current_term = self.current_term()?;
+        let latest_log_term = self.with_log(|log| log.latest_log_term())?;
+        let commit_index = self.commit_index;
 
-        handler.state_changed(ConsensusStateKind::Candidate, &ConsensusStateKind::Leader);
+        handler.state_changed(ConsensusState::Candidate, &ConsensusState::Leader);
 
+        // transition to new state
+        let state = Leader::new(latest_log_index, &self.config, &self.id);
+        let mut leader = State {
+            id: self.id,
+            config: self.config,
+            log: self.log,
+            state_machine: self.state_machine,
+            commit_index,
+            min_index: self.min_index,
+            last_applied: self.last_applied,
+            _h: PhantomData,
+            state_data: state,
+        };
+
+        // reset uncommitted config changes
+        leader.with_log_mut(|log| log.read_latest_config(&mut leader.config))?;
+
+        // send a ping to all peers
         let message = AppendEntriesRequest {
-            term: self.current_term()?,
+            term: current_term,
             prev_log_index: latest_log_index,
-            prev_log_term: self.with_log(|log| log.latest_log_term())?,
-            leader_commit: self.commit_index,
+            prev_log_term: latest_log_term,
+            leader_commit: commit_index,
             entries: Vec::new(),
         };
 
-        self.config.with_remote_peers(&self.id, |id| {
+        leader.config.with_remote_peers(&leader.id, |id| {
             handler.send_peer_message(*id, PeerMessage::AppendEntriesRequest(message.clone()));
-            handler.set_timeout(ConsensusTimeout::Heartbeat(*id));
+            handler.set_timeout(Timeout::Heartbeat(*id));
             Ok(())
         });
 
-        handler.clear_timeout(ConsensusTimeout::Election);
-        let state = Leader::new(latest_log_index, &self.config, &self.id);
+        handler.clear_timeout(Timeout::Election);
 
-        let leader_state = State {
-            id: self.id,
-            config: self.config.clone(),
-            log: self.log,
-            state_machine: self.state_machine,
-            commit_index: self.commit_index,
-            min_index: self.min_index,
-            last_applied: self.last_applied,
-            state_data: state,
-        };
-        Ok(CurrentState::Leader(leader_state))
+        Ok(leader)
     }
 }
 

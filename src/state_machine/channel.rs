@@ -34,7 +34,7 @@ impl StateMachine for ChannelStateMachine {
         Vec::new()
     }
 
-    fn restore_snapshot(&mut self, _snapshot: Vec<u8>) -> () {
+    fn restore_snapshot(&mut self, _snapshot: &[u8]) -> () {
         ()
     }
 }

@@ -2,7 +2,7 @@
 use crate::{LogIndex, ServerId, Term};
 use std::error::Error as StdError;
 use thiserror::Error as ThisError;
-use uuid::BytesError;
+use uuid::Error as UuidError;
 
 #[cfg(feature = "use_capnp")]
 use capnp::Error as CapnpError;
@@ -34,7 +34,7 @@ pub enum Error {
     LastNodeRemoval,
 
     #[error("UUID conversion")]
-    Uuid(#[from] BytesError),
+    Uuid(#[from] UuidError),
 
     #[error("Decoding capnp")]
     #[cfg(feature = "use_capnp")]

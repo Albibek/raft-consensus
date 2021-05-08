@@ -1,135 +1,167 @@
 @0x99bbdf91931a3304;
 
-# Peer messages
-
-struct PeerMessage {
-   union {
-   appendEntriesRequest @0 :AppendEntriesRequest;
-   appendEntriesResponse @1 :AppendEntriesResponse;
-
-   requestVoteRequest @2 :RequestVoteRequest;
-   requestVoteResponse @3 :RequestVoteResponse;
-
-   addServerRequest @4 :AddServerRequest;
-   serverCommandResponse @5 :ServerCommandResponse;
-   }
-}
-
-struct AppendEntriesRequest {
-    term @0 :UInt64;
-    prevLogIndex @1 :UInt64;
-    prevLogTerm @2 :UInt64;
-    leaderCommit @3 :UInt64;
-
-    entries @4 :List(Entry);
-}
-
-struct AppendEntriesResponse {
-    term @0 :UInt64;
-
-  union {
-    success @1 :TermAndIndex;
-    staleTerm @2 :UInt64;
-    inconsistentPrevEntry @3 :TermAndIndex;
-    staleEntry @4 :Void;
-  }
-}
-
-struct RequestVoteRequest {
-    term @0 :UInt64;
-    lastLogIndex @1 :UInt64;
-    lastLogTerm @2 :UInt64;
-    isVoluntaryStepDown @3 :Bool;
-}
-
-struct RequestVoteResponse {
-  union {
-    staleTerm @0 :UInt64;
-    inconsistentLog @1 :UInt64;
-    granted @2 :UInt64;
-    alreadyVoted @3 :UInt64;
-  }
-}
-
-# Client messages
-struct ClientRequest {
-    union {
-        ping @0 :Void;
-        proposal @1 :Data;
-        query @2 :Data;
-    }
-}
-
-struct ClientResponse {
-    union {
-        ping @0 :PingResponse;
-        proposal @1 :CommandResponse;
-        query @2 :CommandResponse;
-    }
-}
-
-# Cluster membership change messages
-struct AddServerRequest {
+struct Peer {
     id @0 :UInt64;
-    info @1 :Data;
-}
-
-struct ServerCommandResponse {
-    union {
-        success @0 :Void;
-        badPeer @1 :Void;
-        alreadyPending @2 :Void;
-        leaderJustChanged @3 :Void;
-        unknownLeader @4 :Void;
-        notLeader @5 :UInt64;
-    }
-}
-
-# Other messages
-struct CommandResponse {
-    union {
-        success @0 :Data;
-        queued @1 :Void;
-        unknownLeader @2 :Void;
-        notLeader @3 :UInt64;
-    }
-}
-
-struct PingResponse {
-    term @0 :UInt64;
-    index @1 :UInt64;
-    state @2 :ConsensusState;
-}
-
-# Other structures
-struct ConsensusState {
-    union {
-        leader @0 :Void;
-        candidate @1 :Void;
-        follower @2 :Void;
-        catchingup @3: Void;
-    }
+    metadata @1: Data;
 }
 
 struct Entry {
-    term @0 :UInt64;
-    data @1 :EntryData;
-}
-
-struct EntryData {
     union {
-        client @0 :Data;
-        addServer @1 :AddServerEntry;
-        removeServer @2 :UInt64;
+        heartbeat @0 :Void;
+        empty @1 :LogEntry;
+        proposal @2 :LogEntry;
+        config @3 :ConfigChangeEntry;
+
+    }
+
+    struct LogEntry {
+        term @0 :UInt64;
+        data @1 :LogEntryData;
+    }
+
+    struct LogEntryData {
+        union {
+            empty @0 :Void;
+            proposal @1 :Data;
+            config @2 :List(Peer);
+        }
+    }
+
+    struct ConfigChangeEntry {
+        entry @0 :LogEntry;
+        isActual @1 :Bool;
     }
 }
 
-struct AddServerEntry {
-    id @0 :UInt64;
-    info @1 :Data;
+struct Timeout {
+    union {
+        election @0 :Void;
+        heartbeat @1 :UInt64;
+    }
 }
 
-struct TermAndIndex {
-    term @0 :UInt64;
-    logIndex @1 :UInt64;
+struct PeerMessage {
+    union {
+        appendEntriesRequest @0 :AppendEntriesRequest;
+        appendEntriesResponse @1 :AppendEntriesResponse;
+
+        requestVoteRequest @2 :RequestVoteRequest;
+        requestVoteResponse @3 :RequestVoteResponse;
+    }
+
+    struct AppendEntriesRequest {
+        term @0 :UInt64;
+        prevLogIndex @1 :UInt64;
+        prevLogTerm @2 :UInt64;
+        leaderCommit @3 :UInt64;
+
+        entries @4 :List(Entry);
+    }
+
+    struct AppendEntriesResponse {
+        term @0 :UInt64;
+
+      union {
+        success @1 :TermAndIndex;
+        staleTerm @2 :UInt64;
+        inconsistentPrevEntry @3 :TermAndIndex;
+        staleEntry @4 :Void;
+      }
+    }
+
+    struct RequestVoteRequest {
+        term @0 :UInt64;
+        lastLogIndex @1 :UInt64;
+        lastLogTerm @2 :UInt64;
+        isVoluntaryStepDown @3 :Bool;
+    }
+
+    struct RequestVoteResponse {
+      union {
+        staleTerm @0 :UInt64;
+        inconsistentLog @1 :UInt64;
+        granted @2 :UInt64;
+        alreadyVoted @3 :UInt64;
+      }
+    }
+
+    struct TermAndIndex {
+        term @0 :UInt64;
+        logIndex @1 :UInt64;
+    }
+}
+
+# Client messages
+struct ClientMessage {
+    union {
+        clientProposalRequest @0 :Data;
+        clientProposalResponse @1 :ClientResponse;
+
+        clientQueryRequest @2 :Data;
+        clientQueryResponse @3 :ClientResponse;
+    }
+
+    struct ClientResponse {
+        union {
+            success @0 :Data;
+            queued @1 :Void;
+            unknownLeader @2 :Void;
+            notLeader @3 :UInt64;
+        }
+    }
+}
+
+# Administration messages
+
+struct AdminMessage {
+    union {
+        addServerRequest @0 :AddServerRequest;
+        addServerResponse @1 :ConfigurationChangeResponse;
+
+        removeServerRequest @2 :RemoveServerRequest;
+        removeServerResponse @3 :ConfigurationChangeResponse;
+
+        stepDownRequest @4 :UInt64;
+        stepDownResponse @5 :ConfigurationChangeResponse;
+
+        pingRequest @6 :Void;
+        pingResponse @7 :PingResponse;
+    }
+
+    struct AddServerRequest {
+        id @0 :UInt64;
+        metadata @1 :Data;
+    }
+
+    struct RemoveServerRequest {
+        id @0 :UInt64;
+    }
+
+    struct ConfigurationChangeResponse {
+        union {
+            success @0 :Void;
+            badPeer @1 :Void;
+            alreadyPending @2 :Void;
+            leaderJustChanged @3 :Void;
+            unknownLeader @4 :Void;
+            notLeader @5 :UInt64;
+        }
+    }
+
+
+    struct PingResponse {
+        term @0 :UInt64;
+        index @1 :UInt64;
+        state @2 :ConsensusState;
+        leader @3 :Peer;
+    }
+
+    struct ConsensusState {
+        union {
+            leader @0 :Void;
+            candidate @1 :Void;
+            follower @2 :Void;
+        }
+    }
+
 }

@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 use std::fmt::Debug;
 
+use crate::entry::ConsensusConfig;
 use crate::message::*;
-use crate::{ClientId, Peer, ServerId};
+use crate::{AdminId, ClientId, ServerId};
 
 /// Handler for actions returned from consensus
 ///
@@ -10,16 +11,22 @@ use crate::{ClientId, Peer, ServerId};
 /// and resetting otherwise, i.e. setting the new one from the start
 pub trait Handler: Debug {
     fn send_peer_message(&mut self, id: ServerId, message: PeerMessage);
-    fn send_client_response(&mut self, id: ClientId, message: ClientResponse);
-    fn set_timeout(&mut self, timeout: ConsensusTimeout);
-    fn clear_timeout(&mut self, timeout: ConsensusTimeout);
+    fn send_client_message(&mut self, id: ClientId, message: ClientMessage);
+    fn send_admin_message(&mut self, id: AdminId, message: AdminMessage);
+
+    fn set_timeout(&mut self, timeout: Timeout);
+    fn clear_timeout(&mut self, timeout: Timeout);
+
+    /// Let handler know about new peers added by configuration change.
+    /// The usual reaction could be, for example, to establish a connection to new peers getting
+    /// exchanged messages witht hem.
+    // Called when some follower(especially the catching one) receives the latest configuration change
+    // so peer list may be counted updated and ready for sending messages.
+    fn update_peers(&mut self, peers: &ConsensusConfig);
 
     #[allow(unused_variables)]
     /// Called when consensus goes to new state. Initializing new consensus does not call this function.
-    fn state_changed(&mut self, old: ConsensusStateKind, new: &ConsensusStateKind) {}
-
-    /// called when peer caught the error where it should be restarted or failed
-    fn peer_failed(&mut self, id: ServerId);
+    fn state_changed(&mut self, old: ConsensusState, new: &ConsensusState) {}
 }
 
 /// A handler that collects all messages leaving processing of them untouched.
@@ -27,10 +34,11 @@ pub trait Handler: Debug {
 #[derive(Debug)]
 pub struct CollectHandler {
     pub peer_messages: HashMap<ServerId, Vec<PeerMessage>>,
-    pub client_messages: HashMap<ClientId, Vec<ClientResponse>>,
-    pub timeouts: Vec<ConsensusTimeout>,
-    pub clear_timeouts: Vec<ConsensusTimeout>,
-    pub state: ConsensusStateKind,
+    pub client_messages: HashMap<ClientId, Vec<ClientMessage>>,
+    pub admin_messages: HashMap<AdminId, Vec<AdminMessage>>,
+    pub timeouts: Vec<Timeout>,
+    pub clear_timeouts: Vec<Timeout>,
+    pub state: ConsensusState,
 }
 
 impl CollectHandler {
@@ -38,9 +46,10 @@ impl CollectHandler {
         Self {
             peer_messages: HashMap::new(),
             client_messages: HashMap::new(),
+            admin_messages: HashMap::new(),
             timeouts: Vec::new(),
             clear_timeouts: Vec::new(),
-            state: ConsensusStateKind::Follower,
+            state: ConsensusState::Follower,
         }
     }
 
@@ -62,36 +71,38 @@ impl Default for CollectHandler {
 impl Handler for CollectHandler {
     /// Saves peer message to a vector
     fn send_peer_message(&mut self, id: ServerId, message: PeerMessage) {
-        let peer = self.peer_messages.entry(id).or_insert_with(Vec::new);
-        peer.push(message);
+        let queue = self.peer_messages.entry(id).or_insert_with(Vec::new);
+        queue.push(message);
     }
 
     /// Saves client message to a vector
-    fn send_client_response(&mut self, id: ClientId, message: ClientResponse) {
-        let client = self.client_messages.entry(id).or_insert_with(Vec::new);
-        client.push(message);
+    fn send_client_message(&mut self, id: ClientId, message: ClientMessage) {
+        let queue = self.client_messages.entry(id).or_insert_with(Vec::new);
+        queue.push(message);
+    }
+
+    /// Saves admin message to a vector
+    fn send_admin_message(&mut self, id: AdminId, message: AdminMessage) {
+        let queue = self.admin_messages.entry(id).or_insert_with(Vec::new);
+        queue.push(message);
     }
 
     /// Collects timeouts uniquely
-    fn set_timeout(&mut self, timeout: ConsensusTimeout) {
+    fn set_timeout(&mut self, timeout: Timeout) {
         if !self.timeouts.iter().any(|&t| t == timeout) {
             self.timeouts.push(timeout);
         }
     }
 
-    fn peer_failed(&mut self, _id: ServerId) {}
-
-    fn clear_timeout(&mut self, timeout: ConsensusTimeout) {
+    fn clear_timeout(&mut self, timeout: Timeout) {
         if !self.clear_timeouts.iter().any(|&t| t == timeout) {
             self.clear_timeouts.push(timeout);
         }
     }
 
-    fn state_changed(&mut self, _old: ConsensusStateKind, new: &ConsensusStateKind) {
+    fn update_peers(&mut self, peers: &ConsensusConfig) {}
+
+    fn state_changed(&mut self, _old: ConsensusState, new: &ConsensusState) {
         self.state = new.clone()
     }
-
-    //    fn ensure_connected(&mut self, peers: &[Peer]) -> Result<(), ()> {
-    //Ok(())
-    //    }
 }
