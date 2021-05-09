@@ -3,10 +3,14 @@ use std::marker::PhantomData;
 
 use log::{debug, info, trace};
 
-use crate::persistent_log::Log;
 use crate::state_machine::StateMachine;
+use crate::{
+    error::CriticalError,
+    persistent_log::{Log, LogEntry, LogEntryData},
+};
 
-use crate::entry::{ConsensusConfig, Entry, EntryData};
+use crate::config::ConsensusConfig;
+//use crate::entry::{ConsensusConfig, Entry, EntryData};
 use crate::error::Error;
 use crate::handler::Handler;
 use crate::message::*;
@@ -51,7 +55,7 @@ where
     // State-specific data
     pub(crate) state_data: S,
 
-    _h: PhantomData<H>,
+    pub(crate) _h: PhantomData<H>,
 }
 
 /// Common functions for any state
@@ -61,50 +65,42 @@ where
     M: StateMachine,
     H: Handler,
 {
-    /// Applies all committed but unapplied log entries to the state machine. Returns the set of
-    /// return values from the commits applied.
-    /// if results are not required, returns an empty map
-    pub(crate) fn apply_commits(&mut self, results_required: bool) -> HashMap<LogIndex, Vec<u8>> {
-        let mut results = HashMap::new();
-        while self.last_applied < self.commit_index {
-            let mut entry = Entry::default();
-            // Unwrap is justified here since we know there is an entry in the log.
-            self.log.entry(self.last_applied + 1, &mut entry).unwrap();
-
-            match entry.data {
-                EntryData::Client(data) => {
-                    let result = self.state_machine.apply(&data, results_required);
-                    self.last_applied = self.last_applied + 1;
-                    if results_required {
-                        results.insert(self.last_applied, result);
-                    }
-                }
-                EntryData::Config(config, _) => {
-                    // according to raft paper, nodes do not need to wait for entries to be committed by majority
-                    // and can apply configuration right away as it goes to the log
-                    todo!("detection of actual config for catching up follower");
-                    self.config = config.clone();
-                }
-            }
-        }
-
-        results
-    }
-
     /// Returns the current term.
     pub(crate) fn current_term(&self) -> Result<Term, Error> {
         Ok(self
             .log
             .current_term()
-            .map_err(|e| Error::PersistentLog(Box::new(e)))?)
+            .map_err(|e| Error::PersistentLogRead(Box::new(e)))?)
+    }
+
+    /// Increases the current term and resets the voted_for value.
+    pub(crate) fn inc_current_term(&mut self) -> Result<(), Error> {
+        let current = self
+            .log
+            .current_term()
+            .map_err(|e| Error::PersistentLogRead(Box::new(e)))?;
+        self.log
+            .set_voted_for(None)
+            .map_err(|e| Error::Critical(CriticalError::PersistentLogWrite(Box::new(e))))?;
+        self.log
+            .set_current_term(current + 1)
+            .map_err(|e| Error::Critical(CriticalError::PersistentLogWrite(Box::new(e))))
     }
 
     /// Returns the term of the latest applied log entry.
     pub(crate) fn latest_log_term(&self) -> Result<Term, Error> {
-        Ok(self
+        let index = self
             .log
-            .latest_log_term()
-            .map_err(|e| Error::PersistentLog(Box::new(e)))?)
+            .latest_log_index()
+            .map_err(|e| Error::PersistentLogRead(Box::new(e)))?;
+        match self
+            .log
+            .term_of(index)
+            .map_err(|e| Error::PersistentLogRead(Box::new(e)))?
+        {
+            Some(term) => Ok(term),
+            None => Err(Error::unreachable(module_path!())),
+        }
     }
 
     /// Returns the index of the latest applied log entry.
@@ -112,21 +108,22 @@ where
         Ok(self
             .log
             .latest_log_index()
-            .map_err(|e| Error::PersistentLog(Box::new(e)))?)
+            .map_err(|e| Error::PersistentLogRead(Box::new(e)))?)
     }
 
     pub(crate) fn with_log_mut<T, F>(&mut self, mut f: F) -> Result<T, Error>
     where
         F: FnMut(&mut L) -> Result<T, L::Error>,
     {
-        f(&mut self.log).map_err(|e| Error::PersistentLog(Box::new(e)))
+        f(&mut self.log)
+            .map_err(|e| Error::Critical(CriticalError::PersistentLogWrite(Box::new(e))))
     }
 
     pub(crate) fn with_log<T, F>(&self, f: F) -> Result<T, Error>
     where
         F: Fn(&L) -> Result<T, L::Error>,
     {
-        f(&self.log).map_err(|e| Error::PersistentLog(Box::new(e)))
+        f(&self.log).map_err(|e| Error::PersistentLogRead(Box::new(e)))
     }
 }
 
@@ -144,7 +141,7 @@ where
         from: ConsensusState,
         leader_term: Term,
     ) -> Result<State<L, M, H, Follower>, Error> {
-        handler.state_changed(from, &ConsensusState::Follower);
+        handler.state_changed(from, ConsensusState::Follower);
 
         let mut follower_state = State {
             id: self.id,
@@ -166,14 +163,13 @@ where
 
         follower_state.config.clear_heartbeats(handler);
         handler.set_timeout(Timeout::Election);
-        follower_state.with_log_mut(|log| log.read_latest_config(&mut follower_state.config))?;
 
         Ok(follower_state)
     }
 
     // At some point all nodes behave in the same way regardless of their state
     pub(crate) fn common_request_vote_request(
-        self,
+        mut self,
         handler: &mut H,
         from: ServerId,
         request: &RequestVoteRequest,
@@ -182,7 +178,6 @@ where
         let candidate_term = request.term;
         let candidate_log_term = request.last_log_term;
         let candidate_log_index = request.last_log_index;
-        let latest_config_index = self.with_log(|log| log.latest_config_index())?;
         debug!(
             "RequestVoteRequest from Consensus {{ id: {}, term: {}, latest_log_term: \
              {}, latest_log_index: {} }}",
@@ -206,13 +201,13 @@ where
             RequestVoteResponse::StaleTerm(new_local_term)
         } else if candidate_log_term < self.latest_log_term()?
             || candidate_log_index < self.latest_log_index()?
-            || candidate_log_index < latest_config_index
         {
             RequestVoteResponse::InconsistentLog(new_local_term)
         } else {
+            // candidate_term == current_term
             match self.with_log(|log| log.voted_for())? {
                 None => {
-                    self.with_log_mut(|log| log.set_voted_for(from))?;
+                    self.with_log_mut(|log| log.set_voted_for(Some(from)))?;
                     RequestVoteResponse::Granted(new_local_term)
                 }
                 Some(voted_for) => {
@@ -248,165 +243,165 @@ where
 #[cfg(test)]
 mod test {
     /*
-    use std::collections::HashSet;
-    use std::collections::VecDeque;
+           use std::collections::HashSet;
+           use std::collections::VecDeque;
 
-    use super::*;
-    use crate::persistent_log::mem::MemLog;
-    use crate::state_machine::null::NullStateMachine;
+           use super::*;
+           use crate::persistent_log::mem::MemLog;
+           use crate::state_machine::null::NullStateMachine;
 
-    use crate::handler::CollectHandler;
-    use pretty_env_logger;
+           use crate::handler::CollectHandler;
+           use pretty_env_logger;
 
-    #[derive(Debug)]
-    struct TestHandler(CollectHandler);
+           #[derive(Debug)]
+           struct TestHandler(CollectHandler);
 
-    impl Handler for TestHandler {
+           impl Handler for TestHandler {
         /// Saves peer message to a vector
         fn send_peer_message(&mut self, id: ServerId, message: PeerMessage) {
-            self.0.send_peer_message(id, message)
+        self.0.send_peer_message(id, message)
         }
 
         /// Saves client message to a vector
         fn send_client_response(&mut self, id: ClientId, message: ClientResponse) {
-            self.0.send_client_response(id, message)
+        self.0.send_client_response(id, message)
         }
 
         /// Collects timeouts uniquely
         fn set_timeout(&mut self, timeout: ConsensusTimeout) {
-            self.0.set_timeout(timeout)
+        self.0.set_timeout(timeout)
         }
 
         fn clear_timeout(&mut self, timeout: ConsensusTimeout) {
-            self.0.clear_timeout(timeout)
+        self.0.clear_timeout(timeout)
         }
 
         fn state_changed(&mut self, old: CurrentState, new: CurrentState) {
-            match (&old, &new) {
-                (&CurrentState::Leader, &CurrentState::Candidate) => {
-                    panic!("Bad state transition: leader to candidate")
-                }
-                // TODO: this test is ok for single node
-                // (&ConsensusState::Follower, &ConsensusState::Leader) => {
-                //warn!("Bad state transition: follower to leader (ok for solitary transition)")
-                //}
-                (old, new) => trace!("state transition {:?} -> {:?}", old, new),
-            }
-            self.0.state_changed(old, new);
+        match (&old, &new) {
+        (&CurrentState::Leader, &CurrentState::Candidate) => {
+        panic!("Bad state transition: leader to candidate")
+        }
+        // TODO: this test is ok for single node
+        // (&ConsensusState::Follower, &ConsensusState::Leader) => {
+        //warn!("Bad state transition: follower to leader (ok for solitary transition)")
+        //}
+        (old, new) => trace!("state transition {:?} -> {:?}", old, new),
+        }
+        self.0.state_changed(old, new);
         }
 
         fn done(&mut self) {
-            trace!("apply done")
+        trace!("apply done")
         }
-    }
-    impl TestHandler {
+        }
+        impl TestHandler {
         fn clear(&mut self) {
-            self.0.clear()
+        self.0.clear()
         }
-    }
+        }
 
-    type TestPeer = HandledConsensus<MemLog, NullStateMachine, TestHandler>;
+        type TestPeer = HandledConsensus<MemLog, NullStateMachine, TestHandler>;
 
-    #[derive(Debug)]
-    struct TestCluster {
+        #[derive(Debug)]
+        struct TestCluster {
         pub peers: HashMap<ServerId, TestPeer>,
+        }
+
+        impl TestCluster {
+        fn new(size: usize) -> Self {
+        pretty_env_logger::try_init().unwrap_or_else(|_| ());
+        let ids: Vec<ServerId> = (0..size).map(|i| (i as u64).into()).collect();
+        let mut peers = HashMap::with_capacity(size);
+        for i in 0..size {
+        let mut ids = ids.clone();
+        ids.remove(i); // remove self
+        let id = ServerId(i as u64);
+        let store = MemLog::new();
+        let handler = TestHandler(CollectHandler::new());
+        let mut consensus =
+            HandledConsensus::new(id, ids, store, NullStateMachine, handler).unwrap();
+        consensus.init();
+        peers.insert(id, consensus);
+    }
+    Self { peers }
     }
 
-    impl TestCluster {
-        fn new(size: usize) -> Self {
-            pretty_env_logger::try_init().unwrap_or_else(|_| ());
-            let ids: Vec<ServerId> = (0..size).map(|i| (i as u64).into()).collect();
-            let mut peers = HashMap::with_capacity(size);
-            for i in 0..size {
-                let mut ids = ids.clone();
-                ids.remove(i); // remove self
-                let id = ServerId(i as u64);
-                let store = MemLog::new();
-                let handler = TestHandler(CollectHandler::new());
-                let mut consensus =
-                    HandledConsensus::new(id, ids, store, NullStateMachine, handler).unwrap();
-                consensus.init();
-                peers.insert(id, consensus);
-            }
-            Self { peers }
-        }
-
-        // Applies the actions to the consensus peers (recursively applying any resulting
-        // actions) and returns any client messages and set timeouts.
-        fn apply_peer_messages(
-            &mut self,
-        ) -> (
-            HashMap<ServerId, HashSet<ConsensusTimeout>>,
-            HashMap<ClientId, Vec<ClientResponse>>,
-        ) {
-            trace!("apply peer messages");
-            let mut queue: VecDeque<(ServerId, ServerId, PeerMessage)> = VecDeque::new();
-            let mut timeouts: HashMap<ServerId, HashSet<ConsensusTimeout>> = HashMap::new();
-            let mut client_messages: HashMap<ClientId, Vec<ClientResponse>> = HashMap::new();
-            for (peer, mut consensus) in self.peers.iter_mut() {
-                for (to, messages) in consensus.handler.0.peer_messages.drain() {
-                    for message in messages.into_iter() {
-                        queue.push_back((peer.clone(), to, message));
-                    }
+    // Applies the actions to the consensus peers (recursively applying any resulting
+    // actions) and returns any client messages and set timeouts.
+    fn apply_peer_messages(
+        &mut self,
+    ) -> (
+    HashMap<ServerId, HashSet<ConsensusTimeout>>,
+    HashMap<ClientId, Vec<ClientResponse>>,
+    ) {
+        trace!("apply peer messages");
+        let mut queue: VecDeque<(ServerId, ServerId, PeerMessage)> = VecDeque::new();
+        let mut timeouts: HashMap<ServerId, HashSet<ConsensusTimeout>> = HashMap::new();
+        let mut client_messages: HashMap<ClientId, Vec<ClientResponse>> = HashMap::new();
+        for (peer, mut consensus) in self.peers.iter_mut() {
+            for (to, messages) in consensus.handler.0.peer_messages.drain() {
+                for message in messages.into_iter() {
+                    queue.push_back((peer.clone(), to, message));
                 }
-
-                let mut entry = timeouts.entry(peer.clone()).or_insert(HashSet::new());
-
-                for timeout in consensus.handler.0.timeouts.clone() {
-                    if let ConsensusTimeout::Election = timeout {
-                        entry.insert(timeout);
-                    }
-                }
-
-                client_messages.extend(consensus.handler.0.client_messages.clone());
-                consensus.handler.clear();
             }
-            trace!("Initial queue: {:?}", queue);
-            while let Some((from, to, message)) = queue.pop_front() {
-                let mut peer_consensus = self.peers.get_mut(&to).unwrap();
-                peer_consensus.apply_peer_message(from, message).unwrap();
-                for (to, messages) in peer_consensus.handler.0.peer_messages.drain() {
-                    for message in messages.into_iter() {
-                        queue.push_back((peer_consensus.inner.id.clone(), to, message));
-                    }
+
+            let mut entry = timeouts.entry(peer.clone()).or_insert(HashSet::new());
+
+            for timeout in consensus.handler.0.timeouts.clone() {
+                if let ConsensusTimeout::Election = timeout {
+                    entry.insert(timeout);
                 }
+            }
 
-                trace!("Queue: {:?}", queue);
-                let mut entry = timeouts
-                    .entry(peer_consensus.inner.id.clone())
-                    .or_insert(HashSet::new());
-                for timeout in peer_consensus.handler.0.timeouts.clone() {
-                    if let ConsensusTimeout::Election = timeout {
-                        entry.insert(timeout);
-                    }
+            client_messages.extend(consensus.handler.0.client_messages.clone());
+            consensus.handler.clear();
+        }
+        trace!("Initial queue: {:?}", queue);
+        while let Some((from, to, message)) = queue.pop_front() {
+            let mut peer_consensus = self.peers.get_mut(&to).unwrap();
+            peer_consensus.apply_peer_message(from, message).unwrap();
+            for (to, messages) in peer_consensus.handler.0.peer_messages.drain() {
+                for message in messages.into_iter() {
+                    queue.push_back((peer_consensus.inner.id.clone(), to, message));
                 }
-
-                client_messages.extend(peer_consensus.handler.0.client_messages.clone());
-                peer_consensus.handler.clear();
             }
-            (timeouts, client_messages)
-        }
 
-        fn into_peers(self) -> HashMap<ServerId, TestPeer> {
-            self.peers
-        }
-
-        // Elect `leader` as the leader of a cluster with the provided followers.
-        // The leader and the followers must be in the same term.
-        fn elect_leader(&mut self, leader: ServerId) {
-            {
-                let leader_peer = self.peers.get_mut(&leader).unwrap();
-                leader_peer
-                    .apply_timeout(ConsensusTimeout::Election)
-                    .unwrap();
+            trace!("Queue: {:?}", queue);
+            let mut entry = timeouts
+                .entry(peer_consensus.inner.id.clone())
+                .or_insert(HashSet::new());
+            for timeout in peer_consensus.handler.0.timeouts.clone() {
+                if let ConsensusTimeout::Election = timeout {
+                    entry.insert(timeout);
+                }
             }
-            //let client_messages = apply_actions(leader, actions, peers);
-            //let client_messages = self.apply_peer_messages();
-            self.apply_peer_messages();
-            // TODO client messages
-            // assert!(client_messages.is_empty());
-            assert!(self.peers[&leader].is_leader());
+
+            client_messages.extend(peer_consensus.handler.0.client_messages.clone());
+            peer_consensus.handler.clear();
         }
+        (timeouts, client_messages)
+    }
+
+    fn into_peers(self) -> HashMap<ServerId, TestPeer> {
+        self.peers
+    }
+
+    // Elect `leader` as the leader of a cluster with the provided followers.
+    // The leader and the followers must be in the same term.
+    fn elect_leader(&mut self, leader: ServerId) {
+        {
+            let leader_peer = self.peers.get_mut(&leader).unwrap();
+            leader_peer
+                .apply_timeout(ConsensusTimeout::Election)
+                .unwrap();
+        }
+        //let client_messages = apply_actions(leader, actions, peers);
+        //let client_messages = self.apply_peer_messages();
+        self.apply_peer_messages();
+        // TODO client messages
+        // assert!(client_messages.is_empty());
+        assert!(self.peers[&leader].is_leader());
+    }
     }
 
     // Tests the majority function.

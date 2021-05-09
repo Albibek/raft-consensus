@@ -3,9 +3,10 @@ use std::collections::{HashMap, VecDeque};
 use crate::error::*;
 use log::{debug, info, trace};
 
-use crate::entry::{ConsensusConfig, Entry, EntryData};
+use crate::config::ConsensusConfig;
 use crate::handler::Handler;
 use crate::message::*;
+use crate::persistent_log::{LogEntry, LogEntryData, LogEntryDataRef, LogEntryRef};
 use crate::raft::CurrentState;
 use crate::state::State;
 use crate::state_impl::StateImpl;
@@ -46,7 +47,7 @@ where
             //return Err(Error::AnotherLeader(from, current_term));
         }
 
-        let mut new_state = self.leader_into_follower(handler, leader_term)?;
+        let new_state = self.leader_into_follower(handler, leader_term)?;
         let (response, new_state) = new_state.append_entries_request(handler, from, request)?;
 
         Ok((response, new_state))
@@ -55,7 +56,7 @@ where
     /// The provided message may be initialized with a new AppendEntries request to send back to
     /// the follower in the case that the follower's log is behind.
     fn append_entries_response(
-        self,
+        mut self,
         handler: &mut H,
         from: ServerId,
         response: &AppendEntriesResponse,
@@ -117,40 +118,13 @@ where
                     // advance commit only if response was from follower
                     self.try_advance_commit_index(handler)?;
                 } else if self.state_data.is_catching_up(&from) {
-                    // having success from the catching up node, means
-                    // it has catched up the last round
-                    // the exception here is teh very first "ping"
-                    // request, it will go to Some(false) because
-                    // last round check was not set to true intentionally
-                    match self.state_data.update_rounds()? {
-                        CatchUpStatus::CaughtUp => {
-                            // switch to new stage
-                            self.state_data.begin_config_change(
-                                local_latest_log_index + 1,
-                                &mut self.config,
-                            )?;
-
-                            // the new config is definitely the latest one
-                            let (log_index, message) =
-                                self.add_next_entry(EntryData::Config(self.config.clone(), true))?;
-
-                            self.send_append_entries_request(handler, log_index, message)?;
-                            return Ok((None, self.into()));
-                        }
-                        CatchUpStatus::NotYet => {
-                            trace!("catching up node did not catch this round, continuing the catching up process");
-                            // nothing shoule be done here: the rounds has been rotated,
-                            // the rest of logic is the same as for a regular follower,
-                            // which is written below
-                        }
-                        CatchUpStatus::TooSlow => {
-                            trace!("catching up node was too slow, configuration change cancelled");
-                            let mut config = self.config.clone();
-                            self.with_log_mut(|log| log.read_latest_config(&mut config))?;
-                            self.state_data.reset_config_change(handler);
-                            return Ok((None, self.into()));
-                        }
-                    }
+                    let message = self.check_catch_up_state(
+                        handler,
+                        from,
+                        current_term,
+                        local_latest_log_index,
+                    )?;
+                    return Ok((message, self.into()));
                 } else {
                     return Err(Error::UnknownPeer(from.clone()));
                 }
@@ -162,66 +136,9 @@ where
         // is considered by leader
         //
         // So, the only thing left to decide is which messages to send to it next
-
-        // catching up peer is handled internally by state funtion
-        let next_index = self.state_data.next_index(&from)?;
-
-        if next_index <= local_latest_log_index {
-            // If the peer is behind, send it entries to catch up.
-            trace!(
-                "AppendEntriesResponse: peer {} is missing at least {} entries; \
-                     sending missing entries",
-                from,
-                local_latest_log_index - next_index
-            );
-            let prev_log_index = next_index - 1;
-            let prev_log_term = if prev_log_index == LogIndex(0) {
-                Term(0)
-            } else {
-                // non-existence of index is definitely a bug here
-                self.with_log(|log| log.term_at(prev_log_index))?
-                    .ok_or(Error::log_broken(prev_log_index, module_path!()))?
-            };
-
-            let from_index = next_index;
-            let until_index = local_latest_log_index + 1;
-
-            let mut message = AppendEntriesRequest {
-                term: current_term,
-                prev_log_index,
-                prev_log_term,
-                entries: Vec::new(),
-                leader_commit: self.commit_index,
-            };
-
-            // as of now we push all the entries, regardless of amount
-            // this may be kind of dangerous sometimes because of amount being too big
-            // but most probably snapshotting would solve it
-            for idx in from_index.as_u64()..until_index.as_u64() {
-                let mut entry = Entry::default();
-
-                self.with_log_mut(|log| log.entry(LogIndex(idx), &mut entry))?;
-
-                message.entries.push(entry);
-            }
-            self.state_data
-                .set_next_index(from, local_latest_log_index + 1)?;
-
-            Ok((Some(message), self.into()))
-        } else {
-            if self.state_data.is_catching_up(&from) {
-                // the catching up remote has catched up
-                // we should begin committing the new config
-            }
-
-            todo!("remove the election timeout to stop counting rounds for catching up follower");
-            //FIXME:
-            todo!("add config change entry to log and distribute it over cluster");
-
-            // since the peer is caught up, set a heartbeat timeout.
-            handler.set_timeout(Timeout::Heartbeat(from));
-            Ok((None, self.into()))
-        }
+        let message =
+            self.send_next_entries(handler, from, current_term, local_latest_log_index)?;
+        Ok((message, self.into()))
     }
 
     /// Applies a peer vote request to the consensus.
@@ -268,9 +185,9 @@ where
             // The responder is not necessarily the leader, but it is somewhat likely, so we will
             // use it as the leader hint.
             info!(
-                "received RequestVoteResponse from {{ id: {}, term: {} }} with newer term; transitioning to follower",
-                from, voter_term
-            );
+            "received RequestVoteResponse from {{ id: {}, term: {} }} with newer term; transitioning to follower",
+            from, voter_term
+        );
             let follower = self.into_follower(handler, ConsensusState::Leader, voter_term)?;
             Ok(follower.into())
         } else {
@@ -288,7 +205,7 @@ where
         Ok(AppendEntriesRequest {
             term: self.current_term()?,
             prev_log_index: self.latest_log_index()?,
-            prev_log_term: self.with_log(|log| log.latest_log_term())?,
+            prev_log_term: self.latest_log_term()?,
             leader_commit: self.commit_index,
             entries: Vec::new(),
         })
@@ -330,7 +247,7 @@ where
         let message = AppendEntriesRequest {
             term: self.current_term()?,
             prev_log_index: self.latest_log_index()?,
-            prev_log_term: self.with_log(|log| log.latest_log_term())?,
+            prev_log_term: self.latest_log_term()?,
             leader_commit: self.commit_index,
             entries: Vec::new(),
         };
@@ -353,7 +270,8 @@ where
         if self.state_data.config_change.is_some() {
             Ok(ConfigurationChangeResponse::AlreadyPending)
         } else {
-            self.state_data.config_change = Some(ConfigChange::new(request.id));
+            self.state_data.config_change =
+                Some(ConfigChange::new(request.id, request.info.clone()));
             // we can send a ping request to receive the log index at the catching up node
             // the first success will not be counted as a good round because
             // response_this_timeout is set to false at this point
@@ -386,7 +304,9 @@ where
         from: ClientId,
         request: &ClientRequest,
     ) -> Result<ClientResponse, Error> {
-        let (log_index, message) = self.add_next_entry(EntryData::Client(request.data))?;
+        // append an entry to the log
+        let (log_index, message) =
+            self.add_new_entry(LogEntryDataRef::Proposal(request.data.as_slice()))?;
 
         debug!("proposal request from client {}: entry {}", from, log_index);
         self.state_data.proposals.push_back((from, log_index));
@@ -395,11 +315,11 @@ where
         Ok(ClientResponse::Queued)
     }
 
-    fn client_query_request(&mut self, from: ClientId, request: &ClientRequest) -> ClientReponse {
+    fn client_query_request(&mut self, from: ClientId, request: &ClientRequest) -> ClientResponse {
         // TODO: this is not totally safe because we don't implement RegisterClientRPC yet
         // so messages can be duplicated
         trace!("query from client {}", from);
-        let result = self.state_machine.query(request.data);
+        let result = self.state_machine.query(request.data.as_slice());
         ClientResponse::Success(result)
     }
 
@@ -419,7 +339,7 @@ where
     H: Handler,
 {
     fn leader_into_follower(
-        self,
+        mut self,
         handler: &mut H,
         leader_term: Term,
     ) -> Result<State<L, M, H, Follower>, Error> {
@@ -435,54 +355,199 @@ where
         while self.commit_index < latest_log_index {
             if self.state_data.count_match_indexes(self.commit_index + 1) >= majority {
                 self.commit_index = self.commit_index + 1;
-                debug!("commit index advanced to {}", self.commit_index);
+                trace!("commit index advanced to {}", self.commit_index);
             } else {
-                break; // If there isn't a majority now, there won't be one later.
+                break; // If there isn't a majority now, there will non be one until next message
             }
         }
 
-        let mut results = self.apply_commits(true);
+        // Being here means the commit index has advanced and we can confirm clients
+        // that their proposals are committed
+        while self.last_applied <= self.commit_index {
+            // so we read all committed entries and check if any of them have to be
+            // replied to clients
+            let mut entry = LogEntry::default();
+            self.log
+                .read_entry(self.last_applied + 1, &mut entry)
+                .map_err(|e| Error::PersistentLogRead(Box::new(e)))?;
 
-        // As long as we know it, we send the connected clients the notification
-        // about their proposals being committed
-        //
-        // A note about client proposals ordering: they may come out of order obviously (via parallel
-        // TCP connectinos, for example), but the consensus should not be responsible for that ordering
-        // because state machine may or may not depend on it. Consensus still tries to help the
-        // client with the ordering sending a ClientResponse::Queued for each request
-        //
-        // What the consensus should really be responsible is the same ordering on the followers.
-        // And since it is leader that applies and commits the commands, the order
-        // they come will be kept as intended, as it's enqueued in self.state.proposals
-        // so we don't need to do any special handling of it outside the client state machine aplication
-        while let Some(&(client, index)) = self.state_data.proposals.get(0) {
-            if index <= self.commit_index {
-                trace!("responding to client {} for entry {}", client, index);
-                // state machine's apply have to return a vector, that means the
-                // results will always contain the index required, so we
-                // can safely unwrap it, otherwise it's a bug and we should panic
-                // We know that there will be an index here since it was commited
-                // and the index is less than that which has been commited.
-                handler.send_client_message(
-                    client,
-                    ClientMessage::ClientProposalResponse(ClientResponse::Success(
-                        results.remove(&index).unwrap(),
-                    )),
-                );
-                self.state_data.proposals.pop_front();
-            } else {
-                break;
+            match entry.data {
+                LogEntryData::Empty => {}
+                LogEntryData::Proposal(data) => {
+                    let result = self.state_machine.apply(&data, true);
+                    self.last_applied = self.last_applied + 1;
+
+                    // As long as we know it, we've sent the connected clients the notification
+                    // about their proposals being queued
+                    //
+                    // Client proposals may come not in the same order clients expect. For example, via parallel
+                    // TCP connectinos. The consensus though is only responsible for keeping the order of the
+                    // messages as they come in in it's own log on all nodes.
+
+                    // the queued entries have to exist in the queue to be committed,
+                    // so popping a wrong index means a bug
+                    if let Some(&(client, index)) = self.state_data.proposals.get(0) {
+                        trace!("responding to client {} for entry {}", client, index);
+
+                        handler.send_client_message(
+                            client,
+                            ClientMessage::ClientProposalResponse(ClientResponse::Success(result)),
+                        );
+                        self.state_data.proposals.pop_front();
+                    } else {
+                        return Err(Error::unreachable(module_path!()));
+                    }
+                }
+                LogEntryData::Config(config) => {
+                    // on leader if server is added, there is nothing to do here, because configuration change
+                    // was already applied
+                    todo!(
+                        "on server removal step down leader if it it not on the new configuration"
+                    )
+                }
             }
         }
 
         Ok(())
     }
 
-    /// appends a single entry to a local log obeying all the Raft rules (log indexing etc)
-    /// and sends the request to the followers
-    fn add_next_entry(
+    fn send_next_entries(
         &mut self,
-        entry_data: EntryData,
+        handler: &mut H,
+        from: ServerId,
+        current_term: Term,
+        local_latest_log_index: LogIndex,
+    ) -> Result<Option<AppendEntriesRequest>, Error> {
+        // catching up peer is handled internally by state funtion
+        let next_index = self.state_data.next_index(&from)?;
+
+        if next_index <= local_latest_log_index {
+            // The peer is behind: send it entries to catch up.
+            trace!(
+                "AppendEntriesResponse: peer {} is missing at least {} entries; \
+                     sending missing entries",
+                from,
+                local_latest_log_index - next_index
+            );
+            let prev_log_index = next_index - 1;
+            let prev_log_term = if prev_log_index == LogIndex(0) {
+                Term(0)
+            } else {
+                // non-existence of index is definitely a bug here
+                self.with_log(|log| log.term_of(prev_log_index))?
+                    .ok_or(Error::log_broken(prev_log_index, module_path!()))?
+            };
+
+            let mut message = AppendEntriesRequest {
+                term: current_term,
+                prev_log_index,
+                prev_log_term,
+                entries: Vec::new(),
+                leader_commit: self.commit_index,
+            };
+
+            self.fill_entries(&mut message.entries, next_index, local_latest_log_index + 1)?;
+
+            self.state_data
+                .set_next_index(from, local_latest_log_index + 1)?;
+
+            Ok(Some(message))
+        } else {
+            if self.state_data.is_catching_up(&from) {
+                return Err(Error::unreachable(module_path!()));
+            }
+
+            // since the peer is caught up, set a heartbeat timeout.
+            handler.set_timeout(Timeout::Heartbeat(from));
+            Ok(None)
+        }
+    }
+
+    fn check_catch_up_state(
+        &mut self,
+        handler: &mut H,
+        from: ServerId,
+        current_term: Term,
+        local_latest_log_index: LogIndex,
+    ) -> Result<Option<AppendEntriesRequest>, Error> {
+        // having success from the catching up node, means
+        // it has catched up the last round
+        // the exception here is teh very first "ping"
+        // request, it will go to Some(false) because
+        // last round check was not set to true intentionally
+        match self.state_data.update_rounds()? {
+            CatchUpStatus::CaughtUp => {
+                // switch to new stage
+                self.state_data
+                    .begin_config_change(local_latest_log_index + 1, &mut self.config)?;
+
+                // TODO
+                // too bad, we cannot borrow config from self at the same time with
+                // running something on self.log
+                // let's hope borrowing rules change someday
+                // until that time it's not very bad to clone a config
+                let config = self.config.clone();
+
+                // the config is already modified, just add it as an entry
+                let (log_index, message) = self.add_new_entry(LogEntryDataRef::Config(&config))?;
+                self.send_append_entries_request(handler, log_index, message)?;
+
+                handler.clear_timeout(Timeout::Election);
+                handler.set_timeout(Timeout::Heartbeat(from));
+                Ok(None)
+            }
+            CatchUpStatus::NotYet => {
+                trace!(
+                    "catching up node did not catch this round, continuing the catching up process"
+                );
+                self.send_next_entries(handler, from, current_term, local_latest_log_index)
+            }
+            CatchUpStatus::TooSlow => {
+                trace!("catching up node was too slow, configuration change cancelled");
+                // The new config is only stored in the volatile state and is not
+                // distributed to followers yet, so dropping it is enough, nothing to restore here
+                self.state_data.reset_config_change(handler);
+                Ok(None)
+            }
+        }
+    }
+
+    // fill entries vector
+    fn fill_entries(
+        &self,
+        entries: &mut Vec<Entry>,
+        from: LogIndex,
+        until: LogIndex,
+    ) -> Result<(), Error> {
+        // as of now we push all the entries, regardless of amount
+        // this may be kind of dangerous sometimes because of amount being too big
+        // but most probably snapshotting would solve it
+        for index in from.as_u64()..until.as_u64() {
+            let mut log_entry = LogEntry::new_proposal(Term(0), Vec::new());
+            self.log
+                .read_entry(LogIndex(index), &mut log_entry)
+                .map_err(|e| Error::PersistentLogRead(Box::new(e)))?;
+            let mut entry: Entry = log_entry.into();
+            if self
+                .log
+                .latest_config_index()
+                .map_err(|e| Error::PersistentLogRead(Box::new(e)))?
+                .map(|idx| idx.as_u64() == index)
+                .unwrap_or(false)
+            {
+                entry.set_config_active(true);
+            }
+
+            entries.push(entry);
+        }
+        Ok(())
+    }
+
+    /// appends a single entry to a leader's log obeying all the Raft rules (log indexing etc)
+    /// returns a message ready to send to followers
+    fn add_new_entry<'a>(
+        &mut self,
+        entry_data: LogEntryDataRef<'a>,
     ) -> Result<(LogIndex, AppendEntriesRequest), Error> {
         let prev_log_index = self.latest_log_index()?;
         let prev_log_term = self.latest_log_term()?;
@@ -490,9 +555,19 @@ where
 
         let log_index = prev_log_index + 1;
         let leader_commit = self.commit_index;
-        let entry = Entry::new(term, entry_data);
-        self.with_log_mut(|log| log.append_entries(log_index, Some(&entry).into_iter()))?;
 
+        //      self.with_log_mut(|log| log.append_entries(log_index, Some(&entry).into_iter()))?;
+        let log_entry = LogEntryRef {
+            term,
+            data: entry_data,
+        };
+        self.log
+            .append_entry(log_index, &log_entry)
+            .map_err(|e| Error::Critical(CriticalError::PersistentLogWrite(Box::new(e))))?;
+
+        let mut entry: Entry = log_entry.into();
+        // this is the new addition, so if it's a config, than it is definitely a new active one
+        entry.set_config_active(true);
         let message = AppendEntriesRequest {
             term,
             prev_log_index,
@@ -512,16 +587,19 @@ where
     ) -> Result<(), Error> {
         if !self.config.is_solitary(&self.id) {
             // solitary consensus can just advance, no messages required
-            //
             // fan out the request to all followers that are catched up enough
-            self.config.with_remote_peers(&self.id, |id| {
-                if self.state_data.next_index(&id)? == log_index {
-                    handler
-                        .send_peer_message(*id, PeerMessage::AppendEntriesRequest(message.clone()));
-                    self.state_data.set_next_index(*id, log_index + 1);
+            for peer in &self.config.peers {
+                if peer.id != self.id {
+                    let id = peer.id;
+                    if self.state_data.next_index(&id).unwrap() == log_index {
+                        handler.send_peer_message(
+                            id,
+                            PeerMessage::AppendEntriesRequest(message.clone()),
+                        );
+                        self.state_data.set_next_index(id, log_index + 1);
+                    }
                 }
-                Ok(())
-            });
+            }
         }
 
         if self.config.majority() == 1 {
@@ -591,9 +669,9 @@ impl Leader {
 
     fn has_catching_up_node(&self) -> bool {
         if let Some(ConfigChange {
-            peer,
             stage: ConfigChangeStage::CatchingUp { .. },
-        }) = self.config_change
+            ..
+        }) = &self.config_change
         {
             true
         } else {
@@ -613,8 +691,8 @@ impl Leader {
                 handler.clear_timeout(Timeout::Election);
             }
             Some(ConfigChange {
-                peer,
                 stage: ConfigChangeStage::Committing { .. },
+                ..
             }) => {}
             None => {}
         }
@@ -629,11 +707,11 @@ impl Leader {
         if let Some(ConfigChange {
             peer,
             stage: ConfigChangeStage::CatchingUp { index, .. },
-        }) = self.config_change
+        }) = &self.config_change
         {
             if &peer.id == follower {
                 // the index is requested for a catching up peer
-                return Ok(index);
+                return Ok(*index);
             }
         }
 
@@ -782,9 +860,9 @@ pub(crate) struct ConfigChange {
 }
 
 impl ConfigChange {
-    pub(crate) fn new(id: ServerId) -> Self {
+    pub(crate) fn new(id: ServerId, metadata: Vec<u8>) -> Self {
         Self {
-            peer: Peer { id },
+            peer: Peer { id, metadata },
             stage: ConfigChangeStage::CatchingUp {
                 index: LogIndex(0),
                 rounds: MAX_ROUNDS,

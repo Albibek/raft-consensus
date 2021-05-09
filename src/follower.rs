@@ -4,15 +4,15 @@ use std::marker::PhantomData;
 use crate::error::*;
 use log::{debug, info, trace};
 
-use crate::{ClientId, LogIndex, Peer, ServerId, Term};
-
 use crate::handler::Handler;
 use crate::message::*;
 use crate::persistent_log::Log;
+use crate::persistent_log::{LogEntry, LogEntryData, LogEntryDataRef, LogEntryRef};
 use crate::raft::CurrentState;
 use crate::state::State;
 use crate::state_impl::StateImpl;
 use crate::state_machine::StateMachine;
+use crate::{ClientId, LogIndex, Peer, ServerId, Term};
 
 use crate::candidate::Candidate;
 
@@ -24,7 +24,7 @@ where
     H: Handler,
 {
     fn append_entries_request(
-        self,
+        mut self,
         handler: &mut H,
         from: ServerId,
         request: &AppendEntriesRequest,
@@ -54,9 +54,9 @@ where
 
     fn append_entries_response(
         self,
-        handler: &mut H,
-        from: ServerId,
-        response: &AppendEntriesResponse,
+        _handler: &mut H,
+        _from: ServerId,
+        _response: &AppendEntriesResponse,
     ) -> Result<(Option<AppendEntriesRequest>, CurrentState<L, M, H>), Error> {
         // the follower can only receive responses in case the node was a leader some time ago
         // and sent requests which triggered the reponse while response was held somewhere in network
@@ -66,7 +66,7 @@ where
     }
 
     fn request_vote_request(
-        self,
+        mut self,
         handler: &mut H,
         candidate: ServerId,
         request: &RequestVoteRequest,
@@ -143,32 +143,43 @@ where
 
     // Timeout handling
     /// Handles heartbeat timeout event
-    fn heartbeat_timeout(&mut self, peer: ServerId) -> Result<AppendEntriesRequest, Error> {
+    fn heartbeat_timeout(&mut self, _peer: ServerId) -> Result<AppendEntriesRequest, Error> {
         Err(Error::MustLeader)
     }
 
     fn election_timeout(mut self, handler: &mut H) -> Result<CurrentState<L, M, H>, Error> {
         if let Some((from, ref request)) = self.state_data.delayed_vote_request.take() {
-            // voting has started already, process the vote request first
+            // Since voting has started already, we must process the delayed vote request.
+            // For the node this means it has to vote for another candidate instead of itself
+            // This in turn means, that becoming candidate may not be required
+
+            // we must send response to any request, regardless of our own state
             let (response, new_state) =
                 self.common_request_vote_request(handler, from, request, ConsensusState::Follower)?;
+
+            // but after that we must decide if we should really become a candidate
+            // this depends on what response we are sending
+            // general rule: we want it if request was bad for some reason
+            let become_candidate = match response {
+                RequestVoteResponse::StaleTerm(_) => true,
+                RequestVoteResponse::InconsistentLog(_) => true,
+                RequestVoteResponse::Granted(_) => false,
+                RequestVoteResponse::AlreadyVoted(_) => false,
+            };
+
             handler.send_peer_message(from, PeerMessage::RequestVoteResponse(response));
 
-            if new_state.is_follower() {
-                // new state means we must become totally new follower, meaning becoming candidate
-                // is not required
-                Ok(new_state)
+            if become_candidate {
+                if let CurrentState::Follower(new_state) = new_state {
+                    let candidate = new_state.into_candidate(handler)?;
+                    Ok(candidate.into())
+                } else {
+                    Err(Error::unreachable(module_path!()))
+                }
             } else {
-                // Even though we have voted for another candidate, there stil may be things to be
-                // done, like increasing local term.
-                // Most probably this branch is unreachable, because delayed request will
-                // always have the term greater than ours.
-                // TODO: think the cases this branch could be reached (candidate_term <= local_term)
-                // At the moment we choose the safer way of starting the election in a regular way
-                // rather than staying a follower
-                let candidate = self.into_candidate(handler)?;
-                Ok(candidate.into())
+                Ok(new_state)
             }
+            //let candidate = new_state.into_candidate(handler)?;
         } else {
             let candidate = self.into_candidate(handler)?;
             Ok(candidate.into())
@@ -273,7 +284,7 @@ where
             Some(Term::from(0))
         } else {
             // try to find term of specified log index and check if there is such entry
-            self.with_log(|log| log.term_at(leader_prev_log_index))?
+            self.with_log(|log| log.term_of(leader_prev_log_index))?
         };
 
         if existing_term
@@ -283,7 +294,7 @@ where
             // If an existing entry conflicts with a new one (same index but different terms),
             // delete the existing entry and all that follow it
 
-            self.with_log(|log| log.discard_log_since(leader_prev_log_index))?;
+            self.with_log_mut(|log| log.discard_log_since(leader_prev_log_index))?;
 
             // TODO we could send a hint to a leader about existing index, so leader
             // could send the entries starting from this index instead of decrementing it each time
@@ -319,12 +330,17 @@ where
             return Ok(AppendEntriesResponse::StaleEntry);
         }
 
-        self.with_log_mut(|log| log.append_entries(leader_prev_log_index + 1, entries.iter()))?;
+        let mut append_index = leader_prev_log_index + 1;
+        for entry in entries.iter() {
+            self.with_log_mut(|log| log.append_entry(append_index, &entry.as_entry_ref()))?;
+            append_index = append_index + 1;
+        }
+
         self.min_index = new_latest_log_index;
 
         // We are matching the leader's log up to and including `new_latest_log_index`.
         self.commit_index = cmp::min(request.leader_commit, new_latest_log_index);
-        self.apply_commits(false);
+        self.apply_follower_commits()?;
 
         Ok(AppendEntriesResponse::Success(
             current_term,
@@ -332,7 +348,30 @@ where
         ))
     }
 
-    fn into_candidate(mut self, handler: &mut H) -> Result<State<L, M, H, Candidate>, Error> {
+    /// Applies all committed but unapplied log entries to the state machine ignoring the results.
+    pub(crate) fn apply_follower_commits(&mut self) -> Result<(), Error> {
+        while self.last_applied < self.commit_index {
+            let mut entry = LogEntry::default();
+            self.log
+                .read_entry(self.last_applied + 1, &mut entry)
+                .map_err(|e| Error::PersistentLogRead(Box::new(e)))?;
+            match entry.data {
+                LogEntryData::Empty => {}
+                LogEntryData::Proposal(data) => {
+                    let _ = self.state_machine.apply(&data, false);
+                    self.last_applied = self.last_applied + 1;
+                }
+                LogEntryData::Config(_) => {
+                    // this is the committing stage so far, there is no need to do anything
+                    // with the configuration entries at this point
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn into_candidate(self, handler: &mut H) -> Result<State<L, M, H, Candidate>, Error> {
         let mut state_data = Candidate::new();
         state_data.record_vote(self.id);
         let mut candidate = State {
@@ -347,11 +386,10 @@ where
             state_data,
         };
 
-        candidate.with_log_mut(|log| log.read_latest_config(&mut candidate.config))?;
-        candidate.with_log_mut(|log| log.inc_current_term())?;
+        candidate.inc_current_term()?;
         let id = candidate.id;
-        candidate.with_log_mut(|log| log.set_voted_for(id))?;
-        let last_log_term = candidate.with_log(|log| log.latest_log_term())?;
+        candidate.with_log_mut(|log| log.set_voted_for(Some(id)))?;
+        let last_log_term = candidate.latest_log_term()?;
 
         let message = RequestVoteRequest {
             term: candidate.current_term()?,
@@ -365,7 +403,7 @@ where
             Ok(())
         });
 
-        handler.state_changed(ConsensusState::Follower, &ConsensusState::Candidate);
+        handler.state_changed(ConsensusState::Follower, ConsensusState::Candidate);
         handler.set_timeout(Timeout::Election);
         Ok(candidate)
     }

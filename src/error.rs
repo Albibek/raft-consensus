@@ -9,22 +9,22 @@ use capnp::Error as CapnpError;
 #[cfg(feature = "use_capnp")]
 use capnp::NotInSchema;
 
-#[error("Consensus error")]
+#[error("raft consensus error")]
 #[derive(ThisError, Debug)]
 pub enum Error {
-    #[error("Consensus have reached unrecoverable error: {}", _0)]
+    #[error("consensus have reached unrecoverable error: {}", _0)]
     Critical(#[from] CriticalError),
 
-    #[error("Consensus state was not Leader while it had to be.")]
+    #[error("consensus state was not Leader while it had to be.")]
     MustLeader,
 
-    #[error("Consensus state was Leader while it had NOT to be.")]
+    #[error("consensus state was Leader while it had NOT to be.")]
     MustNotLeader,
 
-    #[error("Follower responded with inconsistent index.")]
+    #[error("follower responded with inconsistent index.")]
     BadFollowerIndex,
 
-    #[error("Unknown peer")]
+    #[error("unknown peer")]
     UnknownPeer(ServerId),
 
     #[error("unexpected message")]
@@ -36,17 +36,16 @@ pub enum Error {
     #[error("UUID conversion")]
     Uuid(#[from] UuidError),
 
-    #[error("Decoding capnp")]
+    #[error("decoding capnp")]
     #[cfg(feature = "use_capnp")]
     Capnp(#[from] CapnpError),
 
-    #[error("Detecting capnp schema")]
+    #[error("detecting capnp schema")]
     #[cfg(feature = "use_capnp")]
     CapnpSchema(#[from] NotInSchema),
 
-    #[error("Error in PersistentLog")]
-    // TODO: Proper error conversions
-    PersistentLog(Box<dyn StdError + 'static + Send + Sync>),
+    #[error("error reading persistent log: {}", _0)]
+    PersistentLogRead(Box<dyn StdError + 'static>),
 
     #[error("Follower node must be in list of peers at start")]
     MustBootstrap,
@@ -89,4 +88,7 @@ pub enum CriticalError {
 
     #[error("BUG: peer leader with matching term detected")]
     AnotherLeader(ServerId, Term),
+
+    #[error("error writing to persistent log: {}", _0)]
+    PersistentLogWrite(Box<dyn StdError + 'static>),
 }

@@ -10,9 +10,6 @@ use crate::messages_capnp::*;
 #[cfg(feature = "use_capnp")]
 use capnp::message::{Allocator, Builder, HeapAllocator, Reader, ReaderSegments};
 
-use super::common::ConsensusState;
-
-use crate::entry::Entry;
 use crate::{LogIndex, ServerId, Term};
 
 /// The module contains all messages related to client API of a consensus
@@ -23,9 +20,9 @@ use crate::{LogIndex, ServerId, Term};
 #[derive(Clone, Debug, PartialEq)]
 /// Any message related to client requests and responses
 pub enum ClientMessage {
-    ClientProposalRequest(Vec<u8>),
+    ClientProposalRequest(ClientRequest),
     ClientProposalResponse(ClientResponse),
-    ClientQueryRequest(Vec<u8>),
+    ClientQueryRequest(ClientRequest),
     ClientQueryResponse(ClientResponse),
 }
 
@@ -53,6 +50,13 @@ impl ClientMessage {
     //}
 
     //common_capnp!(client_request::Builder, client_request::Reader);
+}
+
+#[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
+/// Response to client command
+pub struct ClientRequest {
+    pub data: Vec<u8>,
 }
 
 #[derive(Clone, Debug, PartialEq)]

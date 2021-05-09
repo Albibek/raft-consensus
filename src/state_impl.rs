@@ -10,7 +10,7 @@ use crate::raft::CurrentState;
 
 /// Applies a peer message to the consensus
 pub(crate) fn apply_peer_message<L, M, S: StateImpl<L, M, H>, H: Handler>(
-    s: &mut S,
+    s: S,
     handler: &mut H,
     from: ServerId,
     message: &PeerMessage,
@@ -57,7 +57,7 @@ where
 }
 
 pub(crate) fn apply_timeout<L, M, S: StateImpl<L, M, H>, H: Handler>(
-    s: S,
+    mut s: S,
     handler: &mut H,
     timeout: Timeout,
 ) -> Result<CurrentState<L, M, H>, Error>
@@ -91,16 +91,27 @@ where
 {
     match message {
         ClientMessage::ClientProposalRequest(req) => {
-        let response = s.client_proposal_request(handler, from, req)?;
-        handler.sen
+            let response = s.client_proposal_request(handler, from, req)?;
+            handler.send_client_message(from, ClientMessage::ClientProposalResponse(response));
+            Ok(())
         }
-        //ClientResponse::Proposal(response)
-        //}
-        //ClientRequest::Query(data) => ClientResponse::Query(s.client_query_request(from, &data)),
+        ClientMessage::ClientProposalResponse(req) => {
+            // TODO: message proxying
+            Ok(())
+        }
+        ClientMessage::ClientQueryRequest(req) => {
+            let response = s.client_proposal_request(handler, from, req)?;
+            handler.send_client_message(from, ClientMessage::ClientQueryResponse(response));
+            Ok(())
+        }
+        ClientMessage::ClientQueryResponse(req) => {
+            // TODO: message proxying
+            Ok(())
+        }
     }
 }
 
-pub fn apply_admin_message<L, M, S: StateImpl<L, M, H>, H: Handler>(
+pub(crate) fn apply_admin_message<L, M, S: StateImpl<L, M, H>, H: Handler>(
     s: &mut S,
     handler: &mut H,
     request: &AdminMessage,
@@ -183,11 +194,11 @@ where
         &mut self,
         handler: &mut H,
         from: ClientId,
-        request: &[u8],
+        request: &ClientRequest,
     ) -> Result<ClientResponse, Error>;
 
     // Requests some client state from the state machine handled by consensus
-    fn client_query_request(&mut self, from: ClientId, request: &[u8]) -> ClientResponse;
+    fn client_query_request(&mut self, from: ClientId, request: &ClientRequest) -> ClientResponse;
 
     ///////////////////////////
     // Administration RPC

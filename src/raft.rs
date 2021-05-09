@@ -65,7 +65,7 @@ where
         &mut self,
         handler: &mut H,
         from: ClientId,
-        message: ClientMessage,
+        message: &ClientMessage,
     ) -> Result<(), Error> {
         self.state.apply_client_message(handler, from, message)
     }
@@ -148,7 +148,7 @@ where
         let new_state = proxy_state!(
             prev_state,
             s,
-            apply_peer_message(&mut s, handler, from, message)?
+            apply_peer_message(s, handler, from, message)?
         )?;
         *self = new_state;
         Ok(())
@@ -158,7 +158,7 @@ where
         &mut self,
         handler: &mut H,
         from: ClientId,
-        message: ClientMessage,
+        message: &ClientMessage,
     ) -> Result<(), Error> {
         proxy_state!(self, s, apply_client_message(s, handler, from, message)?)
     }

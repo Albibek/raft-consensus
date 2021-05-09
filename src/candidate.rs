@@ -78,7 +78,7 @@ where
 
     /// Applies a request vote response to the consensus state machine.
     fn request_vote_response(
-        self,
+        mut self,
         handler: &mut H,
         from: ServerId,
         response: &RequestVoteResponse,
@@ -115,7 +115,7 @@ where
                         "election for term {} won; transitioning to Leader",
                         local_term
                     );
-                    let new_state = self.into_leader(handler, voter_term)?;
+                    let new_state = self.into_leader(handler)?;
                     Ok(new_state.into())
                 } else {
                     Ok(self.into())
@@ -141,13 +141,13 @@ where
 
             //self.with_log(|log| log.inc_current_term())?;
             //self.with_log(|log| log.set_voted_for(self.id))?;
-            let current_term = self.with_log(|log| log.current_term())?;
-            let leader = self.into_leader(handler, current_term)?;
+            let leader = self.into_leader(handler)?;
             Ok(leader.into())
         } else {
             info!("election timeout on candidate: restarting election");
-            self.with_log_mut(|log| log.inc_current_term())?;
-            self.with_log_mut(|log| log.set_voted_for(self.id))?;
+            self.inc_current_term()?;
+            let id = self.id;
+            self.with_log_mut(|log| log.set_voted_for(Some(id)))?;
             handler.set_timeout(Timeout::Election);
             todo!("send vote requests");
             Ok(self.into())
@@ -227,7 +227,7 @@ where
     // so we expect follower to call this right after transitioning to candidate
     // rather than making into_leader usable in any state being callable from anywhere
     pub(crate) fn try_solitary_leader(
-        self,
+        mut self,
         handler: &mut H,
     ) -> Result<CurrentState<L, M, H>, Error> {
         if self.config.is_solitary(&self.id) {
@@ -236,10 +236,10 @@ where
             info!("election timeout: transitioning to Leader due do solitary replica condition");
             assert!(self.with_log(|log| log.voted_for())?.is_none());
 
-            self.with_log_mut(|log| log.inc_current_term())?;
-            self.with_log_mut(|log| log.set_voted_for(self.id))?;
-            let current_term = self.with_log(|log| log.current_term())?;
-            let leader = self.into_leader(handler, current_term)?;
+            self.inc_current_term()?;
+            let id = self.id;
+            self.with_log_mut(|log| log.set_voted_for(Some(id)))?;
+            let leader = self.into_leader(handler)?;
             Ok(leader.into())
         } else {
             Ok(self.into())
@@ -247,22 +247,18 @@ where
     }
 
     // Only candidates can transition to leader
-    pub(crate) fn into_leader(
-        self,
-        handler: &mut H,
-        leader_term: Term,
-    ) -> Result<State<L, M, H, Leader>, Error> {
+    pub(crate) fn into_leader(self, handler: &mut H) -> Result<State<L, M, H, Leader>, Error> {
         trace!("transitioning to Leader");
         let latest_log_index = self.with_log(|log| log.latest_log_index())?;
         let current_term = self.current_term()?;
-        let latest_log_term = self.with_log(|log| log.latest_log_term())?;
+        let latest_log_term = self.latest_log_term()?;
         let commit_index = self.commit_index;
 
-        handler.state_changed(ConsensusState::Candidate, &ConsensusState::Leader);
+        handler.state_changed(ConsensusState::Candidate, ConsensusState::Leader);
 
         // transition to new state
         let state = Leader::new(latest_log_index, &self.config, &self.id);
-        let mut leader = State {
+        let leader = State {
             id: self.id,
             config: self.config,
             log: self.log,
@@ -273,9 +269,6 @@ where
             _h: PhantomData,
             state_data: state,
         };
-
-        // reset uncommitted config changes
-        leader.with_log_mut(|log| log.read_latest_config(&mut leader.config))?;
 
         // send a ping to all peers
         let message = AppendEntriesRequest {

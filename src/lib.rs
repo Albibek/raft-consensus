@@ -10,8 +10,8 @@
 //! another node.
 //! * Configuration change API. Peer nodes can be added and removed(TODO) dynamically with the changes
 //! propagated over the cluster.
-//! * Panic-free(TODO). Any unrecoverable errors lead to a special `Lost` state of the consensus,
-//! but do not exit the whole process.
+//! * Panic-free(TODO). Only unrecoverable error can be returned, but no panic happens when
+//! messages are processed.
 //!
 //! This crate only implements a logic part and is not tied to any network implementation. This
 //! means that users of it should use the external implementation of the networking layer. The
@@ -40,6 +40,18 @@
 //! querying it
 //! * The `AdminMessage` API. Used for making configuration changes inside the cluster. Mostly
 //! the cluster membership changes, but also pings with useful information.
+//!
+//! ## Error handling
+//! The `Error` enum returned from the functions can be critical (can be also checked by is_critial
+//! method). If this kind of error is returned, the consensus falls into the special `Lost` state
+//! which cannot be transitioned from. In such a case the consensus must be considered
+//! inconsistent, because there is no guarantee, that for example data was written to a log or data
+//! was correctly read from the log. Obviously, the errors about implementation bugs should also
+//! be reported and fixed.
+//!
+//! Note, that panic-free guarantee is only bounded to consensus implementation. The `Log` and `StateMachine`
+//! implementations may have no such guarantee because since they are provided by caller.
+//!
 
 /// Raft consensus API
 pub mod raft;
@@ -212,8 +224,8 @@ impl fmt::Display for LogIndex {
 #[derive(Clone, Hash, PartialEq, Eq, Ord, PartialOrd, Debug)]
 #[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
 pub struct Peer {
-    id: ServerId,
-    metadata: Vec<u8>,
+    pub id: ServerId,
+    pub metadata: Vec<u8>,
 }
 
 /// The ID of a Raft peer node. Must be unique among the participants in a

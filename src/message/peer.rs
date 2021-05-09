@@ -10,7 +10,10 @@ use crate::messages_capnp::*;
 #[cfg(feature = "use_capnp")]
 use capnp::message::{Allocator, Builder, HeapAllocator, Reader, ReaderSegments};
 
-use crate::persistent_log::LogEntry;
+use crate::{
+    config::ConsensusConfig,
+    persistent_log::{LogEntry, LogEntryDataRef, LogEntryRef},
+};
 
 use crate::{LogIndex, Term};
 
@@ -138,20 +141,46 @@ impl AppendEntriesRequest {
     //);
 }
 
-/// Type representing a part of the AppendEntriesRequest message
+/// Type representing a part of the AppendEntriesRequest message.
+/// It not the same type as a LogEntry, because of additional fields (like config activeness flag)
+/// and may become more different in future.
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
-pub enum Entry {
-    /// Means entry is e heartbeat. Unlike the original paper recommendation we can
-    /// differentiate empty entry not to be added to the log and one to be. So we do it for the
-    /// sake of less coding errors.
-    Heartbeat,
+pub struct Entry {
+    pub term: Term,
+    pub data: EntryData,
+}
+
+impl Entry {
+    pub(crate) fn set_config_active(&mut self, is_active: bool) {
+        if let EntryData::Config(_, ref mut active) = self.data {
+            *active = is_active
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
+pub enum EntryData {
     /// An empty entry, which is added to every node's log at the beginning of each term
-    Empty(LogEntry),
+    Empty,
     /// A client proposal that should be provided to the state machine
-    Proposal(LogEntry),
-    /// A configuration change
-    Config(LogEntry, bool),
+    Proposal(Vec<u8>),
+    /// A configuration change with an flag showing if it is active
+    Config(ConsensusConfig, bool),
+}
+
+impl Entry {
+    pub fn as_entry_ref<'a>(&'a self) -> LogEntryRef<'a> {
+        LogEntryRef {
+            term: self.term,
+            data: match self.data {
+                EntryData::Empty => LogEntryDataRef::Empty,
+                EntryData::Proposal(ref v) => LogEntryDataRef::Proposal(v.as_slice()),
+                EntryData::Config(ref c, _) => LogEntryDataRef::Config(c),
+            },
+        }
+    }
 }
 
 #[cfg(feature = "use_capnp")]
@@ -190,22 +219,6 @@ impl Entry {
     //}
 
     //common_capnp!(entry_capnp::Builder, entry_capnp::Reader);
-}
-
-/// Type representing all possible data types that can be sent over network
-/// inside AppendEntriesRequest
-#[derive(Debug, Clone, PartialEq)]
-#[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
-pub enum EntryData {
-    Client(Vec<u8>),
-    /// The new config when a configuration change happens.
-    /// A flag shows if a config is the latest one or coming
-    /// from some previous config change because the older config should probably not be
-    /// considered by node, but sill have to be added to log for consistency.
-    Config(ConsensusConfig, bool),
-    // TODO:
-    // RegisterClient
-    // RemoveClient
 }
 
 #[derive(Clone, Debug, PartialEq)]

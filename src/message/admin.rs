@@ -13,14 +13,17 @@ use capnp::message::{Allocator, Builder, HeapAllocator, Reader, ReaderSegments};
 use super::common::ConsensusState;
 use crate::{LogIndex, ServerId, Term};
 
-#[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
 #[derive(Clone, Debug, PartialEq)]
+#[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
 /// Any message related to client requests and responses
 pub enum AdminMessage {
     AddServerRequest(AddServerRequest),
     AddServerResponse(ConfigurationChangeResponse),
     RemoveServerRequest(RemoveServerRequest),
     RemoveServerResponse(ConfigurationChangeResponse),
+
+    StepDownRequest(Option<ServerId>),
+    StepDownResponse(ConfigurationChangeResponse),
 
     PingRequest,
     PingResponse(PingResponse),
@@ -114,13 +117,13 @@ impl ConfigurationChangeResponse {
 /// Part of client message.
 pub struct PingResponse {
     /// The server's current term
-    pub(crate) term: Term,
+    pub term: Term,
 
     /// The server's current index
-    pub(crate) index: LogIndex,
+    pub index: LogIndex,
 
     /// The server's current state
-    pub(crate) state: ConsensusState,
+    pub state: ConsensusState,
 }
 
 #[cfg(feature = "use_capnp")]

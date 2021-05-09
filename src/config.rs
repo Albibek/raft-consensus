@@ -4,8 +4,8 @@ use serde::{Deserialize, Serialize};
 #[cfg(feature = "use_capnp")]
 use capnp::message::{Allocator, Builder, HeapAllocator, Reader, ReaderSegments};
 
-#[cfg(feature = "use_capnp")]
-use crate::messages_capnp::{entry as entry_capnp, entry_data};
+//#[cfg(feature = "use_capnp")]
+//use crate::messages_capnp::{entry as entry_capnp, entry_data};
 
 use crate::error::Error;
 use crate::message::Timeout;
@@ -20,8 +20,8 @@ pub use crate::state_machine::StateMachine;
 // nodes, including self, but always requires
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
-pub(crate) struct ConsensusConfig {
-    peers: Vec<Peer>,
+pub struct ConsensusConfig {
+    pub peers: Vec<Peer>,
 }
 
 impl ConsensusConfig {
@@ -63,7 +63,7 @@ impl ConsensusConfig {
     }
 
     pub(crate) fn clear_heartbeats<H: Handler>(&self, handler: &mut H) {
-        for &peer in &self.peers {
+        for peer in &self.peers {
             handler.clear_timeout(Timeout::Heartbeat(peer.id));
         }
     }

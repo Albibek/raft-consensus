@@ -1,5 +1,7 @@
-use crate::entry::{ConsensusConfig, Entry, EntryData};
-use crate::persistent_log::{Error, Log};
+use crate::config::ConsensusConfig;
+use crate::persistent_log::{
+    Error, Log, LogEntry, LogEntryData, LogEntryDataRef, LogEntryRef, LogError,
+};
 use crate::{LogIndex, ServerId, Term};
 
 /// This is a `Log` implementation that stores entries in a simple in-memory vector. Other data
@@ -8,7 +10,7 @@ use crate::{LogIndex, ServerId, Term};
 pub struct MemLog {
     current_term: Term,
     voted_for: Option<ServerId>,
-    entries: Vec<Entry>,
+    entries: Vec<LogEntry>,
     latest_config_index: Option<u64>,
 }
 
@@ -24,107 +26,74 @@ impl MemLog {
 }
 
 impl Log for MemLog {
-    type Error = Error;
+    type Error = LogError;
 
-    fn current_term(&self) -> Result<Term, Error> {
+    fn current_term(&self) -> Result<Term, Self::Error> {
         Ok(self.current_term)
     }
 
-    fn set_current_term(&mut self, term: Term) -> Result<(), Error> {
+    fn set_current_term(&mut self, term: Term) -> Result<(), Self::Error> {
         self.voted_for = None;
         self.current_term = term;
         Ok(())
     }
 
-    fn inc_current_term(&mut self) -> Result<Term, Error> {
-        self.voted_for = None;
-        self.current_term = self.current_term + 1;
-        self.current_term()
-    }
-
-    fn voted_for(&self) -> Result<Option<ServerId>, Error> {
+    fn voted_for(&self) -> Result<Option<ServerId>, Self::Error> {
         Ok(self.voted_for)
     }
 
-    fn set_voted_for(&mut self, address: ServerId) -> Result<(), Error> {
-        self.voted_for = Some(address);
+    fn set_voted_for(&mut self, address: Option<ServerId>) -> Result<(), Self::Error> {
+        self.voted_for = address;
         Ok(())
     }
 
-    fn latest_log_index(&self) -> Result<LogIndex, Error> {
+    fn latest_log_index(&self) -> Result<LogIndex, Self::Error> {
         Ok(LogIndex(self.entries.len() as u64))
     }
 
-    fn latest_log_term(&self) -> Result<Term, Error> {
-        let len = self.entries.len();
-        if len == 0 {
-            Ok(Term::from(0))
-        } else {
-            Ok(self.entries[len - 1].term)
+    fn discard_log_since(&mut self, index: LogIndex) -> Result<LogIndex, Self::Error> {
+        if index.as_usize() < self.entries.len() {
+            self.entries.truncate(index.as_usize())
         }
+        Ok(index)
     }
 
-    //    fn set_latest_config_index(&mut self, index: LogIndex) -> Result<(), Self::Error> {
-    //self.latest_config_index = Some(index.0);
-    //Ok(())
-    //}
-
-    fn discard_since(&self, index: LogIndex) -> Result<(), Self::Error> {
-        todo!()
+    fn latest_config_index(&self) -> Result<Option<LogIndex>, Self::Error> {
+        Ok(self.latest_config_index.map(|i| i.into()))
     }
 
-    fn latest_config_index(&self) -> Result<LogIndex, Self::Error> {
-        self.latest_config_index
-            .map(|i| i.into())
-            .ok_or(Error::NoConfig)
-    }
-
-    fn read_latest_config(&self, config: &mut ConsensusConfig) -> Result<LogIndex, Self::Error> {
-        let index = self.latest_config_index()?;
-        match self.entries.get(index.as_usize()) {
-            Some(Entry {
-                data: EntryData::Config(latest_config, _),
-                ..
-            }) => {
-                *config = latest_config.clone();
-                Ok(index)
-            }
-            _ => Err(Error::BadIndex),
-        }
-    }
-
-    fn term(&self, index: LogIndex) -> Result<Option<Term>, Error> {
+    fn term_of(&self, index: LogIndex) -> Result<Option<Term>, Self::Error> {
         todo!();
         self.entries
             .get((index - 1).as_u64() as usize)
             .map(|entry| Some(entry.term))
-            .ok_or(Error::BadIndex)
+            .ok_or(LogError::BadIndex)
     }
 
-    fn entry(&self, index: LogIndex, dest: &mut Entry) -> Result<(), Error> {
+    fn read_entry(&self, index: LogIndex, dest: &mut LogEntry) -> Result<(), Self::Error> {
         self.entries
             .get((index - 1).as_u64() as usize)
             .map(|entry| *dest = entry.clone())
-            .ok_or(Error::BadIndex)
+            .ok_or(LogError::BadIndex)
     }
-
-    fn append_entries<'a, I: Iterator<Item = &'a Entry>>(
+    /// Must append an entry to the log
+    fn append_entry<'a>(
         &mut self,
-        from: LogIndex,
-        entries: I,
+        at: LogIndex,
+        entry: &LogEntryRef<'a>,
     ) -> Result<(), Self::Error> {
-        if self.latest_log_index()? + 1 < from {
-            return Err(Error::BadLogIndex);
+        if self.latest_log_index()? + 1 < at {
+            return Err(LogError::BadLogIndex);
         }
 
-        let start = (from - 1).as_u64() as usize;
+        let start = (at - 1).as_u64() as usize;
         if self.entries.len() < start + 1 {
-            return Err(Error::BadLogIndex);
+            return Err(LogError::BadLogIndex);
         } else {
             self.entries.truncate(start);
         }
 
-        self.entries.extend(entries.cloned());
+        self.entries.push(entry.into());
         Ok(())
     }
 }

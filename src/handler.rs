@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::fmt::Debug;
 
-use crate::entry::ConsensusConfig;
+use crate::config::ConsensusConfig;
 use crate::message::*;
 use crate::{AdminId, ClientId, ServerId};
 
@@ -25,8 +25,8 @@ pub trait Handler: Debug {
     fn update_peers(&mut self, peers: &ConsensusConfig);
 
     #[allow(unused_variables)]
-    /// Called when consensus goes to new state. Initializing new consensus does not call this function.
-    fn state_changed(&mut self, old: ConsensusState, new: &ConsensusState) {}
+    /// Called when consensus goes to new state. Useful for triggering things on leader change.
+    fn state_changed(&mut self, old: ConsensusState, new: ConsensusState) {}
 }
 
 /// A handler that collects all messages leaving processing of them untouched.
@@ -102,7 +102,7 @@ impl Handler for CollectHandler {
 
     fn update_peers(&mut self, peers: &ConsensusConfig) {}
 
-    fn state_changed(&mut self, _old: ConsensusState, new: &ConsensusState) {
-        self.state = new.clone()
+    fn state_changed(&mut self, _old: ConsensusState, new: ConsensusState) {
+        self.state = new
     }
 }

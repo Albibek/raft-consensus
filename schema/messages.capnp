@@ -6,29 +6,16 @@ struct Peer {
 }
 
 struct Entry {
+    term @0 :UInt64;
     union {
-        heartbeat @0 :Void;
-        empty @1 :LogEntry;
-        proposal @2 :LogEntry;
-        config @3 :ConfigChangeEntry;
-
-    }
-
-    struct LogEntry {
-        term @0 :UInt64;
-        data @1 :LogEntryData;
-    }
-
-    struct LogEntryData {
-        union {
-            empty @0 :Void;
-            proposal @1 :Data;
-            config @2 :List(Peer);
-        }
+        heartbeat @1 :Void;
+        empty @2 :Void;
+        proposal @3 :Data;
+        config @4 :ConfigChangeEntry;
     }
 
     struct ConfigChangeEntry {
-        entry @0 :LogEntry;
+        config @0 :List(Peer);
         isActual @1 :Bool;
     }
 }
