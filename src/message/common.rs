@@ -38,37 +38,6 @@ macro_rules! common_capnp {
     };
 }
 
-/// A state of the node. Used in ping responses.
-#[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
-#[derive(Clone, Debug, PartialEq)]
-/// Any message that cluster peers can exchange
-pub enum ConsensusState {
-    Follower,
-    Candidate,
-    Leader,
-}
-
-#[cfg(feature = "use_capnp")]
-impl ConsensusState {
-    //    pub fn from_capnp<'a>(reader: consensus_state::Reader<'a>) -> Result<Self, Error> {
-    //match reader.which().map_err(Error::CapnpSchema)? {
-    //consensus_state::Which::Follower(()) => Ok(ConsensusState::Follower),
-    //consensus_state::Which::Candidate(()) => Ok(ConsensusState::Candidate),
-    //consensus_state::Which::Leader(()) => Ok(ConsensusState::Leader),
-    //}
-    //}
-
-    //pub fn fill_capnp<'a>(&self, builder: &mut consensus_state::Builder<'a>) {
-    //match self {
-    //&ConsensusState::Follower => builder.reborrow().set_follower(()),
-    //&ConsensusState::Candidate => builder.reborrow().set_candidate(()),
-    //&ConsensusState::Leader => builder.reborrow().set_leader(()),
-    //};
-    //}
-
-    //common_capnp!(consensus_state::Builder, consensus_state::Reader);
-}
-
 /// Consensus timeout types. Usually not sent over the network, but may still be, so
 /// they are treated as the ususl messages.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -81,113 +50,113 @@ pub enum Timeout {
 }
 
 // TODO
-//#[cfg(test)]
-//mod test {
+#[cfg(test)]
+mod test {
 
-//#[cfg(feature = "use_capnp")]
-//use message::*;
+    //#[cfg(feature = "use_capnp")]
+    //use message::*;
 
-//#[cfg(feature = "use_capnp")]
-//macro_rules! test_message_capnp {
-//($i:ident, $t:ty) => {
-//fn $i(message: $t) {
-//let builder = message.as_capnp_heap();
-//let mut encoded = Vec::new();
+    //#[cfg(feature = "use_capnp")]
+    //macro_rules! test_message_capnp {
+    //($i:ident, $t:ty) => {
+    //fn $i(message: $t) {
+    //let builder = message.as_capnp_heap();
+    //let mut encoded = Vec::new();
 
-//::capnp::serialize::write_message(&mut encoded, &builder).unwrap();
-//let mut encoded = ::std::io::Cursor::new(encoded);
-//let decoded = ::capnp::serialize::read_message(
-//&mut encoded,
-//::capnp::message::DEFAULT_READER_OPTIONS,
-//)
-//.unwrap();
-//let decoded = <$t>::from_capnp_untyped(decoded).unwrap();
-//assert_eq!(message, decoded);
-//}
-//};
-//}
+    //::capnp::serialize::write_message(&mut encoded, &builder).unwrap();
+    //let mut encoded = ::std::io::Cursor::new(encoded);
+    //let decoded = ::capnp::serialize::read_message(
+    //&mut encoded,
+    //::capnp::message::DEFAULT_READER_OPTIONS,
+    //)
+    //.unwrap();
+    //let decoded = <$t>::from_capnp_untyped(decoded).unwrap();
+    //assert_eq!(message, decoded);
+    //}
+    //};
+    //}
 
-//#[cfg(feature = "use_capnp")]
-//test_message_capnp!(test_peer_message_capnp, PeerMessage);
+    //#[cfg(feature = "use_capnp")]
+    //test_message_capnp!(test_peer_message_capnp, PeerMessage);
 
-//#[test]
-//#[cfg(feature = "use_capnp")]
-//fn test_append_entries_request_capnp() {
-//let message = AppendEntriesRequest {
-//// The values are pretty random here, maybe not matching raft conditions
-//term: 5.into(),
-//prev_log_index: 3.into(),
-//prev_log_term: 2.into(),
-//leader_commit: 4.into(),
-//entries: vec![Entry {
-//term: 9.into(),
-//data: "qwer".to_string().into_bytes(),
-//}],
-//};
+    //#[test]
+    //#[cfg(feature = "use_capnp")]
+    //fn test_append_entries_request_capnp() {
+    //let message = AppendEntriesRequest {
+    //// The values are pretty random here, maybe not matching raft conditions
+    //term: 5.into(),
+    //prev_log_index: 3.into(),
+    //prev_log_term: 2.into(),
+    //leader_commit: 4.into(),
+    //entries: vec![Entry {
+    //term: 9.into(),
+    //data: "qwer".to_string().into_bytes(),
+    //}],
+    //};
 
-//test_peer_message_capnp(message.into());
-//}
+    //test_peer_message_capnp(message.into());
+    //}
 
-//#[test]
-//#[cfg(feature = "use_capnp")]
-//fn test_append_entries_response_capnp() {
-//let message = AppendEntriesResponse::Success(1.into(), 2.into());
-//test_peer_message_capnp(message.into());
-//let message = AppendEntriesResponse::StaleTerm(3.into());
-//test_peer_message_capnp(message.into());
-//let message = AppendEntriesResponse::InconsistentPrevEntry(4.into(), 5.into());
-//test_peer_message_capnp(message.into());
-//let message = AppendEntriesResponse::StaleEntry;
-//test_peer_message_capnp(message.into());
-//}
+    //#[test]
+    //#[cfg(feature = "use_capnp")]
+    //fn test_append_entries_response_capnp() {
+    //let message = AppendEntriesResponse::Success(1.into(), 2.into());
+    //test_peer_message_capnp(message.into());
+    //let message = AppendEntriesResponse::StaleTerm(3.into());
+    //test_peer_message_capnp(message.into());
+    //let message = AppendEntriesResponse::InconsistentPrevEntry(4.into(), 5.into());
+    //test_peer_message_capnp(message.into());
+    //let message = AppendEntriesResponse::StaleEntry;
+    //test_peer_message_capnp(message.into());
+    //}
 
-//#[test]
-//#[cfg(feature = "use_capnp")]
-//fn test_request_vote_request_capnp() {
-//let message = RequestVoteRequest {
-//term: 1.into(),
-//last_log_index: 2.into(),
-//last_log_term: 3.into(),
-//};
-//test_peer_message_capnp(message.into());
-//}
+    //#[test]
+    //#[cfg(feature = "use_capnp")]
+    //fn test_request_vote_request_capnp() {
+    //let message = RequestVoteRequest {
+    //term: 1.into(),
+    //last_log_index: 2.into(),
+    //last_log_term: 3.into(),
+    //};
+    //test_peer_message_capnp(message.into());
+    //}
 
-//#[test]
-//#[cfg(feature = "use_capnp")]
-//fn test_request_vote_response_capnp() {
-//let message = RequestVoteResponse::StaleTerm(1.into());
-//test_peer_message_capnp(message.into());
-//let message = RequestVoteResponse::Granted(2.into());
-//test_peer_message_capnp(message.into());
-//let message = RequestVoteResponse::InconsistentLog(3.into());
-//test_peer_message_capnp(message.into());
-//let message = RequestVoteResponse::AlreadyVoted(4.into());
-//test_peer_message_capnp(message.into());
-//}
+    //#[test]
+    //#[cfg(feature = "use_capnp")]
+    //fn test_request_vote_response_capnp() {
+    //let message = RequestVoteResponse::StaleTerm(1.into());
+    //test_peer_message_capnp(message.into());
+    //let message = RequestVoteResponse::Granted(2.into());
+    //test_peer_message_capnp(message.into());
+    //let message = RequestVoteResponse::InconsistentLog(3.into());
+    //test_peer_message_capnp(message.into());
+    //let message = RequestVoteResponse::AlreadyVoted(4.into());
+    //test_peer_message_capnp(message.into());
+    //}
 
-//#[test]
-//#[cfg(feature = "use_capnp")]
-//fn test_client_request_capnp() {
-//test_message_capnp!(test_message, ClientRequest);
+    //#[test]
+    //#[cfg(feature = "use_capnp")]
+    //fn test_client_request_capnp() {
+    //test_message_capnp!(test_message, ClientRequest);
 
-//let message = ClientRequest::Proposal("proposal".to_string().into_bytes());
-//test_message(message);
-//let message = ClientRequest::Query("query".to_string().into_bytes());
-//test_message(message);
-//let message = ClientRequest::Ping;
-//test_message(message);
-//}
+    //let message = ClientRequest::Proposal("proposal".to_string().into_bytes());
+    //test_message(message);
+    //let message = ClientRequest::Query("query".to_string().into_bytes());
+    //test_message(message);
+    //let message = ClientRequest::Ping;
+    //test_message(message);
+    //}
 
-//#[test]
-//#[cfg(feature = "use_capnp")]
-//fn test_client_response_capnp() {
-//test_message_capnp!(test_message, ClientResponse);
+    //#[test]
+    //#[cfg(feature = "use_capnp")]
+    //fn test_client_response_capnp() {
+    //test_message_capnp!(test_message, ClientResponse);
 
-//let message = ClientResponse::Ping(PingResponse {
-//term: 10000.into(),
-//index: 2000.into(),
-//state: ConsensusState::Leader,
-//});
-//test_message(message);
-//}
-//}
+    //let message = ClientResponse::Ping(PingResponse {
+    //term: 10000.into(),
+    //index: 2000.into(),
+    //state: ConsensusState::Leader,
+    //});
+    //test_message(message);
+    //}
+}

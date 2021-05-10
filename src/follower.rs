@@ -38,7 +38,7 @@ where
 
         self.state_data.set_leader(from);
 
-        let message = self.append_entries(request, handler, current_term)?;
+        let message = self.append_entries(request, current_term)?;
 
         // ensure to reset timer at the very end of potentially long disk operation
         handler.set_timeout(Timeout::Election);
@@ -148,6 +148,10 @@ where
     }
 
     fn election_timeout(mut self, handler: &mut H) -> Result<CurrentState<L, M, H>, Error> {
+        if !self.state_data.can_vote {
+            // non voters should not set election timeout
+            return Err(Error::unreachable(module_path!()));
+        }
         if let Some((from, ref request)) = self.state_data.delayed_vote_request.take() {
             // Since voting has started already, we must process the delayed vote request.
             // For the node this means it has to vote for another candidate instead of itself
@@ -159,7 +163,8 @@ where
 
             // but after that we must decide if we should really become a candidate
             // this depends on what response we are sending
-            // general rule: we want it if request was bad for some reason
+            // general rule: we want it if request was bad for some reason, meaning election must
+            // start as required
             let become_candidate = match response {
                 RequestVoteResponse::StaleTerm(_) => true,
                 RequestVoteResponse::InconsistentLog(_) => true,
@@ -179,15 +184,15 @@ where
             } else {
                 Ok(new_state)
             }
-            //let candidate = new_state.into_candidate(handler)?;
         } else {
             let candidate = self.into_candidate(handler)?;
-            Ok(candidate.into())
+            let maybe_leader = candidate.try_solitary_leader(handler)?;
+            Ok(maybe_leader.into())
         }
     }
 
     // Utility messages and actions
-    fn peer_connected(&mut self, handler: &mut H, peer: ServerId) -> Result<(), Error> {
+    fn peer_connected(&mut self, _handler: &mut H, _peer: ServerId) -> Result<(), Error> {
         // followers don't send messages, so they don't care about other peers' connections
         Ok(())
     }
@@ -195,8 +200,8 @@ where
     // Configuration change messages
     fn add_server_request(
         &mut self,
-        handler: &mut H,
-        request: &AddServerRequest,
+        _handler: &mut H,
+        _request: &AddServerRequest,
     ) -> Result<ConfigurationChangeResponse, Error> {
         self.state_data
             .leader
@@ -209,13 +214,10 @@ where
     /// Applies a client proposal to the consensus state machine.
     fn client_proposal_request(
         &mut self,
-        handler: &mut H,
-        from: ClientId,
-        request: &ClientRequest,
+        _handler: &mut H,
+        _from: ClientId,
+        _request: &ClientRequest,
     ) -> Result<ClientResponse, Error> {
-        let prev_log_index = self.latest_log_index();
-        let prev_log_term = self.latest_log_term();
-        let term = self.current_term();
         self.state_data
             .leader
             .map_or(Ok(ClientResponse::UnknownLeader), |leader| {
@@ -223,7 +225,7 @@ where
             })
     }
 
-    fn client_query_request(&mut self, from: ClientId, request: &ClientRequest) -> ClientResponse {
+    fn client_query_request(&mut self, from: ClientId, _request: &ClientRequest) -> ClientResponse {
         // TODO: introduce an option for allowing the response from the potentially
         // older state of the machine
         // With such option it could be possible to reply the machine on the follower
@@ -254,7 +256,6 @@ where
     pub(crate) fn append_entries(
         &mut self,
         request: &AppendEntriesRequest,
-        handler: &mut H,
         current_term: Term,
     ) -> Result<AppendEntriesResponse, Error> {
         let leader_term = request.term;
@@ -386,25 +387,8 @@ where
             state_data,
         };
 
-        candidate.inc_current_term()?;
-        let id = candidate.id;
-        candidate.with_log_mut(|log| log.set_voted_for(Some(id)))?;
-        let last_log_term = candidate.latest_log_term()?;
-
-        let message = RequestVoteRequest {
-            term: candidate.current_term()?,
-            last_log_index: candidate.latest_log_index()?,
-            last_log_term,
-            is_voluntary_step_down: false,
-        };
-
-        candidate.config.with_remote_peers(&candidate.id, |id| {
-            handler.send_peer_message(*id, PeerMessage::RequestVoteRequest(message.clone()));
-            Ok(())
-        });
-
         handler.state_changed(ConsensusState::Follower, ConsensusState::Candidate);
-        handler.set_timeout(Timeout::Election);
+        candidate.start_election(handler)?;
         Ok(candidate)
     }
 }

@@ -31,7 +31,7 @@ pub trait Handler: Debug {
 
 /// A handler that collects all messages leaving processing of them untouched.
 /// Note that `timeouts` vectors may intersect, that means both - clearing and setting a new timeout was requested.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CollectHandler {
     pub peer_messages: HashMap<ServerId, Vec<PeerMessage>>,
     pub client_messages: HashMap<ClientId, Vec<ClientMessage>>,
@@ -100,7 +100,7 @@ impl Handler for CollectHandler {
         }
     }
 
-    fn update_peers(&mut self, peers: &ConsensusConfig) {}
+    fn update_peers(&mut self, _peers: &ConsensusConfig) {}
 
     fn state_changed(&mut self, _old: ConsensusState, new: ConsensusState) {
         self.state = new

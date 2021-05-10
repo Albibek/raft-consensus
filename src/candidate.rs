@@ -87,7 +87,7 @@ where
 
         let local_term = self.current_term()?;
         let voter_term = response.voter_term();
-        let majority = self.config.majority();
+        let majority = self.config.majority(self.id);
         if local_term < voter_term {
             // Responder has a higher term number. The election is compromised; abandon it and
             // revert to follower state with the updated term number. Any further responses we
@@ -128,15 +128,15 @@ where
 
     // Timeout handling
     /// Handles heartbeat timeout event
-    fn heartbeat_timeout(&mut self, peer: ServerId) -> Result<AppendEntriesRequest, Error> {
+    fn heartbeat_timeout(&mut self, _peer: ServerId) -> Result<AppendEntriesRequest, Error> {
         Err(Error::MustLeader)
     }
 
     fn election_timeout(mut self, handler: &mut H) -> Result<CurrentState<L, M, H>, Error> {
-        if self.config.is_solitary(&self.id) {
+        if self.config.is_solitary(self.id) {
             // Solitary replica special case: we are the only peer in consensus
             // jump straight to Leader state.
-            info!("election timeout: transitioning to leader due do solitary replica condition");
+            trace!("election timeout: transitioning to leader due do solitary replica condition");
             assert!(self.with_log(|log| log.voted_for())?.is_none()); // there cannot be anyone to vote for us
 
             //self.with_log(|log| log.inc_current_term())?;
@@ -144,33 +144,17 @@ where
             let leader = self.into_leader(handler)?;
             Ok(leader.into())
         } else {
-            info!("election timeout on candidate: restarting election");
-            self.inc_current_term()?;
-            let id = self.id;
-            self.with_log_mut(|log| log.set_voted_for(Some(id)))?;
-            handler.set_timeout(Timeout::Election);
-            todo!("send vote requests");
+            trace!("election timeout on candidate: restarting election");
+            self.start_election(handler)?;
             Ok(self.into())
         }
     }
 
     // Utility messages and actions
-    fn peer_connected(&mut self, handler: &mut H, peer: ServerId) -> Result<(), Error> {
-        //// Resend the request vote request if a response has not yet been receieved.
-        //if state.peer_voted(peer) {
-        //return Ok(());
-        //}
-
-        //let message = RequestVoteRequest {
-        //term: self.current_term(),
-        //last_log_index: self.latest_log_index(),
-        //last_log_term: self.log.latest_log_term().unwrap(),
-        //};
-        //handler.send_peer_message(peer, PeerMessage::RequestVoteRequest(message));
-
-        // TODO: we could resend some data to a peer, but we intentionally do not do this,
-        // leaving this to the implementation which may decide to have different startegies
-        // of retrying
+    fn peer_connected(&mut self, _handler: &mut H, _peer: ServerId) -> Result<(), Error> {
+        // TODO: we could resend `RequestVoteRequest`s to a peer, like previous implementation did,
+        // but we intentionally do not do this, leaving all the retrying strategies to external implementation
+        // which may decide to have different startegies of retrying
         // Sending nothing should not break the consensus, except probably delaying the
         // voting process for one more election timeout
 
@@ -180,27 +164,27 @@ where
     // Configuration change messages
     fn add_server_request(
         &mut self,
-        handler: &mut H,
-        request: &AddServerRequest,
+        _handler: &mut H,
+        _request: &AddServerRequest,
     ) -> Result<ConfigurationChangeResponse, Error> {
-        todo!("process add_server request")
+        Ok(ConfigurationChangeResponse::UnknownLeader)
     }
 
     /// Applies a client proposal to the consensus state machine.
     fn client_proposal_request(
         &mut self,
-        handler: &mut H,
-        from: ClientId,
-        request: &ClientRequest,
+        _handler: &mut H,
+        _from: ClientId,
+        _request: &ClientRequest,
     ) -> Result<ClientResponse, Error> {
         Ok(ClientResponse::UnknownLeader)
     }
 
-    fn client_query_request(&mut self, from: ClientId, request: &ClientRequest) -> ClientResponse {
-        // TODO: introduce an option for allowing the response from the potentially
-        // older state of the machine
-        // With such option it could be possible to reply the machine on the follower
-        trace!("query from client {}", from);
+    fn client_query_request(
+        &mut self,
+        _from: ClientId,
+        _request: &ClientRequest,
+    ) -> ClientResponse {
         ClientResponse::UnknownLeader
     }
 
@@ -230,10 +214,10 @@ where
         mut self,
         handler: &mut H,
     ) -> Result<CurrentState<L, M, H>, Error> {
-        if self.config.is_solitary(&self.id) {
+        if self.config.is_solitary(self.id) {
             // Solitary replica special case: we are the only peer in consensus
             // jump straight to Leader state.
-            info!("election timeout: transitioning to Leader due do solitary replica condition");
+            info!("transitioning to leader due do solitary replica condition");
             assert!(self.with_log(|log| log.voted_for())?.is_none());
 
             self.inc_current_term()?;
@@ -246,9 +230,31 @@ where
         }
     }
 
+    pub(crate) fn start_election(&mut self, handler: &mut H) -> Result<(), Error> {
+        self.inc_current_term()?;
+        let id = self.id;
+        self.with_log_mut(|log| log.set_voted_for(Some(id)))?;
+        let last_log_term = self.latest_log_term()?;
+
+        let message = RequestVoteRequest {
+            term: self.current_term()?,
+            last_log_index: self.latest_log_index()?,
+            last_log_term,
+            is_voluntary_step_down: false,
+        };
+
+        self.config.with_remote_peers(&self.id, |id| {
+            handler.send_peer_message(*id, PeerMessage::RequestVoteRequest(message.clone()));
+            Ok(())
+        });
+
+        handler.set_timeout(Timeout::Election);
+        Ok(())
+    }
+
     // Only candidates can transition to leader
     pub(crate) fn into_leader(self, handler: &mut H) -> Result<State<L, M, H, Leader>, Error> {
-        trace!("transitioning to Leader");
+        trace!("transitioning to leader");
         let latest_log_index = self.with_log(|log| log.latest_log_index())?;
         let current_term = self.current_term()?;
         let latest_log_term = self.latest_log_term()?;
@@ -313,10 +319,5 @@ impl Candidate {
     /// Returns the number of votes.
     pub(crate) fn count_votes(&self) -> usize {
         self.granted_votes.len()
-    }
-
-    /// Returns whether the peer has voted in the current election.
-    pub(crate) fn peer_voted(&self, voter: ServerId) -> bool {
-        self.granted_votes.contains(&voter)
     }
 }

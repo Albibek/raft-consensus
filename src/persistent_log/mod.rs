@@ -71,7 +71,8 @@ pub trait Log {
     /// None means voted_for should be unset
     fn set_voted_for(&mut self, server: Option<ServerId>) -> Result<(), Self::Error>;
 
-    /// Should return the index of a latest config entry, if any
+    /// Should return the index of a latest config entry, if any. LogIndex(0) is considered
+    /// equal to no config.
     fn latest_config_index(&self) -> Result<Option<LogIndex>, Self::Error>;
 
     // Configuration related functions

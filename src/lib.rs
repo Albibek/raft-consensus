@@ -5,11 +5,12 @@
 //!
 //! Main features:
 //! * Snapshotting(TODO)
-//! * Sticky leader. Network partitioning does not make leader to flap.
+//! * Sticky leader. Partial network partitioning does not make leader to flap.
 //! * Leader step down(TODO). Given a special command, leader may give up it's leadership to
 //! another node.
 //! * Configuration change API. Peer nodes can be added and removed(TODO) dynamically with the changes
-//! propagated over the cluster.
+//! propagated over the cluster. Removed node becomes non-voting follower(TODO), receiving
+//! the trail of messages (eventually ending, because of being removed from cluster)
 //! * Panic-free(TODO). Only unrecoverable error can be returned, but no panic happens when
 //! messages are processed.
 //!
@@ -103,9 +104,11 @@ use uuid::Uuid;
 
 use crate::error::Error;
 
+pub use crate::config::ConsensusConfig;
 pub use crate::handler::Handler;
+pub use crate::message::admin::ConsensusState;
 pub use crate::persistent_log::Log;
-pub use crate::raft::Raft;
+pub use crate::raft::{Raft, RaftBuilder};
 pub use crate::state_machine::StateMachine;
 
 /// The term of a log entry.
@@ -221,6 +224,7 @@ impl fmt::Display for LogIndex {
     }
 }
 
+/// peer ID and metadata
 #[derive(Clone, Hash, PartialEq, Eq, Ord, PartialOrd, Debug)]
 #[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
 pub struct Peer {

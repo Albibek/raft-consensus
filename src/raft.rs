@@ -1,4 +1,4 @@
-use std::mem;
+use std::{marker::PhantomData, mem};
 
 use crate::error::{CriticalError, Error};
 use crate::handler::Handler;
@@ -9,13 +9,123 @@ use crate::state_impl::{
     apply_admin_message, apply_client_message, apply_peer_message, apply_timeout, StateImpl,
 };
 
-use crate::{ClientId, ServerId};
-
 use crate::candidate::Candidate;
+use crate::config::ConsensusConfig;
 use crate::follower::Follower;
 use crate::leader::Leader;
 use crate::persistent_log::Log;
+use crate::persistent_log::{LogEntry, LogEntryData};
 use crate::state_machine::StateMachine;
+use crate::{AdminId, ClientId, LogIndex, Peer, ServerId};
+
+#[derive(Clone, Debug)]
+pub struct RaftBuilder<L, M>
+where
+    L: Log,
+    M: StateMachine,
+{
+    id: ServerId,
+    log: L,
+    state_machine: M,
+    bootstrap_config: ConsensusConfig,
+    force_bootstrap: bool,
+    can_vote: Option<bool>,
+}
+
+impl<L, M> RaftBuilder<L, M>
+where
+    L: Log,
+    M: StateMachine,
+{
+    pub fn new(id: ServerId, log: L, state_machine: M) -> Self {
+        Self {
+            id,
+            log,
+            state_machine,
+            bootstrap_config: ConsensusConfig {
+                peers: vec![Peer {
+                    id: ServerId(0),
+                    metadata: Vec::new(),
+                }],
+            },
+            force_bootstrap: false,
+            can_vote: None,
+        }
+    }
+
+    /// provide config to be used if it cannot be read from log
+    pub fn with_bootstrap_config(&mut self, config: ConsensusConfig) {
+        self.bootstrap_config = config
+    }
+
+    pub fn with_force_bootstrap_config(&mut self, force: bool) {
+        self.force_bootstrap = force
+    }
+
+    /// Enforce voting permission for node. By default, permission will be determined
+    /// from consensus config and node ID
+    pub fn with_vote_permission(&mut self, can_vote: bool) {
+        self.can_vote = Some(can_vote)
+    }
+
+    pub fn start<H: Handler>(self, handler: &mut H) -> Result<Raft<L, M, H>, Error> {
+        let Self {
+            id,
+            log,
+            state_machine,
+            bootstrap_config,
+            force_bootstrap,
+            can_vote,
+        } = self;
+
+        let config = if let Some(index) = log
+            .latest_config_index()
+            .map_err(|e| Error::PersistentLogRead(Box::new(e)))?
+        {
+            if index == LogIndex(0) || force_bootstrap {
+                bootstrap_config
+            } else {
+                let mut entry = LogEntry::default();
+                log.read_entry(index, &mut entry)
+                    .map_err(|e| Error::PersistentLogRead(Box::new(e)))?;
+                if let LogEntryData::Config(config) = entry.data {
+                    config
+                } else {
+                    return Err(Error::unreachable(module_path!()));
+                }
+            }
+        } else {
+            bootstrap_config
+        };
+
+        let can_vote = if let Some(can_vote) = can_vote {
+            can_vote
+        } else {
+            config.has_peer(id)
+        };
+
+        if can_vote {
+            handler.set_timeout(Timeout::Election);
+        }
+
+        let state = State {
+            id,
+            config,
+            log,
+            state_machine,
+            commit_index: LogIndex(0),
+            // TODO: after snapshots min_index should be the index from snapshot
+            min_index: LogIndex(0),
+            last_applied: LogIndex(0),
+            state_data: Follower::new(can_vote),
+            _h: PhantomData,
+        };
+        Ok(Raft {
+            state: state.into(),
+            _h: PhantomData,
+        })
+    }
+}
 
 /// An instance of a Raft consensus' single node.
 /// The node API controls a client state machine, to which it applies entries in a globally consistent order.
@@ -26,6 +136,7 @@ use crate::state_machine::StateMachine;
 // This structure is just a facade, hiding the internal state transitions from the caller.
 // At the same time all the internal convenience and requirements like StateImpl correctness is
 // left intact and mofifiable
+#[derive(Clone, Debug)]
 pub struct Raft<L, M, H>
 where
     L: Log,
@@ -49,7 +160,7 @@ where
     }
 
     /// Apply a standard API peer message to the consensus
-    pub(crate) fn apply_peer_message(
+    pub fn apply_peer_message(
         &mut self,
         handler: &mut H,
         from: ServerId,
@@ -61,7 +172,7 @@ where
     /// Apply a client API message to the consensus
     /// Replies should also be processed, i.e. when proxying between
     /// follower and leader takes place
-    fn apply_client_message(
+    pub fn apply_client_message(
         &mut self,
         handler: &mut H,
         from: ClientId,
@@ -74,12 +185,52 @@ where
     pub fn apply_admin_message(
         &mut self,
         handler: &mut H,
+        from: AdminId,
         request: &AdminMessage,
     ) -> Result<(), Error> {
-        self.state.apply_admin_message(handler, request)
+        self.state.apply_admin_message(handler, from, request)
     }
 }
 
+/// These a special functions only available in debug builds.
+/// They can be only used for testing and like looking into log or state machine
+/// but not allowed in production to avoid unintentional damage
+#[cfg(debug_assertions)]
+impl<L, M, H> Raft<L, M, H>
+where
+    L: Log,
+    M: StateMachine,
+    H: Handler,
+{
+    pub fn kind(&self) -> ConsensusState {
+        match self.state {
+            CurrentState::Lost => panic!("state is lost"),
+            CurrentState::Leader(_) => ConsensusState::Leader,
+            CurrentState::Follower(_) => ConsensusState::Follower,
+            CurrentState::Candidate(_) => ConsensusState::Candidate,
+        }
+    }
+
+    pub fn log(&mut self) -> &mut L {
+        match self.state {
+            CurrentState::Lost => panic!("state is lost"),
+            CurrentState::Leader(ref mut s) => &mut s.log,
+            CurrentState::Follower(ref mut s) => &mut s.log,
+            CurrentState::Candidate(ref mut s) => &mut s.log,
+        }
+    }
+
+    pub fn state_machine(&mut self) -> &mut M {
+        match self.state {
+            CurrentState::Lost => panic!("state is lost"),
+            CurrentState::Leader(ref mut s) => &mut s.state_machine,
+            CurrentState::Follower(ref mut s) => &mut s.state_machine,
+            CurrentState::Candidate(ref mut s) => &mut s.state_machine,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
 pub(crate) enum CurrentState<L, M, H>
 where
     L: Log,
@@ -166,32 +317,9 @@ where
     fn apply_admin_message(
         &mut self,
         handler: &mut H,
+        from: AdminId,
         request: &AdminMessage,
     ) -> Result<(), Error> {
-        proxy_state!(self, s, apply_admin_message(s, handler, request)?)
-    }
-
-    pub(crate) fn is_leader(&self) -> bool {
-        if let CurrentState::Leader(_) = self {
-            true
-        } else {
-            false
-        }
-    }
-
-    pub(crate) fn is_follower(&self) -> bool {
-        if let CurrentState::Follower(_) = self {
-            true
-        } else {
-            false
-        }
-    }
-
-    pub(crate) fn is_candidate(&self) -> bool {
-        if let CurrentState::Candidate(_) = self {
-            true
-        } else {
-            false
-        }
+        proxy_state!(self, s, apply_admin_message(s, handler, from, request)?)
     }
 }

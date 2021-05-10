@@ -117,7 +117,7 @@ where
                 if self.state_data.has_follower(&from) {
                     // advance commit only if response was from follower
                     self.try_advance_commit_index(handler)?;
-                } else if self.state_data.is_catching_up(&from) {
+                } else if self.state_data.is_catching_up(from) {
                     let message = self.check_catch_up_state(
                         handler,
                         from,
@@ -232,7 +232,7 @@ where
         // from any server, because they may be a new ones which current server doesn't know
         // about yet
 
-        let new_peer = !self.config.has_peer(&peer) && !self.state_data.is_catching_up(&peer);
+        let new_peer = !self.config.has_peer(peer) && !self.state_data.is_catching_up(peer);
         if new_peer {
             // This may still be correct peer, but it is was not added using AddServer API or was
             // removed already
@@ -348,7 +348,7 @@ where
     }
 
     fn try_advance_commit_index(&mut self, handler: &mut H) -> Result<(), Error> {
-        let majority = self.config.majority();
+        let majority = self.config.majority(self.id);
         // Here we try to move commit index to one that the majority of peers in cluster already have
         let latest_log_index = self.latest_log_index()?;
 
@@ -401,9 +401,11 @@ where
                 LogEntryData::Config(config) => {
                     // on leader if server is added, there is nothing to do here, because configuration change
                     // was already applied
-                    todo!(
-                        "on server removal step down leader if it it not on the new configuration"
-                    )
+                    if !config.peers.iter().any(|peer| peer.id == self.id) {
+                        // server is not in a new configuration
+                        // send StepDown command
+                        todo!("step down leader")
+                    }
                 }
             }
         }
@@ -453,7 +455,7 @@ where
 
             Ok(Some(message))
         } else {
-            if self.state_data.is_catching_up(&from) {
+            if self.state_data.is_catching_up(from) {
                 return Err(Error::unreachable(module_path!()));
             }
 
@@ -585,7 +587,7 @@ where
         log_index: LogIndex,
         message: AppendEntriesRequest,
     ) -> Result<(), Error> {
-        if !self.config.is_solitary(&self.id) {
+        if !self.config.is_solitary(self.id) {
             // solitary consensus can just advance, no messages required
             // fan out the request to all followers that are catched up enough
             for peer in &self.config.peers {
@@ -596,13 +598,13 @@ where
                             id,
                             PeerMessage::AppendEntriesRequest(message.clone()),
                         );
-                        self.state_data.set_next_index(id, log_index + 1);
+                        self.state_data.set_next_index(id, log_index + 1)?;
                     }
                 }
             }
         }
 
-        if self.config.majority() == 1 {
+        if self.config.majority(self.id) == 1 {
             // for a solitary consensus or a 2-peer cluster current node aready has a majority,
             // (because of it's own log commit)
             // so there is a reason to advance the index in case the proposal queue is empty
@@ -659,21 +661,9 @@ impl Leader {
         self.match_index.contains_key(follower)
     }
 
-    fn is_catching_up(&self, node: &ServerId) -> bool {
+    fn is_catching_up(&self, node: ServerId) -> bool {
         if let Some(catching_up) = &self.config_change {
-            node == &catching_up.peer.id
-        } else {
-            false
-        }
-    }
-
-    fn has_catching_up_node(&self) -> bool {
-        if let Some(ConfigChange {
-            stage: ConfigChangeStage::CatchingUp { .. },
-            ..
-        }) = &self.config_change
-        {
-            true
+            node == catching_up.peer.id
         } else {
             false
         }

@@ -10,7 +10,6 @@ use crate::messages_capnp::*;
 #[cfg(feature = "use_capnp")]
 use capnp::message::{Allocator, Builder, HeapAllocator, Reader, ReaderSegments};
 
-use super::common::ConsensusState;
 use crate::{LogIndex, ServerId, Term};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -149,4 +148,35 @@ impl PingResponse {
     //}
 
     //common_capnp!(ping_response::Builder, ping_response::Reader);
+}
+
+/// A state of the node. Used in ping responses.
+#[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
+#[derive(Clone, Debug, PartialEq)]
+/// Any message that cluster peers can exchange
+pub enum ConsensusState {
+    Follower,
+    Candidate,
+    Leader,
+}
+
+#[cfg(feature = "use_capnp")]
+impl ConsensusState {
+    //    pub fn from_capnp<'a>(reader: consensus_state::Reader<'a>) -> Result<Self, Error> {
+    //match reader.which().map_err(Error::CapnpSchema)? {
+    //consensus_state::Which::Follower(()) => Ok(ConsensusState::Follower),
+    //consensus_state::Which::Candidate(()) => Ok(ConsensusState::Candidate),
+    //consensus_state::Which::Leader(()) => Ok(ConsensusState::Leader),
+    //}
+    //}
+
+    //pub fn fill_capnp<'a>(&self, builder: &mut consensus_state::Builder<'a>) {
+    //match self {
+    //&ConsensusState::Follower => builder.reborrow().set_follower(()),
+    //&ConsensusState::Candidate => builder.reborrow().set_candidate(()),
+    //&ConsensusState::Leader => builder.reborrow().set_leader(()),
+    //};
+    //}
+
+    //common_capnp!(consensus_state::Builder, consensus_state::Reader);
 }

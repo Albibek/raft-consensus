@@ -20,7 +20,7 @@ use crate::{LogIndex, Peer, ServerId, Term};
 
 use crate::follower::Follower;
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct State<L, M, H, S>
 where
     L: Log,

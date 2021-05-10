@@ -1,5 +1,6 @@
 #[cfg(feature = "use_serde")]
 use serde::{Deserialize, Serialize};
+use std::iter::FromIterator;
 
 #[cfg(feature = "use_capnp")]
 use capnp::message::{Allocator, Builder, HeapAllocator, Reader, ReaderSegments};
@@ -18,19 +19,25 @@ pub use crate::state_machine::StateMachine;
 
 // An interface to full cluster config, that always stores all
 // nodes, including self, but always requires
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Default)]
 #[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
 pub struct ConsensusConfig {
     pub peers: Vec<Peer>,
 }
 
 impl ConsensusConfig {
-    pub(crate) fn is_solitary(&self, this: &ServerId) -> bool {
-        self.peers.len() == 1 && &self.peers[0].id == this
+    pub fn new<I: Iterator<Item = Peer>>(peers: I) -> Self {
+        Self {
+            peers: Vec::from_iter(peers),
+        }
     }
 
-    pub(crate) fn has_peer(&self, peer: &ServerId) -> bool {
-        self.peers.iter().any(|p| &p.id == peer)
+    pub(crate) fn is_solitary(&self, this: ServerId) -> bool {
+        self.peers.len() == 1 && self.peers[0].id == this
+    }
+
+    pub(crate) fn has_peer(&self, peer: ServerId) -> bool {
+        self.peers.iter().any(|p| p.id == peer)
     }
 
     // Smart configuration change: adds peer if it was not in the list of peers
@@ -57,9 +64,15 @@ impl ConsensusConfig {
     }
 
     /// Get the cluster quorum majority size.
-    pub(crate) fn majority(&self) -> usize {
+    pub(crate) fn majority(&self, this: ServerId) -> usize {
         let peers = self.peers.len();
-        (peers >> 1) + 1
+        // paper 4.2.2: node shoult not include itself to majority if it is
+        // not a cluster member, but still have to start voting
+        if self.has_peer(this) {
+            (peers >> 1) + 1
+        } else {
+            peers >> 1
+        }
     }
 
     pub(crate) fn clear_heartbeats<H: Handler>(&self, handler: &mut H) {
@@ -79,3 +92,27 @@ impl ConsensusConfig {
             .last();
     }
 }
+
+//TODO
+//#[cfg(test)]
+//mod test {
+
+//// Tests the majority function.
+//#[test]
+//fn test_majority() {
+//let peers = TestCluster::new(1).peers;
+//let majority = peers.values().next().unwrap().majority();
+//assert_eq!(1, majority);
+
+//let peers = TestCluster::new(2).peers;
+//let majority = peers.values().next().unwrap().majority();
+//assert_eq!(2, majority);
+
+//let peers = TestCluster::new(3).peers;
+//let majority = peers.values().next().unwrap().majority();
+//assert_eq!(2, majority);
+//let peers = TestCluster::new(4).peers;
+//let majority = peers.values().next().unwrap().majority();
+//assert_eq!(3, majority);
+//}
+//}

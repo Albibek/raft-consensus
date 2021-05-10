@@ -8,14 +8,17 @@ use crate::error::Error;
 use crate::messages_capnp::*;
 
 #[cfg(feature = "use_capnp")]
+use crate::messages_capnp::peer_message::*;
+
+#[cfg(feature = "use_capnp")]
 use capnp::message::{Allocator, Builder, HeapAllocator, Reader, ReaderSegments};
 
 use crate::{
     config::ConsensusConfig,
-    persistent_log::{LogEntry, LogEntryDataRef, LogEntryRef},
+    persistent_log::{LogEntryDataRef, LogEntryRef},
 };
 
-use crate::{LogIndex, Term};
+use crate::{LogIndex, Peer, ServerId, Term};
 
 /// Module contains all messages required for consensus' peer message API
 
@@ -31,45 +34,45 @@ pub enum PeerMessage {
 
 #[cfg(feature = "use_capnp")]
 impl PeerMessage {
-    //    pub fn from_capnp<'a>(reader: peer_message::Reader<'a>) -> Result<Self, Error> {
-    //match reader.which().map_err(Error::CapnpSchema)? {
-    //peer_message::Which::AppendEntriesRequest(message) => {
-    //Ok(AppendEntriesRequest::from_capnp(message?)?.into())
-    //}
-    //peer_message::Which::AppendEntriesResponse(message) => {
-    //Ok(AppendEntriesResponse::from_capnp(message?)?.into())
-    //}
-    //peer_message::Which::RequestVoteRequest(message) => {
-    //Ok(RequestVoteRequest::from_capnp(message?)?.into())
-    //}
-    //peer_message::Which::RequestVoteResponse(message) => {
-    //Ok(RequestVoteResponse::from_capnp(message?)?.into())
-    //}
-    //}
-    //}
+    pub fn from_capnp<'a>(reader: peer_message::Reader<'a>) -> Result<Self, Error> {
+        match reader.which().map_err(Error::CapnpSchema)? {
+            peer_message::Which::AppendEntriesRequest(message) => {
+                Ok(AppendEntriesRequest::from_capnp(message?)?.into())
+            }
+            peer_message::Which::AppendEntriesResponse(message) => {
+                Ok(AppendEntriesResponse::from_capnp(message?)?.into())
+            }
+            peer_message::Which::RequestVoteRequest(message) => {
+                Ok(RequestVoteRequest::from_capnp(message?)?.into())
+            }
+            peer_message::Which::RequestVoteResponse(message) => {
+                Ok(RequestVoteResponse::from_capnp(message?)?.into())
+            }
+        }
+    }
 
-    //pub fn fill_capnp<'a>(&self, builder: &mut peer_message::Builder<'a>) {
-    //match self {
-    //&PeerMessage::AppendEntriesRequest(ref message) => {
-    //let mut builder = builder.reborrow().init_append_entries_request();
-    //message.fill_capnp(&mut builder);
-    //}
-    //&PeerMessage::AppendEntriesResponse(ref message) => {
-    //let mut builder = builder.reborrow().init_append_entries_response();
-    //message.fill_capnp(&mut builder);
-    //}
-    //&PeerMessage::RequestVoteRequest(ref message) => {
-    //let mut builder = builder.reborrow().init_request_vote_request();
-    //message.fill_capnp(&mut builder);
-    //}
-    //&PeerMessage::RequestVoteResponse(ref message) => {
-    //let mut builder = builder.reborrow().init_request_vote_response();
-    //message.fill_capnp(&mut builder);
-    //}
-    //};
-    //}
+    pub fn fill_capnp<'a>(&self, builder: &mut peer_message::Builder<'a>) {
+        match self {
+            &PeerMessage::AppendEntriesRequest(ref message) => {
+                let mut builder = builder.reborrow().init_append_entries_request();
+                message.fill_capnp(&mut builder);
+            }
+            &PeerMessage::AppendEntriesResponse(ref message) => {
+                let mut builder = builder.reborrow().init_append_entries_response();
+                message.fill_capnp(&mut builder);
+            }
+            &PeerMessage::RequestVoteRequest(ref message) => {
+                let mut builder = builder.reborrow().init_request_vote_request();
+                message.fill_capnp(&mut builder);
+            }
+            &PeerMessage::RequestVoteResponse(ref message) => {
+                let mut builder = builder.reborrow().init_request_vote_response();
+                message.fill_capnp(&mut builder);
+            }
+        };
+    }
 
-    //common_capnp!(peer_message::Builder, peer_message::Reader);
+    common_capnp!(peer_message::Builder, peer_message::Reader);
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -100,45 +103,45 @@ impl From<AppendEntriesRequest> for PeerMessage {
 
 #[cfg(feature = "use_capnp")]
 impl AppendEntriesRequest {
-    //    pub fn from_capnp<'a>(reader: append_entries_request::Reader<'a>) -> Result<Self, Error> {
-    //Ok(Self {
-    //term: reader.get_term().into(),
-    //prev_log_index: reader.get_prev_log_index().into(),
-    //prev_log_term: reader.get_prev_log_term().into(),
-    //leader_commit: reader.get_leader_commit().into(),
-    //entries: if reader.has_entries() {
-    //let entries = reader.get_entries().map_err(Error::Capnp)?;
-    //let mut v = Vec::with_capacity(entries.len() as usize);
-    //for e in entries.iter() {
-    //v.push(Entry::from_capnp(e)?);
-    //}
-    //v
-    //} else {
-    //Vec::new()
-    //},
-    //})
-    //}
+    pub fn from_capnp<'a>(reader: append_entries_request::Reader<'a>) -> Result<Self, Error> {
+        Ok(Self {
+            term: reader.get_term().into(),
+            prev_log_index: reader.get_prev_log_index().into(),
+            prev_log_term: reader.get_prev_log_term().into(),
+            leader_commit: reader.get_leader_commit().into(),
+            entries: if reader.has_entries() {
+                let entries = reader.get_entries().map_err(Error::Capnp)?;
+                let mut v = Vec::with_capacity(entries.len() as usize);
+                for e in entries.iter() {
+                    v.push(Entry::from_capnp(e)?);
+                }
+                v
+            } else {
+                Vec::new()
+            },
+        })
+    }
 
-    //pub fn fill_capnp<'a>(&self, builder: &mut append_entries_request::Builder<'a>) {
-    //builder.set_term(self.term.into());
-    //builder.set_prev_log_term(self.prev_log_term.into());
-    //builder.set_prev_log_index(self.prev_log_index.into());
-    //builder.set_leader_commit(self.leader_commit.into());
-    //if self.entries.len() > 0 {
-    //// TODO: guarantee entries length fits u32
-    //let mut entries = builder.reborrow().init_entries(self.entries.len() as u32);
+    pub fn fill_capnp<'a>(&self, builder: &mut append_entries_request::Builder<'a>) {
+        builder.set_term(self.term.into());
+        builder.set_prev_log_term(self.prev_log_term.into());
+        builder.set_prev_log_index(self.prev_log_index.into());
+        builder.set_leader_commit(self.leader_commit.into());
+        if self.entries.len() > 0 {
+            // TODO: guarantee entries length fits u32
+            let mut entries = builder.reborrow().init_entries(self.entries.len() as u32);
 
-    //for (n, entry) in self.entries.iter().enumerate() {
-    //let mut slot = entries.reborrow().get(n as u32);
-    //entry.fill_capnp(&mut slot);
-    //}
-    //}
-    //}
+            for (n, entry) in self.entries.iter().enumerate() {
+                let mut slot = entries.reborrow().get(n as u32);
+                entry.fill_capnp(&mut slot);
+            }
+        }
+    }
 
-    //common_capnp!(
-    //append_entries_request::Builder,
-    //append_entries_request::Reader
-    //);
+    common_capnp!(
+        append_entries_request::Builder,
+        append_entries_request::Reader
+    );
 }
 
 /// Type representing a part of the AppendEntriesRequest message.
@@ -185,40 +188,56 @@ impl Entry {
 
 #[cfg(feature = "use_capnp")]
 impl Entry {
-    //pub fn from_capnp<'a>(reader: entry_capnp::Reader<'a>) -> Result<Self, Error> {
-    //        let data = match reader.get_data()?.which()? {
-    //entry_data::Which::Client(reader) => EntryData::Client(reader?.to_vec()),
-    //entry_data::Which::AddServer(reader) => {
-    //let add_server_entry = reader?;
-    //EntryData::AddServer(
-    //add_server_entry.get_id().into(),
-    //add_server_entry.get_info()?.to_vec(),
-    //)
-    //}
-    //entry_data::Which::RemoveServer(id) => EntryData::RemoveServer(id.into()),
-    //};
+    pub fn from_capnp<'a>(reader: entry::Reader<'a>) -> Result<Self, Error> {
+        let data = match reader.which()? {
+            entry::Which::Empty(()) => EntryData::Empty,
+            entry::Which::Proposal(reader) => EntryData::Proposal(reader?.to_vec()),
+            entry::Which::Config(reader) => {
+                let reader = reader?;
+                let peers_reader = reader.get_peers()?;
 
-    //Ok(Entry {
-    //term: reader.get_term().into(),
-    //data,
-    //})
-    //}
+                let mut config = ConsensusConfig {
+                    peers: Vec::with_capacity(peers_reader.len() as usize),
+                };
+                for e in peers_reader.iter() {
+                    let peer = Peer {
+                        id: ServerId(e.get_id()),
+                        metadata: e.get_metadata().map(|s| s.to_vec()).unwrap_or(Vec::new()),
+                    };
+                    config.peers.push(peer);
+                }
+                EntryData::Config(config, reader.get_is_actual())
+            }
+        };
 
-    //pub fn fill_capnp<'a>(&self, builder: &mut entry_capnp::Builder<'a>) {
-    //builder.set_term(self.term.as_u64());
-    //let mut data_builder = builder.reborrow().init_data();
-    //match self.data {
-    //EntryData::Client(ref data) => data_builder.set_client(data),
-    //EntryData::AddServer(id, ref info) => {
-    //let mut add_server_builder = data_builder.init_add_server();
-    //add_server_builder.set_id(id.into());
-    //add_server_builder.set_info(info);
-    //}
-    //EntryData::RemoveServer(id) => data_builder.set_remove_server(id.into()),
-    //}
-    //}
+        Ok(Entry {
+            term: reader.get_term().into(),
+            data,
+        })
+    }
 
-    //common_capnp!(entry_capnp::Builder, entry_capnp::Reader);
+    pub fn fill_capnp<'a>(&self, builder: &mut entry::Builder<'a>) {
+        builder.set_term(self.term.as_u64());
+        match self.data {
+            EntryData::Empty => builder.set_empty(()),
+            EntryData::Proposal(ref data) => builder.set_proposal(data),
+            EntryData::Config(ref config, ref is_actual) => {
+                let mut config_builder = builder.reborrow().init_config();
+                let mut peers_builder = config_builder
+                    .reborrow()
+                    .init_peers(config.peers.len() as u32);
+
+                for (n, peer) in config.peers.iter().enumerate() {
+                    let mut peer_slot = peers_builder.reborrow().get(n as u32);
+                    peer_slot.set_id(peer.id.as_u64());
+                    peer_slot.set_metadata(&peer.metadata);
+                }
+                config_builder.set_is_actual(*is_actual)
+            }
+        }
+    }
+
+    common_capnp!(entry::Builder, entry::Reader);
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -239,46 +258,46 @@ impl From<AppendEntriesResponse> for PeerMessage {
 
 #[cfg(feature = "use_capnp")]
 impl AppendEntriesResponse {
-    //    pub fn from_capnp<'a>(reader: append_entries_response::Reader<'a>) -> Result<Self, Error> {
-    //let message = match reader.which().map_err(Error::CapnpSchema)? {
-    //append_entries_response::Success(m) => {
-    //let m = m.map_err(Error::Capnp)?;
-    //AppendEntriesResponse::Success(m.get_term().into(), m.get_log_index().into())
-    //}
-    //append_entries_response::StaleTerm(m) => AppendEntriesResponse::StaleTerm(m.into()),
-    //append_entries_response::InconsistentPrevEntry(m) => {
-    //let m = m.map_err(Error::Capnp)?;
-    //AppendEntriesResponse::InconsistentPrevEntry(
-    //m.get_term().into(),
-    //m.get_log_index().into(),
-    //)
-    //}
-    //append_entries_response::StaleEntry(()) => AppendEntriesResponse::StaleEntry,
-    //};
-    //Ok(message)
-    //}
+    pub fn from_capnp<'a>(reader: append_entries_response::Reader<'a>) -> Result<Self, Error> {
+        let message = match reader.which().map_err(Error::CapnpSchema)? {
+            append_entries_response::Success(m) => {
+                let m = m.map_err(Error::Capnp)?;
+                AppendEntriesResponse::Success(m.get_term().into(), m.get_log_index().into())
+            }
+            append_entries_response::StaleTerm(m) => AppendEntriesResponse::StaleTerm(m.into()),
+            append_entries_response::InconsistentPrevEntry(m) => {
+                let m = m.map_err(Error::Capnp)?;
+                AppendEntriesResponse::InconsistentPrevEntry(
+                    m.get_term().into(),
+                    m.get_log_index().into(),
+                )
+            }
+            append_entries_response::StaleEntry(()) => AppendEntriesResponse::StaleEntry,
+        };
+        Ok(message)
+    }
 
-    //pub fn fill_capnp<'a>(&self, builder: &mut append_entries_response::Builder<'a>) {
-    //match self {
-    //&AppendEntriesResponse::Success(term, log_index) => {
-    //let mut message = builder.reborrow().init_success();
-    //message.set_term(term.into());
-    //message.set_log_index(log_index.into());
-    //}
-    //&AppendEntriesResponse::StaleTerm(term) => builder.set_stale_term(term.into()),
-    //&AppendEntriesResponse::InconsistentPrevEntry(term, log_index) => {
-    //let mut message = builder.reborrow().init_inconsistent_prev_entry();
-    //message.set_term(term.into());
-    //message.set_log_index(log_index.into());
-    //}
-    //&AppendEntriesResponse::StaleEntry => builder.set_stale_entry(()),
-    //}
-    //}
+    pub fn fill_capnp<'a>(&self, builder: &mut append_entries_response::Builder<'a>) {
+        match self {
+            &AppendEntriesResponse::Success(term, log_index) => {
+                let mut message = builder.reborrow().init_success();
+                message.set_term(term.into());
+                message.set_log_index(log_index.into());
+            }
+            &AppendEntriesResponse::StaleTerm(term) => builder.set_stale_term(term.into()),
+            &AppendEntriesResponse::InconsistentPrevEntry(term, log_index) => {
+                let mut message = builder.reborrow().init_inconsistent_prev_entry();
+                message.set_term(term.into());
+                message.set_log_index(log_index.into());
+            }
+            &AppendEntriesResponse::StaleEntry => builder.set_stale_entry(()),
+        }
+    }
 
-    //common_capnp!(
-    //append_entries_response::Builder,
-    //append_entries_response::Reader
-    //);
+    common_capnp!(
+        append_entries_response::Builder,
+        append_entries_response::Reader
+    );
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -307,23 +326,23 @@ impl From<RequestVoteRequest> for PeerMessage {
 
 #[cfg(feature = "use_capnp")]
 impl RequestVoteRequest {
-    //    pub fn from_capnp<'a>(reader: request_vote_request::Reader<'a>) -> Result<Self, Error> {
-    //Ok(Self {
-    //term: reader.get_term().into(),
-    //last_log_index: reader.get_last_log_index().into(),
-    //last_log_term: reader.get_last_log_term().into(),
-    //is_voluntary_step_down: reader.get_is_voluntary_step_down(),
-    //})
-    //}
+    pub fn from_capnp<'a>(reader: request_vote_request::Reader<'a>) -> Result<Self, Error> {
+        Ok(Self {
+            term: reader.get_term().into(),
+            last_log_index: reader.get_last_log_index().into(),
+            last_log_term: reader.get_last_log_term().into(),
+            is_voluntary_step_down: reader.get_is_voluntary_step_down(),
+        })
+    }
 
-    //pub fn fill_capnp<'a>(&self, builder: &mut request_vote_request::Builder<'a>) {
-    //builder.set_term(self.term.into());
-    //builder.set_last_log_term(self.last_log_term.into());
-    //builder.set_last_log_index(self.last_log_index.into());
-    //builder.set_is_voluntary_step_down(self.is_voluntary_step_down);
-    //}
+    pub fn fill_capnp<'a>(&self, builder: &mut request_vote_request::Builder<'a>) {
+        builder.set_term(self.term.into());
+        builder.set_last_log_term(self.last_log_term.into());
+        builder.set_last_log_index(self.last_log_index.into());
+        builder.set_is_voluntary_step_down(self.is_voluntary_step_down);
+    }
 
-    //common_capnp!(request_vote_request::Builder, request_vote_request::Reader);
+    common_capnp!(request_vote_request::Builder, request_vote_request::Reader);
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -355,33 +374,164 @@ impl RequestVoteResponse {
 
 #[cfg(feature = "use_capnp")]
 impl RequestVoteResponse {
-    // pub fn from_capnp<'a>(reader: request_vote_response::Reader<'a>) -> Result<Self, Error> {
-    //let message = match reader.which().map_err(Error::CapnpSchema)? {
-    //request_vote_response::Which::StaleTerm(m) => RequestVoteResponse::StaleTerm(m.into()),
-    //request_vote_response::Which::InconsistentLog(m) => {
-    //RequestVoteResponse::InconsistentLog(m.into())
+    pub fn from_capnp<'a>(reader: request_vote_response::Reader<'a>) -> Result<Self, Error> {
+        let message = match reader.which().map_err(Error::CapnpSchema)? {
+            request_vote_response::Which::StaleTerm(m) => RequestVoteResponse::StaleTerm(m.into()),
+            request_vote_response::Which::InconsistentLog(m) => {
+                RequestVoteResponse::InconsistentLog(m.into())
+            }
+            request_vote_response::Which::Granted(m) => RequestVoteResponse::Granted(m.into()),
+            request_vote_response::Which::AlreadyVoted(m) => {
+                RequestVoteResponse::AlreadyVoted(m.into())
+            }
+        };
+        Ok(message)
+    }
+
+    pub fn fill_capnp<'a>(&self, builder: &mut request_vote_response::Builder<'a>) {
+        match self {
+            &RequestVoteResponse::StaleTerm(term) => builder.set_stale_term(term.into()),
+            &RequestVoteResponse::InconsistentLog(term) => {
+                builder.set_inconsistent_log(term.into())
+            }
+            &RequestVoteResponse::Granted(term) => builder.set_granted(term.into()),
+            &RequestVoteResponse::AlreadyVoted(term) => builder.set_already_voted(term.into()),
+        }
+    }
+
+    common_capnp!(
+        request_vote_response::Builder,
+        request_vote_response::Reader
+    );
+}
+
+// TODO
+#[cfg(test)]
+mod test {
+
+    //#[cfg(feature = "use_capnp")]
+    //use message::*;
+    use super::*;
+
+    #[cfg(feature = "use_capnp")]
+    macro_rules! test_message_capnp {
+        ($i:ident, $t:ty) => {
+            fn $i(message: $t) {
+                let builder = message.as_capnp_heap();
+                let mut encoded = Vec::new();
+
+                ::capnp::serialize::write_message(&mut encoded, &builder).unwrap();
+                let mut encoded = ::std::io::Cursor::new(encoded);
+                let decoded = ::capnp::serialize::read_message(
+                    &mut encoded,
+                    ::capnp::message::DEFAULT_READER_OPTIONS,
+                )
+                .unwrap();
+                let decoded = <$t>::from_capnp_untyped(decoded).unwrap();
+                assert_eq!(message, decoded);
+            }
+        };
+    }
+
+    #[cfg(feature = "use_capnp")]
+    test_message_capnp!(test_peer_message_capnp, PeerMessage);
+
+    #[test]
+    #[cfg(feature = "use_capnp")]
+    fn test_append_entries_request_capnp() {
+        let message = AppendEntriesRequest {
+            // The values are pretty random here, maybe not matching raft conditions
+            term: 5.into(),
+            prev_log_index: 3.into(),
+            prev_log_term: 2.into(),
+            leader_commit: 4.into(),
+            entries: vec![
+                Entry {
+                    term: 9.into(),
+                    data: EntryData::Empty,
+                },
+                Entry {
+                    term: 9.into(),
+                    data: EntryData::Proposal("qwer".to_string().into_bytes()),
+                },
+                Entry {
+                    term: 9.into(),
+                    data: EntryData::Config(
+                        ConsensusConfig {
+                            peers: vec![Peer {
+                                id: ServerId(42),
+                                metadata: b"127.0.0.1:8080"[..].to_vec(),
+                            }],
+                        },
+                        true,
+                    ),
+                },
+            ],
+        };
+
+        test_peer_message_capnp(message.into());
+    }
+
+    //#[test]
+    //#[cfg(feature = "use_capnp")]
+    //fn test_append_entries_response_capnp() {
+    //let message = AppendEntriesResponse::Success(1.into(), 2.into());
+    //test_peer_message_capnp(message.into());
+    //let message = AppendEntriesResponse::StaleTerm(3.into());
+    //test_peer_message_capnp(message.into());
+    //let message = AppendEntriesResponse::InconsistentPrevEntry(4.into(), 5.into());
+    //test_peer_message_capnp(message.into());
+    //let message = AppendEntriesResponse::StaleEntry;
+    //test_peer_message_capnp(message.into());
     //}
-    //request_vote_response::Which::Granted(m) => RequestVoteResponse::Granted(m.into()),
-    //request_vote_response::Which::AlreadyVoted(m) => {
-    //RequestVoteResponse::AlreadyVoted(m.into())
-    //}
+
+    //#[test]
+    //#[cfg(feature = "use_capnp")]
+    //fn test_request_vote_request_capnp() {
+    //let message = RequestVoteRequest {
+    //term: 1.into(),
+    //last_log_index: 2.into(),
+    //last_log_term: 3.into(),
     //};
-    //Ok(message)
+    //test_peer_message_capnp(message.into());
     //}
 
-    //pub fn fill_capnp<'a>(&self, builder: &mut request_vote_response::Builder<'a>) {
-    //match self {
-    //&RequestVoteResponse::StaleTerm(term) => builder.set_stale_term(term.into()),
-    //&RequestVoteResponse::InconsistentLog(term) => {
-    //builder.set_inconsistent_log(term.into())
-    //}
-    //&RequestVoteResponse::Granted(term) => builder.set_granted(term.into()),
-    //&RequestVoteResponse::AlreadyVoted(term) => builder.set_already_voted(term.into()),
-    //}
+    //#[test]
+    //#[cfg(feature = "use_capnp")]
+    //fn test_request_vote_response_capnp() {
+    //let message = RequestVoteResponse::StaleTerm(1.into());
+    //test_peer_message_capnp(message.into());
+    //let message = RequestVoteResponse::Granted(2.into());
+    //test_peer_message_capnp(message.into());
+    //let message = RequestVoteResponse::InconsistentLog(3.into());
+    //test_peer_message_capnp(message.into());
+    //let message = RequestVoteResponse::AlreadyVoted(4.into());
+    //test_peer_message_capnp(message.into());
     //}
 
-    //common_capnp!(
-    //request_vote_response::Builder,
-    //request_vote_response::Reader
-    //);
+    //#[test]
+    //#[cfg(feature = "use_capnp")]
+    //fn test_client_request_capnp() {
+    //test_message_capnp!(test_message, ClientRequest);
+
+    //let message = ClientRequest::Proposal("proposal".to_string().into_bytes());
+    //test_message(message);
+    //let message = ClientRequest::Query("query".to_string().into_bytes());
+    //test_message(message);
+    //let message = ClientRequest::Ping;
+    //test_message(message);
+    //}
+
+    //#[test]
+    //#[cfg(feature = "use_capnp")]
+    //fn test_client_response_capnp() {
+    //test_message_capnp!(test_message, ClientResponse);
+
+    //let message = ClientResponse::Ping(PingResponse {
+    //term: 10000.into(),
+    //index: 2000.into(),
+    //state: ConsensusState::Leader,
+    //});
+    //test_message(message);
+    //}
 }

@@ -1,4 +1,4 @@
-use crate::error::Error;
+use crate::{error::Error, AdminId};
 
 use crate::handler::Handler;
 use crate::message::*;
@@ -104,7 +104,7 @@ where
             handler.send_client_message(from, ClientMessage::ClientQueryResponse(response));
             Ok(())
         }
-        ClientMessage::ClientQueryResponse(req) => {
+        ClientMessage::ClientQueryResponse(_req) => {
             // TODO: message proxying
             Ok(())
         }
@@ -114,21 +114,46 @@ where
 pub(crate) fn apply_admin_message<L, M, S: StateImpl<L, M, H>, H: Handler>(
     s: &mut S,
     handler: &mut H,
-    request: &AdminMessage,
+    from: AdminId,
+    message: &AdminMessage,
 ) -> Result<(), Error>
 where
     L: Log,
     M: StateMachine,
     H: Handler,
 {
-    todo!();
-    //    match message {
-    //PingRequest::PingRequest => {
-    //let response = s.client_ping_request()?;
-    //handler.send_client_message(id, message);
-    //Ok(s.into())
-    //} //s.add_server_request(handler, request)
-    //}
+    match message {
+        AdminMessage::AddServerRequest(request) => {
+            let message = s.add_server_request(handler, request)?;
+            handler.send_admin_message(from, AdminMessage::AddServerResponse(message));
+            Ok(())
+        }
+        AdminMessage::PingRequest => {
+            let message = s.ping_request()?;
+            handler.send_admin_message(from, AdminMessage::PingResponse(message));
+            Ok(())
+        }
+        AdminMessage::AddServerResponse(_) => {
+            // TODO: message proxying
+            Ok(())
+        }
+        AdminMessage::RemoveServerRequest(_) => {
+            todo!("implement removal");
+        }
+        AdminMessage::RemoveServerResponse(_) => {
+            todo!("implement removal");
+        }
+        AdminMessage::StepDownRequest(_) => {
+            todo!("implement step down");
+        }
+        AdminMessage::StepDownResponse(_) => {
+            todo!("implement step down");
+        }
+        AdminMessage::PingResponse(_) => {
+            // TODO: message proxying
+            Ok(())
+        }
+    }
 }
 
 /// This trait defines a consensus behaviour that should be supported in each particular state

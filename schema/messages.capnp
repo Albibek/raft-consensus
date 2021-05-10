@@ -8,14 +8,13 @@ struct Peer {
 struct Entry {
     term @0 :UInt64;
     union {
-        heartbeat @1 :Void;
-        empty @2 :Void;
-        proposal @3 :Data;
-        config @4 :ConfigChangeEntry;
+        empty @1 :Void;
+        proposal @2 :Data;
+        config @3 :ConfigChangeEntry;
     }
 
     struct ConfigChangeEntry {
-        config @0 :List(Peer);
+        peers @0 :List(Peer);
         isActual @1 :Bool;
     }
 }
