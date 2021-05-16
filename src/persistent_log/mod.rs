@@ -85,6 +85,7 @@ pub trait Log {
     /// Must append an entry to the log. If the index in the log is earlier, than requested,
     /// the log must be truncated so the added entry always being the last one, with no gaps.
     /// The caller(i.e. the consensus) will check for the gaps, so they should not actually happen.
+    /// NOTE: log indexes in Raft start with 1 (0 is reserved as special), this function should consider this
     fn append_entry<'a>(
         &mut self,
         at: LogIndex,
@@ -93,7 +94,7 @@ pub trait Log {
 }
 
 /// The record to be added into log
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
 pub struct LogEntry {
     pub term: Term,
@@ -101,7 +102,7 @@ pub struct LogEntry {
 }
 
 /// Kinds of a log entry to be processed
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
 pub enum LogEntryData {
     Empty,
@@ -136,7 +137,7 @@ impl From<LogEntry> for Entry {
         Entry {
             term: e.term,
             data: match e.data {
-                LogEntryData::Empty => EntryData::Empty,
+                LogEntryData::Empty => EntryData::Noop,
                 LogEntryData::Proposal(proposal) => EntryData::Proposal(proposal),
                 LogEntryData::Config(c) => EntryData::Config(c, false),
             },
@@ -168,14 +169,14 @@ impl LogEntry {
 }
 
 /// The record to be added into log
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogEntryRef<'a> {
     pub term: Term,
     pub data: LogEntryDataRef<'a>,
 }
 
 /// Kinds of a log entry to be processed
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LogEntryDataRef<'a> {
     Empty,
     Proposal(&'a [u8]),
@@ -213,7 +214,7 @@ impl<'a> From<LogEntryRef<'a>> for Entry {
         Entry {
             term: e.term,
             data: match e.data {
-                LogEntryDataRef::Empty => EntryData::Empty,
+                LogEntryDataRef::Empty => EntryData::Noop,
                 LogEntryDataRef::Proposal(proposal) => EntryData::Proposal(proposal.to_vec()),
                 LogEntryDataRef::Config(c) => EntryData::Config(c.clone(), false),
             },
@@ -226,7 +227,7 @@ impl<'a> From<&'a LogEntryRef<'a>> for Entry {
         Entry {
             term: e.term,
             data: match e.data {
-                LogEntryDataRef::Empty => EntryData::Empty,
+                LogEntryDataRef::Empty => EntryData::Noop,
                 LogEntryDataRef::Proposal(proposal) => EntryData::Proposal(proposal.to_vec()),
                 LogEntryDataRef::Config(c) => EntryData::Config(c.clone(), false),
             },
@@ -240,7 +241,7 @@ impl<'a> From<&'a LogEntryRef<'a>> for Entry {
 #[derive(ThisError, Debug)]
 pub enum LogError {
     Version(u64, u64),
-    BadIndex,
+    BadIndex(LogIndex),
     BadLogIndex,
     NoConfig,
     Io(#[from] ::std::io::Error),

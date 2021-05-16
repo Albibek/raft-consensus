@@ -15,11 +15,14 @@ pub enum Error {
     #[error("consensus have reached unrecoverable error: {}", _0)]
     Critical(#[from] CriticalError),
 
-    #[error("consensus state was not Leader while it had to be.")]
+    #[error("consensus state was not leader while it had to be")]
     MustLeader,
 
-    #[error("consensus state was Leader while it had NOT to be.")]
+    #[error("consensus state was Leader while it had NOT to be")]
     MustNotLeader,
+
+    #[error("consensus state was not follower while it had to be")]
+    MustFollower,
 
     #[error("follower responded with inconsistent index.")]
     BadFollowerIndex,
@@ -47,7 +50,7 @@ pub enum Error {
     #[error("error reading persistent log: {}", _0)]
     PersistentLogRead(Box<dyn StdError + 'static>),
 
-    #[error("Follower node must be in list of peers at start")]
+    #[error("follower node must be in list of peers at start")]
     MustBootstrap,
 
     #[error("unable to support {} cluster members", _0)]

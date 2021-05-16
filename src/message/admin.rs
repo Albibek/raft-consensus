@@ -12,7 +12,7 @@ use capnp::message::{Allocator, Builder, HeapAllocator, Reader, ReaderSegments};
 
 use crate::{LogIndex, ServerId, Term};
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
 /// Any message related to client requests and responses
 pub enum AdminMessage {
@@ -28,7 +28,7 @@ pub enum AdminMessage {
     PingResponse(PingResponse),
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
 /// Request for adding new server to cluster
 pub struct AddServerRequest {
@@ -54,7 +54,7 @@ impl AddServerRequest {
     //common_capnp!(add_server_request::Builder, add_server_request::Reader);
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
 /// Request for adding new server to cluster
 pub struct RemoveServerRequest {
@@ -62,7 +62,7 @@ pub struct RemoveServerRequest {
     pub id: ServerId,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
 /// Response when adding new server to cluster
 pub enum ConfigurationChangeResponse {
@@ -111,7 +111,7 @@ impl ConfigurationChangeResponse {
     //common_capnp!(add_server_response::Builder, add_server_response::Reader);
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
 /// Part of client message.
 pub struct PingResponse {
@@ -152,7 +152,7 @@ impl PingResponse {
 
 /// A state of the node. Used in ping responses.
 #[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 /// Any message that cluster peers can exchange
 pub enum ConsensusState {
     Follower,

@@ -19,7 +19,7 @@ pub use crate::state_machine::StateMachine;
 
 // An interface to full cluster config, that always stores all
 // nodes, including self, but always requires
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 #[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
 pub struct ConsensusConfig {
     pub peers: Vec<Peer>,

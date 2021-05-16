@@ -1,61 +1,100 @@
-use std::collections::HashSet;
 use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet};
 
 use raft_consensus::message::*;
-use raft_consensus::persistent_log::mem::MemLog;
-use raft_consensus::state_machine::null::NullStateMachine;
 use raft_consensus::*;
 
 use raft_consensus::handler::{CollectHandler, Handler};
 
 use log::{debug, info, trace};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
-    Empty,
     Peer(ServerId, ServerId, PeerMessage),
-    SetTimeout(ServerId, Timeout),
-    ClearTimeout(ServerId, Timeout),
-    FireTimeout(ServerId, Timeout),
-    Client(ServerId, ClientId, ClientMessage),
-    Admin(ServerId, AdminId, AdminMessage),
+    Timeout(ServerId, Timeout),
+    Client(ClientId, ServerId, ClientMessage),
+    Admin(AdminId, ServerId, AdminMessage),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TestHandler {
     pub cur: ServerId,
-    pub queue: VecDeque<Action>,
-    pub queue2: Vec<Action>,
+
+    pub peer_network: HashMap<(ServerId, ServerId), VecDeque<PeerMessage>>,
+    // raft sends only client responses and only admin responses through handler
+    pub client_network: HashMap<(ServerId, ClientId), VecDeque<ClientMessage>>,
+    pub admin_network: HashMap<(ServerId, AdminId), VecDeque<AdminMessage>>,
+
+    pub election_timeouts: HashMap<ServerId, bool>,
+    pub heartbeat_timeouts: HashMap<ServerId, Option<HashMap<ServerId, bool>>>,
 }
 
 impl Handler for TestHandler {
     /// Saves peer message to a vector
     fn send_peer_message(&mut self, id: ServerId, message: PeerMessage) {
         assert_ne!(self.cur, ServerId(u64::MAX));
-        self.queue.push_back(Action::Peer(self.cur, id, message));
+        let q = self.peer_network.get_mut(&(self.cur, id)).unwrap();
+        q.push_back(message);
     }
 
     /// Saves client message to a vector
     fn send_client_message(&mut self, id: ClientId, message: ClientMessage) {
         assert_ne!(self.cur, ServerId(u64::MAX));
-        self.queue.push_back(Action::Client(self.cur, id, message));
+        let q = self.client_network.get_mut(&(self.cur, id)).unwrap();
+        q.push_back(message);
     }
 
     fn send_admin_message(&mut self, id: AdminId, message: AdminMessage) {
         assert_ne!(self.cur, ServerId(u64::MAX));
-        self.queue.push_back(Action::Admin(self.cur, id, message));
+        let q = self.admin_network.get_mut(&(self.cur, id)).unwrap();
+        q.push_back(message);
     }
 
     /// Collects timeouts uniquely
     fn set_timeout(&mut self, timeout: Timeout) {
         assert_ne!(self.cur, ServerId(u64::MAX));
-        self.queue.push_back(Action::SetTimeout(self.cur, timeout));
+        //       self.queue.push_back(Action::SetTimeout(self.cur, timeout));
+
+        // all timeouts being set or reset go to next step's queue
+        if !self.heartbeat_timeouts.contains_key(&self.cur) {
+            self.heartbeat_timeouts.insert(self.cur, None);
+        }
+        match timeout {
+            Timeout::Election => {
+                self.election_timeouts.insert(self.cur, true); // previous id must exist
+            }
+            Timeout::Heartbeat(id) => {
+                if let Some(timeouts) = self.heartbeat_timeouts.get_mut(&self.cur).unwrap() {
+                    timeouts.insert(id, true);
+                } else {
+                    let mut timeouts = HashMap::new();
+                    timeouts.insert(id, true);
+                    *self.heartbeat_timeouts.get_mut(&self.cur).unwrap() = Some(timeouts);
+                }
+            }
+        }
     }
 
     fn clear_timeout(&mut self, timeout: Timeout) {
         assert_ne!(self.cur, ServerId(u64::MAX));
-        self.queue
-            .push_back(Action::ClearTimeout(self.cur, timeout));
+
+        if !self.heartbeat_timeouts.contains_key(&self.cur) {
+            self.heartbeat_timeouts.insert(self.cur, None);
+        }
+        match timeout {
+            Timeout::Election => {
+                self.election_timeouts.insert(self.cur, false);
+            }
+            Timeout::Heartbeat(id) => {
+                if let Some(timeouts) = self.heartbeat_timeouts.get_mut(&self.cur).unwrap() {
+                    timeouts.insert(id, false);
+                } else {
+                    let mut timeouts = HashMap::new();
+                    timeouts.insert(id, false);
+                    *self.heartbeat_timeouts.get_mut(&self.cur).unwrap() = Some(timeouts);
+                }
+            }
+        }
     }
 
     fn state_changed(&mut self, old: ConsensusState, new: ConsensusState) {
@@ -70,7 +109,7 @@ impl Handler for TestHandler {
                 // conform too
                 panic!("Bad state transition: follower to leader (ok for solitary transition)")
             }
-            (old, new) => trace!("state transition {:?} -> {:?}", old, new),
+            (old, new) => trace!("id={} state transition {:?} -> {:?}", self.cur, old, new),
         }
     }
 
@@ -80,47 +119,48 @@ impl Handler for TestHandler {
 }
 
 impl TestHandler {
-    pub fn new() -> Self {
+    pub fn new(size: usize) -> Self {
+        let mut peer_network = HashMap::new();
+        for i in 0..size {
+            for j in 0..size {
+                if i != j {
+                    peer_network.insert((ServerId(i as u64), ServerId(j as u64)), VecDeque::new());
+                }
+            }
+        }
+
+        let client_id = ClientId(uuid::Uuid::from_slice(&[0u8; 16]).unwrap());
+        let mut client_network = HashMap::new();
+        for i in 0..size {
+            client_network.insert((ServerId(i as u64), client_id), VecDeque::new());
+        }
+
+        let admin_id = AdminId(uuid::Uuid::from_slice(&[0u8; 16]).unwrap());
+        let mut admin_network = HashMap::new();
+        for i in 0..size {
+            admin_network.insert((ServerId(i as u64), admin_id), VecDeque::new());
+        }
+
         Self {
             cur: ServerId(u64::MAX),
-            queue: VecDeque::new(),
-            queue2: Vec::new(),
+            peer_network,
+            client_network,
+            admin_network,
+
+            election_timeouts: HashMap::new(),
+            heartbeat_timeouts: HashMap::new(),
         }
-    }
-
-    pub fn fire_election_timeout(&mut self, id: ServerId) {
-        //
-    }
-
-    pub fn rotate_queue_ordered(&mut self) {
-        assert!(self.queue2.is_empty());
-        self.queue2.resize(self.queue.len(), Action::Empty);
-        let mut queue_index = 0usize;
-        while let Some(next_action) = self.queue.pop_front() {
-            self.queue2[queue_index] = next_action;
-            queue_index += 1;
-        }
-    }
-
-    // take all collected actions from the main queue and
-    // push them to second queue, changing their order according to `permutation`
-    pub fn rotate_queue(&mut self, permutation: &[usize]) {
-        assert!(self.queue2.is_empty());
-        self.queue2.resize(permutation.len(), Action::Empty);
-        let mut queue_index = 0usize;
-        while let Some(next_action) = self.queue.pop_front() {
-            if let Some(pos) = permutation.iter().position(|idx| idx == &queue_index) {
-                self.queue2[pos] = next_action
-            }
-            queue_index += 1;
-        }
-    }
-
-    pub fn clear(&mut self) {
-        self.queue.clear();
     }
 
     pub fn reset_cur(&mut self) {
         self.cur = ServerId(u64::MAX);
+    }
+
+    pub fn peer_net_len(&self) -> usize {
+        let mut len = 0;
+        for (_, q) in &self.peer_network {
+            len += q.len()
+        }
+        len
     }
 }

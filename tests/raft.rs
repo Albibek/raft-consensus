@@ -1,12 +1,15 @@
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
+use std::iter::FromIterator;
 
 use crate::handler::*;
 use crate::hash_machine::HashMachine;
+use itertools::Itertools;
 
 use raft_consensus::message::*;
 use raft_consensus::persistent_log::mem::MemLog;
+use raft_consensus::persistent_log::*;
 use raft_consensus::*;
 
 use raft_consensus::handler::{CollectHandler, Handler};
@@ -15,12 +18,17 @@ use log::{debug, info, trace};
 
 pub type TestState = Raft<MemLog, HashMachine, TestHandler>;
 
-#[derive(Clone, Debug)]
+//#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Eq)]
 pub struct TestCluster {
     pub nodes: HashMap<ServerId, TestState>,
-    pub election_timeouts: HashMap<ServerId, bool>,
-    pub heartbeat_timeouts: HashMap<ServerId, Option<HashMap<ServerId, bool>>>,
     pub handler: TestHandler,
+}
+
+impl PartialEq for TestCluster {
+    fn eq(&self, other: &Self) -> bool {
+        self.nodes == other.nodes
+    }
 }
 
 impl TestCluster {
@@ -33,210 +41,179 @@ impl TestCluster {
             })
             .collect();
         let mut nodes = HashMap::new();
-        let mut handler = TestHandler::new();
-        let mut election_timeouts = HashMap::new();
-        let mut heartbeat_timeouts = HashMap::new();
+        let mut handler = TestHandler::new(size);
         for peer in &peers {
             let store = MemLog::new();
             let machine = HashMachine::new();
 
             let mut builder = RaftBuilder::new(peer.id, store, machine);
             builder.with_bootstrap_config(ConsensusConfig::new(peers.iter().cloned()));
-            election_timeouts.insert(peer.id, false);
-            heartbeat_timeouts.insert(peer.id, None);
 
             handler.cur = peer.id;
             let consensus = builder.start(&mut handler).unwrap();
             nodes.insert(peer.id, consensus);
         }
-        Self {
-            nodes,
-            handler,
-            election_timeouts,
-            heartbeat_timeouts,
+        Self { nodes, handler }
+    }
+
+    // start the consensus and  make everyone elect a leader
+    pub fn kickstart(&mut self) {
+        trace!("start {:?}", self.handler);
+        // at the start all nodes have set their election timeouts
+        // we only want one from id=0, so it could win the election
+        // for doing that and considering sticky leader feature,
+        // we must to play with election timeouts a bit
+
+        // apply the timeout first
+        self.apply_action(Action::Timeout(ServerId(0), Timeout::Election));
+        self.apply_peer_packets();
+
+        // due to sticky leader, the nodes will delay voting until their election timeouts
+        // so we apply timeouts to get the election started
+        self.apply_action(Action::Timeout(ServerId(1), Timeout::Election));
+        self.apply_action(Action::Timeout(ServerId(2), Timeout::Election));
+
+        self.apply_peer_packets();
+        // consensus should have leader with id=0 elected at this point
+        for (id, node) in &self.nodes {
+            if id == &ServerId(0) {
+                assert_eq!(node.kind(), ConsensusState::Leader);
+            } else {
+                assert_eq!(node.kind(), ConsensusState::Follower);
+            }
+        }
+        // because of new term, leader MUST insert an empty entry to it's log instead of just pinging the followers,
+
+        // let followers receive leader entries
+        self.apply_peer_packets();
+
+        // and confirm them
+        self.apply_peer_packets();
+
+        // we've missed the timeouts and need to push them back, so cluster
+        // is good to correctly proceed
+
+        // TODO: as of now leader clears it's eleciton timeout, but there
+        // are client API considerations that may have it always on in the future
+
+        trace!("kickstart finished {:?}", self);
+    }
+
+    pub fn apply_peer_packets(&mut self) {
+        while self.handler.peer_net_len() > 0 {
+            let mut actions = Vec::new();
+            for ((from, to), queue) in &mut self.handler.peer_network {
+                while let Some(message) = queue.pop_front() {
+                    actions.push(Action::Peer(*from, *to, message));
+                }
+            }
+            while let Some(action) = actions.pop() {
+                self.apply_action(action)
+            }
         }
     }
 
-    pub fn apply_actions(&mut self) {
-        loop {
-            trace!("apply step before {:?}", self.handler);
-            self.apply_actions_step();
-            trace!("apply step after {:?}", self.handler);
-
-            for (id, timeouts) in &self.heartbeat_timeouts {
-                self.handler.cur = *id;
-
-                let node = self.nodes.get_mut(&id).unwrap();
-                if let Some(timeouts) = timeouts {
-                    for (tid, is_set) in timeouts {
-                        if *is_set {
-                            node.apply_timeout(&mut self.handler, Timeout::Heartbeat(*tid))
-                                .unwrap();
-                        }
+    pub fn apply_heartbeats(&mut self) {
+        let mut actions = Vec::new();
+        for (at, timeouts) in &self.handler.heartbeat_timeouts {
+            if let Some(timeouts) = timeouts {
+                for (on, is_set) in timeouts {
+                    if *is_set {
+                        actions.push(Action::Timeout(*at, Timeout::Heartbeat(*on)));
                     }
                 }
-                self.handler.reset_cur()
-            }
-
-            for (id, timeout) in self.election_timeouts {
-                //
-            }
-
-            trace!("apply step after timeouts {:?}", self.handler);
-            if self.handler.queue.is_empty() {
-                break;
             }
         }
-    }
 
-    pub fn apply_actions_step(&mut self) {
-        self.handler.rotate_queue_ordered();
-        while let Some(action) = self.handler.queue2.pop() {
+        while let Some(action) = actions.pop() {
             self.apply_action(action)
         }
-        self.asset_leader_condition()
     }
 
-    fn apply_action(&mut self, action: Action) {
+    pub fn apply_action(&mut self, action: Action) {
         match action {
-            Action::Empty => {
-                panic!("empty action in queue");
-            }
             Action::Peer(from, to, msg) => {
                 self.handler.cur = to;
-                let mut node = self.nodes.get_mut(&to).unwrap();
+                let node = self.nodes.get_mut(&to).unwrap();
+                trace!("{} -> {} peer: {:?}", from, to, msg);
                 node.apply_peer_message(&mut self.handler, from, &msg)
                     .unwrap();
                 self.handler.reset_cur();
             }
-            Action::SetTimeout(to, timeout) => {
-                //self.handler.cur = to;
-                match timeout {
-                    Timeout::Election => {
-                        self.election_timeouts.insert(to, true).unwrap(); // previous id must exist
-                    }
-                    Timeout::Heartbeat(id) => {
-                        if let Some(timeouts) = self.heartbeat_timeouts.get_mut(&to).unwrap() {
-                            timeouts.insert(id, true);
-                        } else {
-                            let mut timeouts = HashMap::new();
-                            timeouts.insert(id, true);
-                            *self.heartbeat_timeouts.get_mut(&to).unwrap() = Some(timeouts);
-                        }
-                    }
-                }
+            Action::Timeout(on, timeout) => {
+                self.handler.cur = on;
+                let node = self.nodes.get_mut(&on).unwrap();
+                trace!("timeout {:?}", action);
+                node.apply_timeout(&mut self.handler, timeout).unwrap();
+                self.handler.reset_cur();
             }
-            Action::ClearTimeout(to, timeout) => match timeout {
-                Timeout::Election => {
-                    self.election_timeouts.insert(to, false).unwrap(); // previous id must exist
-                }
-                Timeout::Heartbeat(id) => {
-                    if let Some(timeouts) = self.heartbeat_timeouts.get_mut(&to).unwrap() {
-                        timeouts.insert(id, false);
-                    } else {
-                        let mut timeouts = HashMap::new();
-                        timeouts.insert(id, false);
-                        *self.heartbeat_timeouts.get_mut(&to).unwrap() = Some(timeouts);
-                    }
-                }
-            },
             Action::Client(from, to, msg) => {
-                todo!();
-                //                self.handler.cur = to;
-                //let node = self.nodes.get(&to).unwrap();
-                //node.apply_client_message(&mut self.handler, from, msg)
-                //.unwrap();
+                self.handler.cur = to;
+                trace!("{} -> {} client: {:?}", from, to, msg);
+                let node = self.nodes.get_mut(&to).unwrap();
+                node.apply_client_message(&mut self.handler, from, &msg)
+                    .unwrap();
             }
             Action::Admin(from, to, msg) => {
-                todo!();
-                //self.handler.cur = to;
-                //let node = self.nodes.get(&to).unwrap();
-                //node.apply_admin_message(&mut self.handler, from, msg)
-                //.unwrap();
+                self.handler.cur = to;
+                trace!("{} -> {}: admin {:?} ", from, to, msg);
+                let node = self.nodes.get_mut(&to).unwrap();
+                node.apply_admin_message(&mut self.handler, from, &msg)
+                    .unwrap();
             }
         }
         self.handler.reset_cur();
     }
 
-    pub fn asset_leader_condition(&self) {
-        let mut leaders = 0usize;
-        for node in self.nodes.values() {
-            if node.kind() == ConsensusState::Leader {
-                leaders += 1
+    pub fn assert_leader_condition(&mut self) {
+        let mut leaders = HashMap::new();
+
+        let admin_id = AdminId(uuid::Uuid::from_slice(&[0u8; 16]).unwrap());
+        for (id, node) in &mut self.nodes {
+            self.handler.cur = *id;
+            node.apply_admin_message(&mut self.handler, admin_id, &AdminMessage::PingRequest)
+                .unwrap();
+
+            let (_, queue) = self.handler.admin_network.iter_mut().next().unwrap();
+            let response = queue.pop_back().unwrap();
+            if let AdminMessage::PingResponse(response) = response {
+                let num_leaders = leaders.entry(response.term).or_insert(0usize);
+                if response.state == ConsensusState::Leader {
+                    *num_leaders += 1;
+                }
+            } else {
+                panic!("non ping request for ping response");
             }
-            assert!(leaders <= 1);
+            self.handler.reset_cur();
+        }
+
+        for n in leaders.values() {
+            if *n > 1 {
+                trace!("states: {:?}", self.nodes.values().collect::<Vec<_>>());
+            }
         }
     }
 
-    //fn apply_peer_messages(&mut self) {
-    //trace!("apply peer messages");
-    //let mut queue: VecDeque<(ServerId, ServerId, PeerMessage)> = VecDeque::new();
-    //let mut timeouts: HashMap<ServerId, HashSet<ConsensusTimeout>> = HashMap::new();
-    //let mut client_messages: HashMap<ClientId, Vec<ClientResponse>> = HashMap::new();
-    //for (peer, mut consensus) in self.peers.iter_mut() {
-    //for (to, messages) in consensus.handler.0.peer_messages.drain() {
-    //for message in messages.into_iter() {
-    //queue.push_back((peer.clone(), to, message));
-    //}
-    //}
+    pub fn assert_log_condition(&mut self) {
+        for (id, node) in &mut self.nodes {
+            let log = node.log();
+            let latest = log.latest_log_index().unwrap();
+            trace!("id={} log latest {}", id, latest);
+            for index in 1..(latest.as_u64() + 1) {
+                let mut log_entry = LogEntry::new_proposal(Term(0), Vec::new());
+                log.read_entry(LogIndex(index), &mut log_entry).unwrap();
+                trace!("id={} entry {:?}", id, log_entry);
+            }
+        }
+    }
 
-    //let mut entry = timeouts.entry(peer.clone()).or_insert(HashSet::new());
-
-    //for timeout in consensus.handler.0.timeouts.clone() {
-    //if let ConsensusTimeout::Election = timeout {
-    //entry.insert(timeout);
-    //}
-    //}
-
-    //client_messages.extend(consensus.handler.0.client_messages.clone());
-    //consensus.handler.clear();
-    //}
-    //trace!("Initial queue: {:?}", queue);
-    //while let Some((from, to, message)) = queue.pop_front() {
-    //let mut peer_consensus = self.peers.get_mut(&to).unwrap();
-    //peer_consensus.apply_peer_message(from, message).unwrap();
-    //for (to, messages) in peer_consensus.handler.0.peer_messages.drain() {
-    //for message in messages.into_iter() {
-    //queue.push_back((peer_consensus.inner.id.clone(), to, message));
-    //}
-    //}
-
-    //trace!("Queue: {:?}", queue);
-    //let mut entry = timeouts
-    //.entry(peer_consensus.inner.id.clone())
-    //.or_insert(HashSet::new());
-    //for timeout in peer_consensus.handler.0.timeouts.clone() {
-    //if let ConsensusTimeout::Election = timeout {
-    //entry.insert(timeout);
-    //}
-    //}
-
-    //client_messages.extend(peer_consensus.handler.0.client_messages.clone());
-    //peer_consensus.handler.clear();
-    //}
-    //(timeouts, client_messages)
-    //}
-
-    //fn into_peers(self) -> HashMap<ServerId, TestPeer> {
-    //self.peers
-    //}
-
-    //// Elect `leader` as the leader of a cluster with the provided followers.
-    //// The leader and the followers must be in the same term.
-    //fn elect_leader(&mut self, leader: ServerId) {
-    //{
-    //let leader_peer = self.peers.get_mut(&leader).unwrap();
-    //leader_peer
-    //.apply_timeout(ConsensusTimeout::Election)
-    //.unwrap();
-    //}
-    ////let client_messages = apply_actions(leader, actions, peers);
-    ////let client_messages = self.apply_peer_messages();
-    //self.apply_peer_messages();
-    //// TODO client messages
-    //// assert!(client_messages.is_empty());
-    //assert!(self.peers[&leader].is_leader());
-    //}
+    pub fn assert_machine_condition(&mut self) {
+        for (id, node) in &mut self.nodes {
+            let machine = node.state_machine();
+            let result = machine.query(&[]);
+            trace!("id={} state machine state: {:?}", id, result);
+        }
+    }
 }
 
 //// Tests that a consensus state machine with no peers will transitition immediately to the

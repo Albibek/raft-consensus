@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::marker::PhantomData;
 
-use log::{debug, info, trace};
+use log::{info, trace};
 
 use crate::state_machine::StateMachine;
 use crate::{
@@ -20,7 +20,7 @@ use crate::{LogIndex, Peer, ServerId, Term};
 
 use crate::follower::Follower;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct State<L, M, H, S>
 where
     L: Log,
@@ -141,6 +141,7 @@ where
         from: ConsensusState,
         leader_term: Term,
     ) -> Result<State<L, M, H, Follower>, Error> {
+        trace!("id={} transitioning to follower", self.id);
         handler.state_changed(from, ConsensusState::Follower);
 
         let mut follower_state = State {
@@ -178,17 +179,21 @@ where
         let candidate_term = request.term;
         let candidate_log_term = request.last_log_term;
         let candidate_log_index = request.last_log_index;
-        debug!(
-            "RequestVoteRequest from Consensus {{ id: {}, term: {}, latest_log_term: \
-             {}, latest_log_index: {} }}",
-            &from, candidate_term, candidate_log_term, candidate_log_index
+        trace!(
+            "RequestVoteRequest from id: {}, term: {}, latest_log_term: \
+             {}, latest_log_index: {}, self: {:?}",
+            &from,
+            candidate_term,
+            candidate_log_term,
+            candidate_log_index,
+            &from_state
         );
 
         let current_term = self.current_term()?;
         let (new_local_term, change_to_follower) = if candidate_term > current_term {
             info!(
-                "received RequestVoteRequest with newer term from Consensus {{ id: {}, term: {} }}; \
-                 transitioning to Follower",
+                "id={} received RequestVoteRequest with newer term from Consensus {{ id: {}, term: {} }}; \
+                 transitioning to Follower", self.id,
                  from, candidate_term
             );
 
@@ -208,9 +213,11 @@ where
             match self.with_log(|log| log.voted_for())? {
                 None => {
                     self.with_log_mut(|log| log.set_voted_for(Some(from)))?;
+                    trace!("granted vote to {}", from);
                     RequestVoteResponse::Granted(new_local_term)
                 }
                 Some(voted_for) => {
+                    trace!("found already voted for {}", voted_for);
                     if voted_for == from {
                         RequestVoteResponse::Granted(new_local_term)
                     } else {

@@ -8,7 +8,7 @@ struct Peer {
 struct Entry {
     term @0 :UInt64;
     union {
-        empty @1 :Void;
+        noop @1 :Void;
         proposal @2 :Data;
         config @3 :ConfigChangeEntry;
     }
@@ -33,6 +33,7 @@ struct PeerMessage {
 
         requestVoteRequest @2 :RequestVoteRequest;
         requestVoteResponse @3 :RequestVoteResponse;
+        timeoutNow @4 :Void;
     }
 
     struct AppendEntriesRequest {

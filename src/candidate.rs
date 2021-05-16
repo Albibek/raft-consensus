@@ -8,11 +8,12 @@ use crate::handler::Handler;
 use crate::leader::Leader;
 use crate::message::*;
 use crate::persistent_log::Log;
+use crate::persistent_log::{LogEntry, LogEntryData, LogEntryDataRef, LogEntryRef};
 use crate::raft::CurrentState;
 use crate::state::State;
 use crate::state_impl::StateImpl;
 use crate::state_machine::StateMachine;
-use crate::{ClientId, ServerId, Term};
+use crate::{AdminId, ClientId, ServerId, Term};
 
 impl<L, M, H> StateImpl<L, M, H> for State<L, M, H, Candidate>
 where
@@ -29,7 +30,14 @@ where
         let leader_term = request.term;
         let current_term = self.current_term()?;
 
-        if leader_term < current_term {
+        // previous term is not counted as stale, it can happen because of
+        // the delayed heartbeat from the leader, and it is ok because node
+        // can still see the leader
+        // if we count the request from previous term as a stale, the node
+        // that lost it's connection to leader (while other nodes did not),
+        // will become an eternal candidate, sending it's vote requests each election
+        // timeout even when connection comes back
+        if leader_term < current_term - 1 {
             return Ok((AppendEntriesResponse::StaleTerm(current_term), self.into()));
         }
 
@@ -112,8 +120,8 @@ where
                 self.state_data.record_vote(from);
                 if self.state_data.count_votes() >= majority {
                     info!(
-                        "election for term {} won; transitioning to Leader",
-                        local_term
+                        "id={} election for term {} won; transitioning to Leader",
+                        self.id, local_term
                     );
                     let new_state = self.into_leader(handler)?;
                     Ok(new_state.into())
@@ -126,13 +134,20 @@ where
         }
     }
 
+    fn timeout_now(self, _handler: &mut H) -> Result<CurrentState<L, M, H>, Error> {
+        info!("TimeoutNow on candidate ignored");
+        Ok(self.into())
+    }
+
     // Timeout handling
-    /// Handles heartbeat timeout event
+    // Handles heartbeat timeout event
     fn heartbeat_timeout(&mut self, _peer: ServerId) -> Result<AppendEntriesRequest, Error> {
         Err(Error::MustLeader)
     }
 
     fn election_timeout(mut self, handler: &mut H) -> Result<CurrentState<L, M, H>, Error> {
+        // election timeout is never down, but we want handler to radomize it
+        handler.set_timeout(Timeout::Election);
         if self.config.is_solitary(self.id) {
             // Solitary replica special case: we are the only peer in consensus
             // jump straight to Leader state.
@@ -145,7 +160,7 @@ where
             Ok(leader.into())
         } else {
             trace!("election timeout on candidate: restarting election");
-            self.start_election(handler)?;
+            self.start_election(handler, false)?;
             Ok(self.into())
         }
     }
@@ -159,15 +174,6 @@ where
         // voting process for one more election timeout
 
         Ok(())
-    }
-
-    // Configuration change messages
-    fn add_server_request(
-        &mut self,
-        _handler: &mut H,
-        _request: &AddServerRequest,
-    ) -> Result<ConfigurationChangeResponse, Error> {
-        Ok(ConfigurationChangeResponse::UnknownLeader)
     }
 
     /// Applies a client proposal to the consensus state machine.
@@ -186,6 +192,25 @@ where
         _request: &ClientRequest,
     ) -> ClientResponse {
         ClientResponse::UnknownLeader
+    }
+
+    // Configuration change messages
+    fn add_server_request(
+        &mut self,
+        _handler: &mut H,
+        _request: &AddServerRequest,
+    ) -> Result<ConfigurationChangeResponse, Error> {
+        Ok(ConfigurationChangeResponse::UnknownLeader)
+    }
+
+    fn step_down_request(
+        &mut self,
+        handler: &mut H,
+        from: AdminId,
+        request: Option<ServerId>,
+    ) -> Result<ConfigurationChangeResponse, Error> {
+        trace!("request to step down from {}", from);
+        Ok(ConfigurationChangeResponse::UnknownLeader)
     }
 
     fn ping_request(&self) -> Result<PingResponse, Error> {
@@ -230,8 +255,9 @@ where
         }
     }
 
-    pub(crate) fn start_election(&mut self, handler: &mut H) -> Result<(), Error> {
+    pub(crate) fn start_election(&mut self, handler: &mut H, voluntary: bool) -> Result<(), Error> {
         self.inc_current_term()?;
+        self.state_data.reset_votes(self.id);
         let id = self.id;
         self.with_log_mut(|log| log.set_voted_for(Some(id)))?;
         let last_log_term = self.latest_log_term()?;
@@ -240,7 +266,7 @@ where
             term: self.current_term()?,
             last_log_index: self.latest_log_index()?,
             last_log_term,
-            is_voluntary_step_down: false,
+            is_voluntary_step_down: voluntary,
         };
 
         self.config.with_remote_peers(&self.id, |id| {
@@ -254,17 +280,15 @@ where
 
     // Only candidates can transition to leader
     pub(crate) fn into_leader(self, handler: &mut H) -> Result<State<L, M, H, Leader>, Error> {
-        trace!("transitioning to leader");
+        trace!("id={} transitioning to leader", self.id);
         let latest_log_index = self.with_log(|log| log.latest_log_index())?;
-        let current_term = self.current_term()?;
-        let latest_log_term = self.latest_log_term()?;
         let commit_index = self.commit_index;
 
         handler.state_changed(ConsensusState::Candidate, ConsensusState::Leader);
 
         // transition to new state
         let state = Leader::new(latest_log_index, &self.config, &self.id);
-        let leader = State {
+        let mut leader = State {
             id: self.id,
             config: self.config,
             log: self.log,
@@ -276,15 +300,9 @@ where
             state_data: state,
         };
 
-        // send a ping to all peers
-        let message = AppendEntriesRequest {
-            term: current_term,
-            prev_log_index: latest_log_index,
-            prev_log_term: latest_log_term,
-            leader_commit: commit_index,
-            entries: Vec::new(),
-        };
+        let (_, message) = leader.add_new_entry(LogEntryDataRef::Empty)?;
 
+        // send a message wiht empty entry to all peers, this will work as heartbeat
         leader.config.with_remote_peers(&leader.id, |id| {
             handler.send_peer_message(*id, PeerMessage::AppendEntriesRequest(message.clone()));
             handler.set_timeout(Timeout::Heartbeat(*id));
@@ -298,7 +316,7 @@ where
 }
 
 /// The state associated with a Raft consensus module in the `Candidate` state.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Candidate {
     granted_votes: HashSet<ServerId>,
 }
@@ -312,12 +330,18 @@ impl Candidate {
     }
 
     /// Records a vote from `voter`.
-    pub(crate) fn record_vote(&mut self, voter: ServerId) {
+    pub fn record_vote(&mut self, voter: ServerId) {
         self.granted_votes.insert(voter);
     }
 
     /// Returns the number of votes.
-    pub(crate) fn count_votes(&self) -> usize {
+    pub fn count_votes(&self) -> usize {
         self.granted_votes.len()
+    }
+
+    /// Reset previous votes and vote for self
+    pub fn reset_votes(&mut self, this: ServerId) {
+        self.granted_votes.clear();
+        self.granted_votes.insert(this);
     }
 }

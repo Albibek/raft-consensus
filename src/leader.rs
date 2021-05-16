@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::error::*;
 use log::{debug, info, trace};
@@ -10,7 +10,7 @@ use crate::persistent_log::{LogEntry, LogEntryData, LogEntryDataRef, LogEntryRef
 use crate::raft::CurrentState;
 use crate::state::State;
 use crate::state_impl::StateImpl;
-use crate::{ClientId, LogIndex, Peer, ServerId, Term};
+use crate::{AdminId, ClientId, LogIndex, Peer, ServerId, Term};
 
 use crate::follower::Follower;
 use crate::persistent_log::Log;
@@ -102,6 +102,11 @@ where
                 self.state_data.set_next_index(from, *next_index)?;
             }
             AppendEntriesResponse::Success(_, follower_latest_log_index) => {
+                trace!(
+                    "follower OK, checking next entry: {} {}",
+                    *follower_latest_log_index,
+                    local_latest_log_index
+                );
                 if *follower_latest_log_index > local_latest_log_index {
                     // some follower has too high index in it's log
                     // it can only happen by mistake or incorrect log on a follower
@@ -185,9 +190,9 @@ where
             // The responder is not necessarily the leader, but it is somewhat likely, so we will
             // use it as the leader hint.
             info!(
-            "received RequestVoteResponse from {{ id: {}, term: {} }} with newer term; transitioning to follower",
-            from, voter_term
-        );
+                "received RequestVoteResponse from {{ id: {}, term: {} }} with newer term; transitioning to follower",
+                from, voter_term
+            );
             let follower = self.into_follower(handler, ConsensusState::Leader, voter_term)?;
             Ok(follower.into())
         } else {
@@ -199,9 +204,15 @@ where
         }
     }
 
+    fn timeout_now(self, _handler: &mut H) -> Result<CurrentState<L, M, H>, Error> {
+        info!("TimeoutNow on leader ignored");
+        Ok(self.into())
+    }
+
     // Timeout handling
     fn heartbeat_timeout(&mut self, peer: ServerId) -> Result<AppendEntriesRequest, Error> {
         debug!("heartbeat timeout for peer: {}", peer);
+        self.state_data.peers_alive.remove(&peer);
         Ok(AppendEntriesRequest {
             term: self.current_term()?,
             prev_log_index: self.latest_log_index()?,
@@ -212,6 +223,8 @@ where
     }
 
     fn election_timeout(mut self, handler: &mut H) -> Result<CurrentState<L, M, H>, Error> {
+        // election timeout is never down, but we want handler to radomize it
+        handler.set_timeout(Timeout::Election);
         if self.state_data.config_change.is_some() {
             if self.state_data.catching_up_timeout()? {
                 // have more timeouts left
@@ -219,10 +232,15 @@ where
                 //  no timeouts left for node
                 self.state_data.reset_config_change(handler);
             }
-            Ok(StateImpl::<L, M, H>::into_consensus_state(self))
+        }
+        if self.state_data.peers_alive.len() < self.config.majority(self.id) {
+            debug!("leader did not receive enough responses from followers, stepping down to avoid stale leadership");
+            let term = self.current_term()?;
+            Ok(CurrentState::Follower(
+                self.leader_into_follower(handler, term)?,
+            ))
         } else {
-            debug!("BUG: election timeout called on leader without catch up node");
-            return Err(Error::MustNotLeader);
+            Ok(self.into())
         }
     }
 
@@ -261,12 +279,41 @@ where
         Ok(())
     }
 
+    /// Applies a client proposal to the consensus state machine.
+    fn client_proposal_request(
+        &mut self,
+        handler: &mut H,
+        from: ClientId,
+        request: &ClientRequest,
+    ) -> Result<ClientResponse, Error> {
+        // append an entry to the log
+        let (log_index, message) =
+            self.add_new_entry(LogEntryDataRef::Proposal(request.data.as_slice()))?;
+
+        debug!("proposal request from client {}: entry {}", from, log_index);
+        self.state_data.proposals.push_back((from, log_index));
+        self.send_append_entries_request(handler, log_index, message)?;
+
+        Ok(ClientResponse::Queued)
+    }
+
+    fn client_query_request(&mut self, from: ClientId, request: &ClientRequest) -> ClientResponse {
+        // TODO: this is not totally safe because we don't implement RegisterClientRPC yet
+        // so messages can be duplicated
+        trace!("query from client {}", from);
+        let result = self.state_machine.query(request.data.as_slice());
+        ClientResponse::Success(result)
+    }
+
     // Configuration change messages
     fn add_server_request(
         &mut self,
         handler: &mut H,
         request: &AddServerRequest,
     ) -> Result<ConfigurationChangeResponse, Error> {
+        if true {
+            todo!("check if first empty entry has been committed by consensus, do not allow config change until it has");
+        }
         if self.state_data.config_change.is_some() {
             Ok(ConfigurationChangeResponse::AlreadyPending)
         } else {
@@ -297,30 +344,39 @@ where
         }
     }
 
-    /// Applies a client proposal to the consensus state machine.
-    fn client_proposal_request(
+    fn step_down_request(
         &mut self,
         handler: &mut H,
-        from: ClientId,
-        request: &ClientRequest,
-    ) -> Result<ClientResponse, Error> {
-        // append an entry to the log
-        let (log_index, message) =
-            self.add_new_entry(LogEntryDataRef::Proposal(request.data.as_slice()))?;
-
-        debug!("proposal request from client {}: entry {}", from, log_index);
-        self.state_data.proposals.push_back((from, log_index));
-        self.send_append_entries_request(handler, log_index, message)?;
-
-        Ok(ClientResponse::Queued)
-    }
-
-    fn client_query_request(&mut self, from: ClientId, request: &ClientRequest) -> ClientResponse {
-        // TODO: this is not totally safe because we don't implement RegisterClientRPC yet
-        // so messages can be duplicated
-        trace!("query from client {}", from);
-        let result = self.state_machine.query(request.data.as_slice());
-        ClientResponse::Success(result)
+        from: AdminId,
+        request: Option<ServerId>,
+    ) -> Result<ConfigurationChangeResponse, Error> {
+        trace!("request to step down from {}", from);
+        if let Some(id) = request {
+            if self.config.has_peer(id) {
+                handler.send_peer_message(id, PeerMessage::TimeoutNow);
+                Ok(ConfigurationChangeResponse::Started)
+            } else {
+                Ok(ConfigurationChangeResponse::BadPeer)
+            }
+        } else {
+            // when request does not specify the node to give up leader to,
+            // choose the node, where leader is more likely to be elected,
+            // ie. the one which log is ths closest to the leader
+            let mut sid = self.id;
+            let mut max_index = LogIndex(0);
+            for (id, index) in &self.state_data.match_index {
+                if *index > max_index {
+                    sid = *id;
+                    max_index = *index;
+                }
+            }
+            if sid == self.id {
+                Err(Error::unreachable(module_path!()))
+            } else {
+                handler.send_peer_message(sid, PeerMessage::TimeoutNow);
+                Ok(ConfigurationChangeResponse::Started)
+            }
+        }
     }
 
     fn ping_request(&self) -> Result<PingResponse, Error> {
@@ -357,13 +413,14 @@ where
                 self.commit_index = self.commit_index + 1;
                 trace!("commit index advanced to {}", self.commit_index);
             } else {
-                break; // If there isn't a majority now, there will non be one until next message
+                trace!("commit index not advanced: {}", self.commit_index);
+                return Ok(()); // If there isn't a majority now, there will non be one until next message
             }
         }
 
         // Being here means the commit index has advanced and we can confirm clients
         // that their proposals are committed
-        while self.last_applied <= self.commit_index {
+        while self.last_applied < self.commit_index {
             // so we read all committed entries and check if any of them have to be
             // replied to clients
             let mut entry = LogEntry::default();
@@ -375,14 +432,13 @@ where
                 LogEntryData::Empty => {}
                 LogEntryData::Proposal(data) => {
                     let result = self.state_machine.apply(&data, true);
-                    self.last_applied = self.last_applied + 1;
 
                     // As long as we know it, we've sent the connected clients the notification
                     // about their proposals being queued
                     //
                     // Client proposals may come not in the same order clients expect. For example, via parallel
-                    // TCP connectinos. The consensus though is only responsible for keeping the order of the
-                    // messages as they come in in it's own log on all nodes.
+                    // TCP connectinos. TODO: with linerability it will be possible to process
+                    // requests correctly
 
                     // the queued entries have to exist in the queue to be committed,
                     // so popping a wrong index means a bug
@@ -408,6 +464,7 @@ where
                     }
                 }
             }
+            self.last_applied = self.last_applied + 1;
         }
 
         Ok(())
@@ -420,18 +477,21 @@ where
         current_term: Term,
         local_latest_log_index: LogIndex,
     ) -> Result<Option<AppendEntriesRequest>, Error> {
-        // catching up peer is handled internally by state funtion
-        let next_index = self.state_data.next_index(&from)?;
+        let follower_last_index = if let Some(index) = self.state_data.match_index.get(&from) {
+            *index
+        } else {
+            return Err(Error::unreachable(module_path!()));
+        };
 
-        if next_index <= local_latest_log_index {
+        if follower_last_index < local_latest_log_index {
             // The peer is behind: send it entries to catch up.
             trace!(
                 "AppendEntriesResponse: peer {} is missing at least {} entries; \
                      sending missing entries",
                 from,
-                local_latest_log_index - next_index
+                local_latest_log_index - follower_last_index
             );
-            let prev_log_index = next_index - 1;
+            let prev_log_index = follower_last_index - 1;
             let prev_log_term = if prev_log_index == LogIndex(0) {
                 Term(0)
             } else {
@@ -448,7 +508,11 @@ where
                 leader_commit: self.commit_index,
             };
 
-            self.fill_entries(&mut message.entries, next_index, local_latest_log_index + 1)?;
+            self.fill_entries(
+                &mut message.entries,
+                follower_last_index,
+                local_latest_log_index + 1,
+            )?;
 
             self.state_data
                 .set_next_index(from, local_latest_log_index + 1)?;
@@ -494,7 +558,6 @@ where
                 let (log_index, message) = self.add_new_entry(LogEntryDataRef::Config(&config))?;
                 self.send_append_entries_request(handler, log_index, message)?;
 
-                handler.clear_timeout(Timeout::Election);
                 handler.set_timeout(Timeout::Heartbeat(from));
                 Ok(None)
             }
@@ -547,7 +610,7 @@ where
 
     /// appends a single entry to a leader's log obeying all the Raft rules (log indexing etc)
     /// returns a message ready to send to followers
-    fn add_new_entry<'a>(
+    pub(crate) fn add_new_entry<'a>(
         &mut self,
         entry_data: LogEntryDataRef<'a>,
     ) -> Result<(LogIndex, AppendEntriesRequest), Error> {
@@ -618,10 +681,11 @@ where
 }
 
 /// The state associated with a Raft consensus module in the `Leader` state.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Leader {
     next_index: HashMap<ServerId, LogIndex>,
     match_index: HashMap<ServerId, LogIndex>,
+    peers_alive: HashSet<ServerId>,
     /// stores pending config change making sure there can only be one at a time
     pub(crate) config_change: Option<ConfigChange>,
     /// Stores in-flight client proposals.
@@ -652,6 +716,7 @@ impl Leader {
         Leader {
             next_index,
             match_index,
+            peers_alive: HashSet::new(),
             config_change: None,
             proposals: VecDeque::new(),
         }
@@ -678,7 +743,6 @@ impl Leader {
                 //trace!("configuration change cancelled because of leader changing to follower");
                 // TODO: notify admin about cancelling
                 handler.clear_timeout(Timeout::Heartbeat(peer.id));
-                handler.clear_timeout(Timeout::Election);
             }
             Some(ConfigChange {
                 stage: ConfigChangeStage::Committing { .. },
@@ -832,7 +896,7 @@ pub(crate) enum CatchUpStatus {
     CaughtUp,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ConfigChangeStage {
     CatchingUp {
         index: LogIndex,
@@ -843,7 +907,7 @@ pub(crate) enum ConfigChangeStage {
     Committing(ConsensusConfig, LogIndex), // previous config
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ConfigChange {
     pub(crate) peer: Peer,
     pub(crate) stage: ConfigChangeStage,

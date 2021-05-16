@@ -3,4 +3,7 @@ pub mod hash_machine;
 pub mod raft;
 
 #[cfg(test)]
-mod general;
+mod green;
+
+#[cfg(test)]
+mod errors;

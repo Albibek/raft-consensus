@@ -23,13 +23,14 @@ use crate::{LogIndex, Peer, ServerId, Term};
 /// Module contains all messages required for consensus' peer message API
 
 #[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 /// Any message that cluster peers can exchange
 pub enum PeerMessage {
     AppendEntriesRequest(AppendEntriesRequest),
     AppendEntriesResponse(AppendEntriesResponse),
     RequestVoteRequest(RequestVoteRequest),
     RequestVoteResponse(RequestVoteResponse),
+    TimeoutNow,
 }
 
 #[cfg(feature = "use_capnp")]
@@ -48,6 +49,7 @@ impl PeerMessage {
             peer_message::Which::RequestVoteResponse(message) => {
                 Ok(RequestVoteResponse::from_capnp(message?)?.into())
             }
+            peer_message::Which::TimeoutNow(()) => Ok(PeerMessage::TimeoutNow),
         }
     }
 
@@ -69,13 +71,16 @@ impl PeerMessage {
                 let mut builder = builder.reborrow().init_request_vote_response();
                 message.fill_capnp(&mut builder);
             }
+            &PeerMessage::TimeoutNow => {
+                builder.reborrow().set_timeout_now(());
+            }
         };
     }
 
     common_capnp!(peer_message::Builder, peer_message::Reader);
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
 /// Request for Raft AppendEntriesRPC
 pub struct AppendEntriesRequest {
@@ -147,7 +152,7 @@ impl AppendEntriesRequest {
 /// Type representing a part of the AppendEntriesRequest message.
 /// It not the same type as a LogEntry, because of additional fields (like config activeness flag)
 /// and may become more different in future.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
 pub struct Entry {
     pub term: Term,
@@ -162,11 +167,11 @@ impl Entry {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
 pub enum EntryData {
     /// An empty entry, which is added to every node's log at the beginning of each term
-    Empty,
+    Noop,
     /// A client proposal that should be provided to the state machine
     Proposal(Vec<u8>),
     /// A configuration change with an flag showing if it is active
@@ -178,7 +183,7 @@ impl Entry {
         LogEntryRef {
             term: self.term,
             data: match self.data {
-                EntryData::Empty => LogEntryDataRef::Empty,
+                EntryData::Noop => LogEntryDataRef::Empty,
                 EntryData::Proposal(ref v) => LogEntryDataRef::Proposal(v.as_slice()),
                 EntryData::Config(ref c, _) => LogEntryDataRef::Config(c),
             },
@@ -190,7 +195,7 @@ impl Entry {
 impl Entry {
     pub fn from_capnp<'a>(reader: entry::Reader<'a>) -> Result<Self, Error> {
         let data = match reader.which()? {
-            entry::Which::Empty(()) => EntryData::Empty,
+            entry::Which::Noop(()) => EntryData::Noop,
             entry::Which::Proposal(reader) => EntryData::Proposal(reader?.to_vec()),
             entry::Which::Config(reader) => {
                 let reader = reader?;
@@ -219,7 +224,7 @@ impl Entry {
     pub fn fill_capnp<'a>(&self, builder: &mut entry::Builder<'a>) {
         builder.set_term(self.term.as_u64());
         match self.data {
-            EntryData::Empty => builder.set_empty(()),
+            EntryData::Noop => builder.set_noop(()),
             EntryData::Proposal(ref data) => builder.set_proposal(data),
             EntryData::Config(ref config, ref is_actual) => {
                 let mut config_builder = builder.reborrow().init_config();
@@ -240,7 +245,7 @@ impl Entry {
     common_capnp!(entry::Builder, entry::Reader);
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
 /// Response for Raft AppendEntriesRPC
 pub enum AppendEntriesResponse {
@@ -300,7 +305,7 @@ impl AppendEntriesResponse {
     );
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
 /// Request for Raft voting RPC
 pub struct RequestVoteRequest {
@@ -345,7 +350,7 @@ impl RequestVoteRequest {
     common_capnp!(request_vote_request::Builder, request_vote_request::Reader);
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
 /// Response for Raft voting RPC
 pub enum RequestVoteResponse {
@@ -448,7 +453,7 @@ mod test {
             entries: vec![
                 Entry {
                     term: 9.into(),
-                    data: EntryData::Empty,
+                    data: EntryData::Noop,
                 },
                 Entry {
                     term: 9.into(),

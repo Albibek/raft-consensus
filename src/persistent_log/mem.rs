@@ -3,10 +3,11 @@ use crate::persistent_log::{
     Error, Log, LogEntry, LogEntryData, LogEntryDataRef, LogEntryRef, LogError,
 };
 use crate::{LogIndex, ServerId, Term};
+use log::trace;
 
 /// This is a `Log` implementation that stores entries in a simple in-memory vector. Other data
 /// is stored in a struct. It is chiefly intended for testing.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MemLog {
     current_term: Term,
     voted_for: Option<ServerId>,
@@ -63,18 +64,22 @@ impl Log for MemLog {
     }
 
     fn term_of(&self, index: LogIndex) -> Result<Option<Term>, Self::Error> {
+        if index == LogIndex(0) {
+            return Ok(Some(Term(0)));
+        }
         self.entries
             .get((index - 1).as_u64() as usize)
             .map(|entry| Some(entry.term))
-            .ok_or(LogError::BadIndex)
+            .ok_or(LogError::BadIndex(index))
     }
 
     fn read_entry(&self, index: LogIndex, dest: &mut LogEntry) -> Result<(), Self::Error> {
         self.entries
             .get((index - 1).as_u64() as usize)
             .map(|entry| *dest = entry.clone())
-            .ok_or(LogError::BadIndex)
+            .ok_or(LogError::BadIndex(index))
     }
+
     /// Must append an entry to the log
     fn append_entry<'a>(
         &mut self,
@@ -86,7 +91,7 @@ impl Log for MemLog {
         }
 
         let start = (at - 1).as_u64() as usize;
-        if self.entries.len() < start + 1 {
+        if self.entries.len() < start {
             return Err(LogError::BadLogIndex);
         } else {
             self.entries.truncate(start);
@@ -108,6 +113,7 @@ mod test {
 
     use super::*;
 
+    // TODO test not filling logindex(0) and term(0) because log indexes start from 1
     /*
            use crate::persistent_log::{append_entries, get_entry, Log};
 

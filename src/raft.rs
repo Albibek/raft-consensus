@@ -1,5 +1,7 @@
 use std::{marker::PhantomData, mem};
 
+use log::trace;
+
 use crate::error::{CriticalError, Error};
 use crate::handler::Handler;
 use crate::message::*;
@@ -120,6 +122,7 @@ where
             state_data: Follower::new(can_vote),
             _h: PhantomData,
         };
+        trace!("raft id={} initialized", id);
         Ok(Raft {
             state: state.into(),
             _h: PhantomData,
@@ -136,7 +139,7 @@ where
 // This structure is just a facade, hiding the internal state transitions from the caller.
 // At the same time all the internal convenience and requirements like StateImpl correctness is
 // left intact and mofifiable
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Raft<L, M, H>
 where
     L: Log,
@@ -230,7 +233,7 @@ where
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum CurrentState<L, M, H>
 where
     L: Log,

@@ -17,7 +17,7 @@ use crate::{LogIndex, ServerId, Term};
 /// they are only differentiated at the level of `ClientMessage` enum, being same internally
 
 #[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 /// Any message related to client requests and responses
 pub enum ClientMessage {
     ClientProposalRequest(ClientRequest),
@@ -52,14 +52,14 @@ impl ClientMessage {
     //common_capnp!(client_request::Builder, client_request::Reader);
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
 /// Response to client command
 pub struct ClientRequest {
     pub data: Vec<u8>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
 /// Response to client command
 pub enum ClientResponse {

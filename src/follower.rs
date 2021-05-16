@@ -12,7 +12,7 @@ use crate::raft::CurrentState;
 use crate::state::State;
 use crate::state_impl::StateImpl;
 use crate::state_machine::StateMachine;
-use crate::{ClientId, LogIndex, Peer, ServerId, Term};
+use crate::{AdminId, ClientId, LogIndex, Peer, ServerId, Term};
 
 use crate::candidate::Candidate;
 
@@ -141,6 +141,11 @@ where
         }
     }
 
+    fn timeout_now(self, handler: &mut H) -> Result<CurrentState<L, M, H>, Error> {
+        let candidate = self.into_candidate(handler, true)?;
+        Ok(candidate.into())
+    }
+
     // Timeout handling
     /// Handles heartbeat timeout event
     fn heartbeat_timeout(&mut self, _peer: ServerId) -> Result<AppendEntriesRequest, Error> {
@@ -152,6 +157,10 @@ where
             // non voters should not set election timeout
             return Err(Error::unreachable(module_path!()));
         }
+
+        // election timeout is never down, but we want handler to radomize it
+        // TODO: probably make this an option
+        handler.set_timeout(Timeout::Election);
         if let Some((from, ref request)) = self.state_data.delayed_vote_request.take() {
             // Since voting has started already, we must process the delayed vote request.
             // For the node this means it has to vote for another candidate instead of itself
@@ -176,7 +185,7 @@ where
 
             if become_candidate {
                 if let CurrentState::Follower(new_state) = new_state {
-                    let candidate = new_state.into_candidate(handler)?;
+                    let candidate = new_state.into_candidate(handler, false)?;
                     Ok(candidate.into())
                 } else {
                     Err(Error::unreachable(module_path!()))
@@ -185,7 +194,7 @@ where
                 Ok(new_state)
             }
         } else {
-            let candidate = self.into_candidate(handler)?;
+            let candidate = self.into_candidate(handler, false)?;
             let maybe_leader = candidate.try_solitary_leader(handler)?;
             Ok(maybe_leader.into())
         }
@@ -195,20 +204,6 @@ where
     fn peer_connected(&mut self, _handler: &mut H, _peer: ServerId) -> Result<(), Error> {
         // followers don't send messages, so they don't care about other peers' connections
         Ok(())
-    }
-
-    // Configuration change messages
-    fn add_server_request(
-        &mut self,
-        _handler: &mut H,
-        _request: &AddServerRequest,
-    ) -> Result<ConfigurationChangeResponse, Error> {
-        self.state_data
-            .leader
-            .map_or(Ok(ConfigurationChangeResponse::UnknownLeader), |leader| {
-                Ok(ConfigurationChangeResponse::NotLeader(leader))
-            })
-        //TODO: Proxy a command to leader if it is known
     }
 
     /// Applies a client proposal to the consensus state machine.
@@ -234,6 +229,33 @@ where
             .leader
             .map_or(ClientResponse::UnknownLeader, |leader| {
                 ClientResponse::NotLeader(leader)
+            })
+    }
+
+    // Admin messages
+    fn add_server_request(
+        &mut self,
+        _handler: &mut H,
+        _request: &AddServerRequest,
+    ) -> Result<ConfigurationChangeResponse, Error> {
+        self.state_data
+            .leader
+            .map_or(Ok(ConfigurationChangeResponse::UnknownLeader), |leader| {
+                Ok(ConfigurationChangeResponse::NotLeader(leader))
+            })
+    }
+
+    fn step_down_request(
+        &mut self,
+        handler: &mut H,
+        from: AdminId,
+        request: Option<ServerId>,
+    ) -> Result<ConfigurationChangeResponse, Error> {
+        trace!("query from client {}", from);
+        self.state_data
+            .leader
+            .map_or(Ok(ConfigurationChangeResponse::UnknownLeader), |leader| {
+                Ok(ConfigurationChangeResponse::NotLeader(leader))
             })
     }
 
@@ -360,21 +382,26 @@ where
                 LogEntryData::Empty => {}
                 LogEntryData::Proposal(data) => {
                     let _ = self.state_machine.apply(&data, false);
-                    self.last_applied = self.last_applied + 1;
                 }
                 LogEntryData::Config(_) => {
                     // this is the committing stage so far, there is no need to do anything
                     // with the configuration entries at this point
                 }
             }
+
+            self.last_applied = self.last_applied + 1;
         }
 
         Ok(())
     }
 
-    fn into_candidate(self, handler: &mut H) -> Result<State<L, M, H, Candidate>, Error> {
+    fn into_candidate(
+        self,
+        handler: &mut H,
+        voluntary: bool,
+    ) -> Result<State<L, M, H, Candidate>, Error> {
+        trace!("id={} transitioning to candidate", self.id);
         let mut state_data = Candidate::new();
-        state_data.record_vote(self.id);
         let mut candidate = State {
             id: self.id,
             config: self.config,
@@ -388,13 +415,13 @@ where
         };
 
         handler.state_changed(ConsensusState::Follower, ConsensusState::Candidate);
-        candidate.start_election(handler)?;
+        candidate.start_election(handler, voluntary)?;
         Ok(candidate)
     }
 }
 
 /// The state associated with a Raft consensus module in the `Follower` state.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Follower {
     /// The most recent leader of the follower. The leader is not guaranteed to be active, so this
     /// should only be used as a hint.

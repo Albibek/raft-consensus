@@ -50,7 +50,10 @@ where
         PeerMessage::RequestVoteResponse(response) => {
             // request vote response does not produce new requests, but may produce new state
             let new = s.request_vote_response(handler, from, response)?;
-            //(None, new)
+            Ok(new)
+        }
+        PeerMessage::TimeoutNow => {
+            let new = s.timeout_now(handler)?;
             Ok(new)
         }
     }
@@ -134,7 +137,7 @@ where
             Ok(())
         }
         AdminMessage::AddServerResponse(_) => {
-            // TODO: message proxying
+            todo!("implement add_server proxying");
             Ok(())
         }
         AdminMessage::RemoveServerRequest(_) => {
@@ -143,14 +146,16 @@ where
         AdminMessage::RemoveServerResponse(_) => {
             todo!("implement removal");
         }
-        AdminMessage::StepDownRequest(_) => {
-            todo!("implement step down");
+        AdminMessage::StepDownRequest(request) => {
+            let message = s.step_down_request(handler, from, *request)?;
+            handler.send_admin_message(from, AdminMessage::StepDownResponse(message));
+            Ok(())
         }
-        AdminMessage::StepDownResponse(_) => {
-            todo!("implement step down");
+        AdminMessage::StepDownResponse(request) => {
+            todo!("implement step down proxying");
         }
         AdminMessage::PingResponse(_) => {
-            // TODO: message proxying
+            todo!("implement ping proxying");
             Ok(())
         }
     }
@@ -173,10 +178,7 @@ where
         request: &AppendEntriesRequest,
     ) -> Result<(AppendEntriesResponse, CurrentState<L, M, H>), Error>;
 
-    /// Apply an append entries response to the consensus state machine.
-    ///
-    /// The provided message may be initialized with a new AppendEntries request to send back to
-    /// the follower in the case that the follower's log is behind.
+    /// Apply an append entries response to the consensus.
     fn append_entries_response(
         self,
         handler: &mut H,
@@ -186,7 +188,7 @@ where
 
     ///////////////////////////
     // RequestVoteRPC
-    /// Applies a peer request vote request to the consensus state machine.
+    /// Applies a peer request vote request to the consensus.
     fn request_vote_request(
         self,
         handler: &mut H,
@@ -194,13 +196,16 @@ where
         request: &RequestVoteRequest,
     ) -> Result<(Option<RequestVoteResponse>, CurrentState<L, M, H>), Error>;
 
-    /// Applies a request vote response to the consensus state machine.
+    /// Applies a request vote response to the consensus.
     fn request_vote_response(
         self,
         handler: &mut H,
         from: ServerId,
         response: &RequestVoteResponse,
     ) -> Result<CurrentState<L, M, H>, Error>;
+
+    /// Applies a preliminary timeout response to the consensus
+    fn timeout_now(self, handler: &mut H) -> Result<CurrentState<L, M, H>, Error>;
 
     ///////////////////////////
     // Timeouts
@@ -243,11 +248,12 @@ where
     //request: &RemoveServerRequest,
     //) -> Result<ConfigurationChangeResponse, Error>;
 
-    //    fn step_down_request(
-    //&mut self,
-    //handler: &mut H,
-    //request: &RemoveServerRequest,
-    //) -> Result<ConfigurationChangeResponse, Error>;
+    fn step_down_request(
+        &mut self,
+        handler: &mut H,
+        from: AdminId,
+        request: Option<ServerId>,
+    ) -> Result<ConfigurationChangeResponse, Error>;
 
     // Utility messages and actions
     fn peer_connected(&mut self, handler: &mut H, peer: ServerId) -> Result<(), Error>;
