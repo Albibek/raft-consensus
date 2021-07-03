@@ -33,7 +33,7 @@ where
             // response may produce a new request as an answer
             let (request, new) = s.append_entries_response(handler, from, response)?;
             if let Some(message) = request {
-                handler.send_peer_message(from, PeerMessage::AppendEntriesRequest(message));
+                handler.send_peer_message(from, message);
             }
             Ok(new)
         }
@@ -55,6 +55,12 @@ where
         PeerMessage::TimeoutNow => {
             let new = s.timeout_now(handler)?;
             Ok(new)
+        }
+        PeerMessage::InstallSnapshotRequest(_) => {
+            todo!("snapshot request")
+        }
+        PeerMessage::InstallSnapshotResponse(_) => {
+            todo!("snapshot response")
         }
     }
 }
@@ -184,7 +190,7 @@ where
         handler: &mut H,
         from: ServerId,
         response: &AppendEntriesResponse,
-    ) -> Result<(Option<AppendEntriesRequest>, CurrentState<L, M, H>), Error>;
+    ) -> Result<(Option<PeerMessage>, CurrentState<L, M, H>), Error>;
 
     ///////////////////////////
     // RequestVoteRPC
@@ -207,6 +213,22 @@ where
     /// Applies a preliminary timeout response to the consensus
     fn timeout_now(self, handler: &mut H) -> Result<CurrentState<L, M, H>, Error>;
 
+    /// Apply an append entries request to the consensus state machine.
+    fn install_snapshot_request(
+        self,
+        handler: &mut H,
+        from: ServerId,
+        request: &InstallSnapshotRequest,
+    ) -> Result<(InstallSnapshotResponse, CurrentState<L, M, H>), Error>;
+
+    /// Apply an append entries response to the consensus.
+    fn install_snapshot_response(
+        self,
+        handler: &mut H,
+        from: ServerId,
+        response: &InstallSnapshotResponse,
+    ) -> Result<(Option<PeerMessage>, CurrentState<L, M, H>), Error>;
+
     ///////////////////////////
     // Timeouts
     ///////////////////////////
@@ -215,6 +237,7 @@ where
     fn heartbeat_timeout(&mut self, peer: ServerId) -> Result<AppendEntriesRequest, Error>;
     fn election_timeout(self, handler: &mut H) -> Result<CurrentState<L, M, H>, Error>;
 
+    fn check_compaction(&mut self, handler: &mut H, force: bool) -> Result<bool, Error>;
     ///////////////////////////
     // Client RPC messages
     ///////////////////////////
@@ -228,7 +251,11 @@ where
     ) -> Result<ClientResponse, Error>;
 
     // Requests some client state from the state machine handled by consensus
-    fn client_query_request(&mut self, from: ClientId, request: &ClientRequest) -> ClientResponse;
+    fn client_query_request(
+        &mut self,
+        from: ClientId,
+        request: &ClientRequest,
+    ) -> Result<ClientResponse, Error>;
 
     ///////////////////////////
     // Administration RPC

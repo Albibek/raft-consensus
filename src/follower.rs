@@ -7,12 +7,12 @@ use log::{debug, info, trace};
 use crate::handler::Handler;
 use crate::message::*;
 use crate::persistent_log::Log;
-use crate::persistent_log::{LogEntry, LogEntryData, LogEntryDataRef, LogEntryRef};
+use crate::persistent_log::{LogEntry, LogEntryData};
 use crate::raft::CurrentState;
 use crate::state::State;
 use crate::state_impl::StateImpl;
 use crate::state_machine::StateMachine;
-use crate::{AdminId, ClientId, LogIndex, Peer, ServerId, Term};
+use crate::{AdminId, ClientId, LogIndex, ServerId, Term};
 
 use crate::candidate::Candidate;
 
@@ -57,7 +57,7 @@ where
         _handler: &mut H,
         _from: ServerId,
         _response: &AppendEntriesResponse,
-    ) -> Result<(Option<AppendEntriesRequest>, CurrentState<L, M, H>), Error> {
+    ) -> Result<(Option<PeerMessage>, CurrentState<L, M, H>), Error> {
         // the follower can only receive responses in case the node was a leader some time ago
         // and sent requests which triggered the reponse while response was held somewhere in network
         //
@@ -146,6 +146,24 @@ where
         Ok(candidate.into())
     }
 
+    fn install_snapshot_request(
+        self,
+        handler: &mut H,
+        from: ServerId,
+        request: &InstallSnapshotRequest,
+    ) -> Result<(InstallSnapshotResponse, CurrentState<L, M, H>), Error> {
+        todo!()
+    }
+
+    fn install_snapshot_response(
+        self,
+        handler: &mut H,
+        from: ServerId,
+        response: &InstallSnapshotResponse,
+    ) -> Result<(Option<PeerMessage>, CurrentState<L, M, H>), Error> {
+        todo!()
+    }
+
     // Timeout handling
     /// Handles heartbeat timeout event
     fn heartbeat_timeout(&mut self, _peer: ServerId) -> Result<AppendEntriesRequest, Error> {
@@ -200,10 +218,8 @@ where
         }
     }
 
-    // Utility messages and actions
-    fn peer_connected(&mut self, _handler: &mut H, _peer: ServerId) -> Result<(), Error> {
-        // followers don't send messages, so they don't care about other peers' connections
-        Ok(())
+    fn check_compaction(&mut self, _handler: &mut H, __force: bool) -> Result<bool, Error> {
+        self.common_check_compaction(true)
     }
 
     /// Applies a client proposal to the consensus state machine.
@@ -220,16 +236,25 @@ where
             })
     }
 
-    fn client_query_request(&mut self, from: ClientId, _request: &ClientRequest) -> ClientResponse {
+    fn client_query_request(
+        &mut self,
+        from: ClientId,
+        _request: &ClientRequest,
+    ) -> Result<ClientResponse, Error> {
         // TODO: introduce an option for allowing the response from the potentially
         // older state of the machine
         // With such option it could be possible to reply the machine on the follower
         trace!("query from client {}", from);
-        self.state_data
+        Ok(self
+            .state_data
             .leader
             .map_or(ClientResponse::UnknownLeader, |leader| {
                 ClientResponse::NotLeader(leader)
-            })
+            }))
+    }
+
+    fn ping_request(&self) -> Result<PingResponse, Error> {
+        self.common_client_ping_request(ConsensusState::Follower)
     }
 
     // Admin messages
@@ -247,9 +272,9 @@ where
 
     fn step_down_request(
         &mut self,
-        handler: &mut H,
+        _handler: &mut H,
         from: AdminId,
-        request: Option<ServerId>,
+        _request: Option<ServerId>,
     ) -> Result<ConfigurationChangeResponse, Error> {
         trace!("query from client {}", from);
         self.state_data
@@ -259,8 +284,10 @@ where
             })
     }
 
-    fn ping_request(&self) -> Result<PingResponse, Error> {
-        self.common_client_ping_request(ConsensusState::Follower)
+    // Utility messages and actions
+    fn peer_connected(&mut self, _handler: &mut H, _peer: ServerId) -> Result<(), Error> {
+        // followers don't send messages, so they don't care about other peers' connections
+        Ok(())
     }
 
     fn into_consensus_state(self) -> CurrentState<L, M, H> {
@@ -317,7 +344,7 @@ where
             // If an existing entry conflicts with a new one (same index but different terms),
             // delete the existing entry and all that follow it
 
-            self.with_log_mut(|log| log.discard_log_since(leader_prev_log_index))?;
+            self.with_log_mut(|log| log.discard_since(leader_prev_log_index))?;
 
             // TODO we could send a hint to a leader about existing index, so leader
             // could send the entries starting from this index instead of decrementing it each time
@@ -381,7 +408,10 @@ where
             match entry.data {
                 LogEntryData::Empty => {}
                 LogEntryData::Proposal(data) => {
-                    let _ = self.state_machine.apply(&data, false);
+                    let _ = self
+                        .state_machine
+                        .apply(&data, false)
+                        .map_err(|e| Error::Critical(CriticalError::StateMachine(Box::new(e))))?;
                 }
                 LogEntryData::Config(_) => {
                     // this is the committing stage so far, there is no need to do anything
@@ -401,7 +431,7 @@ where
         voluntary: bool,
     ) -> Result<State<L, M, H, Candidate>, Error> {
         trace!("id={} transitioning to candidate", self.id);
-        let mut state_data = Candidate::new();
+        let state_data = Candidate::new();
         let mut candidate = State {
             id: self.id,
             config: self.config,

@@ -9,6 +9,7 @@
 
 // reimports
 
+// TODO: feature gate all types of logs
 //FIXME
 //pub mod fs;
 pub mod mem;
@@ -30,30 +31,20 @@ use serde::{Deserialize, Serialize};
 
 use thiserror::Error as ThisError;
 
-/// A layer of persistence to store Raft state data.
-/// Should implement storing a few specific values, like current_term or voted_for
-/// along with the general-purpose log storage for appending raft log entries.
-// Since the trait is to be implemented externally, we want to keep the API clean and small as possible
-// while solving typical cases using external generic helpers
+/// A layer of persistence to store Raft log and state data.
+/// Should implement general-purpose log storage for appending raft log entries
+/// along with storing iseveral specific values, like voted_for, current cluster configuration
+// TODO store or a list of registered clients?
 pub trait Log {
-    // FIXME: snapshot should probably be guided by leader(using snapshot flag for example), so all the nodes could have
-    // the snapshot at same point in time (QUESTION: it may not be nesessary actually)
-
     type Error: std::error::Error + Sized + 'static;
 
-    // Terms and log indexes
+    //  Logging related persistent functions
 
-    /// Returns the latest known term.
-    fn current_term(&self) -> Result<Term, Self::Error>;
-
-    /// Sets the current term to the provided value. The provided term must be greater than
-    /// the current term.
-    // Must also reset the `voted_for` value.
-    // TODO: introduce reset_voted_for, to take the burden from the implementor
-    fn set_current_term(&mut self, term: Term) -> Result<(), Self::Error>;
-
-    /// Returns the index of the latest persisted log entry (0 if the log is empty).
+    /// Should return the index of the latest persisted log entry (0 if the log is empty).
     fn latest_log_index(&self) -> Result<LogIndex, Self::Error>;
+
+    /// Should return the index of the first persisted log entry (0 if the log is empty).
+    fn first_log_index(&self) -> Result<LogIndex, Self::Error>;
 
     /// Should return term corresponding to log index if such term and index exists in log
     /// Shoult NOT return an error on non-existence
@@ -61,29 +52,19 @@ pub trait Log {
 
     /// Delete or mark invalid all entries since specified log index
     /// return the new index. It is allowed to return any index lower than requested
-    fn discard_log_since(&mut self, index: LogIndex) -> Result<LogIndex, Self::Error>;
+    fn discard_since(&mut self, index: LogIndex) -> Result<LogIndex, Self::Error>;
 
-    // Voted-for persistence
-    /// Returns the candidate id of the candidate voted for in the current term (or none).
-    fn voted_for(&self) -> Result<Option<ServerId>, Self::Error>;
-
-    /// Sets the candidate id the node voted for in the current term.
-    /// None means voted_for should be unset
-    fn set_voted_for(&mut self, server: Option<ServerId>) -> Result<(), Self::Error>;
-
-    /// Should return the index of a latest config entry, if any. LogIndex(0) is considered
-    /// equal to no config.
-    fn latest_config_index(&self) -> Result<Option<LogIndex>, Self::Error>;
-
-    // Configuration related functions
-    /// Must put the latest (actual for the current term) config into config provided rerefence
-    //fn read_latest_config(&self, config: &mut ConsensusConfig) -> Result<LogIndex, Self::Error>;
+    /// Should discard all entries until specified index (including the entry at `index`).
+    /// Should return the new first index, index should be less or equal to the requested
+    fn discard_until(&self, index: LogIndex) -> Result<LogIndex, Self::Error>;
 
     /// Reads the entry at the provided log index into an entry provided by reference
     fn read_entry(&self, index: LogIndex, dest: &mut LogEntry) -> Result<(), Self::Error>;
 
     /// Must append an entry to the log. If the index in the log is earlier, than requested,
     /// the log must be truncated so the added entry always being the last one, with no gaps.
+    /// Is not required for this function to save a config entries, if any pass by. This will be
+    /// done separately to make sure only committed configuration is persisted.
     /// The caller(i.e. the consensus) will check for the gaps, so they should not actually happen.
     /// NOTE: log indexes in Raft start with 1 (0 is reserved as special), this function should consider this
     fn append_entry<'a>(
@@ -91,6 +72,35 @@ pub trait Log {
         at: LogIndex,
         entry: &LogEntryRef<'a>,
     ) -> Result<(), Self::Error>;
+
+    /// Returns the latest known term.
+    fn current_term(&self) -> Result<Term, Self::Error>;
+
+    /// Sets the current term to the provided value. The provided term must be greater than
+    /// the current term.
+    fn set_current_term(&mut self, term: Term) -> Result<(), Self::Error>;
+
+    // Voting related persistence
+    /// Returns the candidate id of the candidate voted for in the current term (or none).
+    fn voted_for(&self) -> Result<Option<ServerId>, Self::Error>;
+
+    /// Sets the candidate id the node voted for in the current term.
+    /// None means voted_for should be unset
+    fn set_voted_for(&mut self, server: Option<ServerId>) -> Result<(), Self::Error>;
+
+    // Config pesistence
+    /// Should persist the provided configuration and it's index for later retrieval.
+    fn set_latest_config(
+        &mut self,
+        config: &ConsensusConfig,
+        index: LogIndex,
+    ) -> Result<(), Self::Error>;
+
+    /// Should return the latest saved config entry if any.
+    fn latest_config(&self) -> Result<Option<ConsensusConfig>, Self::Error>;
+
+    /// Should return the index of latest saved config entry if any.
+    fn latest_config_index(&self) -> Result<Option<LogIndex>, Self::Error>;
 }
 
 /// The record to be added into log

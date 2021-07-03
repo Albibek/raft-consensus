@@ -2,23 +2,17 @@
 use serde::{Deserialize, Serialize};
 use std::iter::FromIterator;
 
-#[cfg(feature = "use_capnp")]
-use capnp::message::{Allocator, Builder, HeapAllocator, Reader, ReaderSegments};
-
-//#[cfg(feature = "use_capnp")]
-//use crate::messages_capnp::{entry as entry_capnp, entry_data};
-
 use crate::error::Error;
 use crate::message::Timeout;
 
-use crate::{ClientId, LogIndex, Peer, ServerId, Term};
+use crate::{LogIndex, Peer, ServerId, Term};
 
 pub use crate::handler::Handler;
 pub use crate::persistent_log::Log;
 pub use crate::state_machine::StateMachine;
 
-// An interface to full cluster config, that always stores all
-// nodes, including self, but always requires
+/// Full cluster config. Always stores all
+/// nodes, including self.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 #[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
 pub struct ConsensusConfig {
@@ -63,7 +57,7 @@ impl ConsensusConfig {
         }
     }
 
-    /// Get the cluster quorum majority size.
+    // Get the cluster quorum majority size.
     pub(crate) fn majority(&self, this: ServerId) -> usize {
         let peers = self.peers.len();
         // paper 4.2.2: node shoult not include itself to majority if it is

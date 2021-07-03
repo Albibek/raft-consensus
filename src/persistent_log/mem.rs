@@ -12,7 +12,7 @@ pub struct MemLog {
     current_term: Term,
     voted_for: Option<ServerId>,
     entries: Vec<LogEntry>,
-    latest_config_index: Option<u64>,
+    latest_config: Option<(ConsensusConfig, LogIndex)>,
 }
 
 impl MemLog {
@@ -21,7 +21,7 @@ impl MemLog {
             current_term: Term(0),
             voted_for: None,
             entries: Vec::new(),
-            latest_config_index: None,
+            latest_config: None,
         }
     }
 }
@@ -29,38 +29,12 @@ impl MemLog {
 impl Log for MemLog {
     type Error = LogError;
 
-    fn current_term(&self) -> Result<Term, Self::Error> {
-        Ok(self.current_term)
-    }
-
-    fn set_current_term(&mut self, term: Term) -> Result<(), Self::Error> {
-        self.voted_for = None;
-        self.current_term = term;
-        Ok(())
-    }
-
-    fn voted_for(&self) -> Result<Option<ServerId>, Self::Error> {
-        Ok(self.voted_for)
-    }
-
-    fn set_voted_for(&mut self, address: Option<ServerId>) -> Result<(), Self::Error> {
-        self.voted_for = address;
-        Ok(())
-    }
-
     fn latest_log_index(&self) -> Result<LogIndex, Self::Error> {
         Ok(LogIndex(self.entries.len() as u64))
     }
 
-    fn discard_log_since(&mut self, index: LogIndex) -> Result<LogIndex, Self::Error> {
-        if index.as_usize() < self.entries.len() {
-            self.entries.truncate(index.as_usize())
-        }
-        Ok(index)
-    }
-
-    fn latest_config_index(&self) -> Result<Option<LogIndex>, Self::Error> {
-        Ok(self.latest_config_index.map(|i| i.into()))
+    fn first_log_index(&self) -> Result<LogIndex, Self::Error> {
+        todo!()
     }
 
     fn term_of(&self, index: LogIndex) -> Result<Option<Term>, Self::Error> {
@@ -71,6 +45,17 @@ impl Log for MemLog {
             .get((index - 1).as_u64() as usize)
             .map(|entry| Some(entry.term))
             .ok_or(LogError::BadIndex(index))
+    }
+
+    fn discard_since(&mut self, index: LogIndex) -> Result<LogIndex, Self::Error> {
+        if index.as_usize() < self.entries.len() {
+            self.entries.truncate(index.as_usize())
+        }
+        Ok(index)
+    }
+
+    fn discard_until(&self, index: LogIndex) -> Result<LogIndex, Self::Error> {
+        todo!()
     }
 
     fn read_entry(&self, index: LogIndex, dest: &mut LogEntry) -> Result<(), Self::Error> {
@@ -99,6 +84,42 @@ impl Log for MemLog {
 
         self.entries.push(entry.into());
         Ok(())
+    }
+
+    fn current_term(&self) -> Result<Term, Self::Error> {
+        Ok(self.current_term)
+    }
+
+    fn set_current_term(&mut self, term: Term) -> Result<(), Self::Error> {
+        self.voted_for = None;
+        self.current_term = term;
+        Ok(())
+    }
+
+    fn voted_for(&self) -> Result<Option<ServerId>, Self::Error> {
+        Ok(self.voted_for)
+    }
+
+    fn set_voted_for(&mut self, address: Option<ServerId>) -> Result<(), Self::Error> {
+        self.voted_for = address;
+        Ok(())
+    }
+
+    fn set_latest_config(
+        &mut self,
+        config: &ConsensusConfig,
+        index: LogIndex,
+    ) -> Result<(), Self::Error> {
+        self.latest_config = Some((config.clone(), index));
+        Ok(())
+    }
+
+    fn latest_config(&self) -> Result<Option<ConsensusConfig>, Self::Error> {
+        Ok(self.latest_config.as_ref().map(|(c, _)| c.clone()))
+    }
+
+    fn latest_config_index(&self) -> Result<Option<LogIndex>, Self::Error> {
+        Ok(self.latest_config.as_ref().map(|(_, i)| i.clone()))
     }
 }
 

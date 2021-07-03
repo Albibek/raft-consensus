@@ -31,6 +31,8 @@ pub enum PeerMessage {
     RequestVoteRequest(RequestVoteRequest),
     RequestVoteResponse(RequestVoteResponse),
     TimeoutNow,
+    InstallSnapshotRequest(InstallSnapshotRequest),
+    InstallSnapshotResponse(InstallSnapshotResponse),
 }
 
 #[cfg(feature = "use_capnp")]
@@ -50,6 +52,12 @@ impl PeerMessage {
                 Ok(RequestVoteResponse::from_capnp(message?)?.into())
             }
             peer_message::Which::TimeoutNow(()) => Ok(PeerMessage::TimeoutNow),
+            peer_message::Which::InstallSnapshotRequest(message) => {
+                Ok(InstallSnapshotRequest::from_capnp(message?)?.into())
+            }
+            peer_message::Which::InstallSnapshotResponse(message) => {
+                Ok(InstallSnapshotResponse::from_capnp(message?)?.into())
+            }
         }
     }
 
@@ -73,6 +81,14 @@ impl PeerMessage {
             }
             &PeerMessage::TimeoutNow => {
                 builder.reborrow().set_timeout_now(());
+            }
+            PeerMessage::InstallSnapshotRequest(ref message) => {
+                let mut builder = builder.reborrow().init_install_snapshot_request();
+                message.fill_capnp(&mut builder);
+            }
+            PeerMessage::InstallSnapshotResponse(ref message) => {
+                let mut builder = builder.reborrow().init_install_snapshot_response();
+                message.fill_capnp(&mut builder);
             }
         };
     }
@@ -407,6 +423,133 @@ impl RequestVoteResponse {
     common_capnp!(
         request_vote_response::Builder,
         request_vote_response::Reader
+    );
+}
+
+/////////////////////  Snapshots
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
+/// Request for Raft InstallSnapshot RPC
+pub struct InstallSnapshotRequest {
+    /// The leader's term.
+    pub term: Term,
+
+    /// Index of the last log entry in leader's log
+    pub last_log_index: LogIndex,
+
+    /// Term of last_index
+    pub last_log_term: Term,
+
+    /// The Leader’s commit log index.
+    pub leader_commit: LogIndex,
+
+    /// For the first chunk: current cluster config
+    pub last_config: Option<ConsensusConfig>,
+
+    /// For the first chunk: a state machine-specific metadata for the whole snapshot
+    pub metadata: Option<Vec<u8>>,
+
+    /// the sequence number of chunk
+    pub chunk_number: usize,
+
+    /// Log entries to store (empty for heartbeat; may send more than one for efficiency)
+    pub chunk_data: Vec<u8>,
+}
+
+impl From<InstallSnapshotRequest> for PeerMessage {
+    fn from(msg: InstallSnapshotRequest) -> PeerMessage {
+        PeerMessage::InstallSnapshotRequest(msg)
+    }
+}
+
+#[cfg(feature = "use_capnp")]
+impl InstallSnapshotRequest {
+    pub fn from_capnp<'a>(reader: install_snapshot_request::Reader<'a>) -> Result<Self, Error> {
+        todo!("installsnapshotRequest::from_capnp");
+        //        Ok(Self {
+        //term: reader.get_term().into(),
+        //prev_log_index: reader.get_prev_log_index().into(),
+        //prev_log_term: reader.get_prev_log_term().into(),
+        //leader_commit: reader.get_leader_commit().into(),
+        //entries: if reader.has_entries() {
+        //let entries = reader.get_entries().map_err(Error::Capnp)?;
+        //let mut v = Vec::with_capacity(entries.len() as usize);
+        //for e in entries.iter() {
+        //v.push(Entry::from_capnp(e)?);
+        //}
+        //v
+        //} else {
+        //Vec::new()
+        //},
+        //})
+    }
+
+    pub fn fill_capnp<'a>(&self, builder: &mut install_snapshot_request::Builder<'a>) {
+        todo!("installsnapshotRequest::fill_capnp");
+        //        builder.set_term(self.term.into());
+        //builder.set_prev_log_term(self.prev_log_term.into());
+        //builder.set_prev_log_index(self.prev_log_index.into());
+        //builder.set_leader_commit(self.leader_commit.into());
+        //if self.entries.len() > 0 {
+        //// TODO: guarantee entries length fits u32
+        //let mut entries = builder.reborrow().init_entries(self.entries.len() as u32);
+
+        //for (n, entry) in self.entries.iter().enumerate() {
+        //let mut slot = entries.reborrow().get(n as u32);
+        //entry.fill_capnp(&mut slot);
+        //}
+        //}
+    }
+
+    //    common_capnp!(
+    //install_snapshot_request::Builder,
+    //install_snapshot_request::Reader
+    //    );
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
+/// Response for Raft InstallSnapshotRPC
+pub enum InstallSnapshotResponse {
+    Success(Term, LogIndex, usize),
+    StaleTerm(Term),
+}
+
+impl From<InstallSnapshotResponse> for PeerMessage {
+    fn from(msg: InstallSnapshotResponse) -> PeerMessage {
+        PeerMessage::InstallSnapshotResponse(msg)
+    }
+}
+
+#[cfg(feature = "use_capnp")]
+impl InstallSnapshotResponse {
+    pub fn from_capnp<'a>(reader: install_snapshot_response::Reader<'a>) -> Result<Self, Error> {
+        todo!("installsnapshotResponse::from_capnp");
+        //let message = match reader.which().map_err(Error::CapnpSchema)? {
+        //install_snapshot_response::Success(m) => {
+        //let m = m.map_err(Error::Capnp)?;
+        //InstallSnapshotResponse::Success(m.get_term().into(), m.get_log_index().into())
+        //}
+        //install_snapshot_response::StaleTerm(m) => InstallSnapshotResponse::StaleTerm(m.into()),
+        //};
+        //Ok(message)
+    }
+
+    pub fn fill_capnp<'a>(&self, builder: &mut install_snapshot_response::Builder<'a>) {
+        todo!("installsnapshotResponse::fill_capnp");
+        //match self {
+        //&InstallSnapshotResponse::Success(term, log_index) => {
+        //let mut message = builder.reborrow().init_success();
+        //message.set_term(term.into());
+        //message.set_log_index(log_index.into());
+        //}
+        //&InstallSnapshotResponse::StaleTerm(term) => builder.set_stale_term(term.into()),
+        //}
+    }
+
+    common_capnp!(
+        install_snapshot_response::Builder,
+        install_snapshot_response::Reader
     );
 }
 

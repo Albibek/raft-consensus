@@ -8,7 +8,7 @@ use raft_consensus::*;
 /// Tests for green scenarios(when network works OK, and nodes do not fail)
 
 // TODO: test stale leader (leader with lower term than rest of the cluster)
-// TODO: test solitary cluster separately
+// TODO: test solitary leader (1-node cluster)
 
 #[test]
 fn test_kickstart() {
@@ -82,8 +82,7 @@ fn test_sticky_leader() {
 
 #[test]
 fn test_leader_transfer_auto() {
-    // Test the very first stage of init: election of a leader
-    // after all nodes have started as followers
+    // Test the leader transfer where any follower node can become a leader
     let mut cluster = TestCluster::new(3);
     for node in cluster.nodes.values() {
         assert_eq!(node.kind(), ConsensusState::Follower);
@@ -128,8 +127,7 @@ fn test_leader_transfer_auto() {
 
 #[test]
 fn test_leader_transfer_manual() {
-    // Test the very first stage of init: election of a leader
-    // after all nodes have started as followers
+    // Test the leader transfer when leader ID is specified explicitly
     let mut cluster = TestCluster::new(3);
     for node in cluster.nodes.values() {
         assert_eq!(node.kind(), ConsensusState::Follower);
@@ -155,12 +153,10 @@ fn test_leader_transfer_manual() {
 
 #[test]
 fn test_client_proposal() {
-    // Test the very first stage of init: election of a leader
-    // after all nodes have started as followers
     let mut cluster = TestCluster::new(3);
     for node in cluster.nodes.values() {
         assert_eq!(node.kind(), ConsensusState::Follower);
     }
     cluster.kickstart();
-    todo!();
+    //    todo!();
 }

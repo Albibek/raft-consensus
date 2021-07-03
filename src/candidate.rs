@@ -8,12 +8,12 @@ use crate::handler::Handler;
 use crate::leader::Leader;
 use crate::message::*;
 use crate::persistent_log::Log;
-use crate::persistent_log::{LogEntry, LogEntryData, LogEntryDataRef, LogEntryRef};
+use crate::persistent_log::LogEntryDataRef;
 use crate::raft::CurrentState;
 use crate::state::State;
 use crate::state_impl::StateImpl;
 use crate::state_machine::StateMachine;
-use crate::{AdminId, ClientId, ServerId, Term};
+use crate::{AdminId, ClientId, ServerId};
 
 impl<L, M, H> StateImpl<L, M, H> for State<L, M, H, Candidate>
 where
@@ -51,10 +51,10 @@ where
 
     fn append_entries_response(
         self,
-        handler: &mut H,
-        from: ServerId,
-        response: &AppendEntriesResponse,
-    ) -> Result<(Option<AppendEntriesRequest>, CurrentState<L, M, H>), Error> {
+        _handler: &mut H,
+        _from: ServerId,
+        _response: &AppendEntriesResponse,
+    ) -> Result<(Option<PeerMessage>, CurrentState<L, M, H>), Error> {
         // the candidate can only receive responses in case the node was a leader some time ago
         // and sent requests which triggered the reponse while response was held somewhere in network
         //
@@ -139,6 +139,24 @@ where
         Ok(self.into())
     }
 
+    fn install_snapshot_request(
+        self,
+        handler: &mut H,
+        from: ServerId,
+        request: &InstallSnapshotRequest,
+    ) -> Result<(InstallSnapshotResponse, CurrentState<L, M, H>), Error> {
+        todo!()
+    }
+
+    fn install_snapshot_response(
+        self,
+        handler: &mut H,
+        from: ServerId,
+        response: &InstallSnapshotResponse,
+    ) -> Result<(Option<PeerMessage>, CurrentState<L, M, H>), Error> {
+        todo!()
+    }
+
     // Timeout handling
     // Handles heartbeat timeout event
     fn heartbeat_timeout(&mut self, _peer: ServerId) -> Result<AppendEntriesRequest, Error> {
@@ -165,15 +183,8 @@ where
         }
     }
 
-    // Utility messages and actions
-    fn peer_connected(&mut self, _handler: &mut H, _peer: ServerId) -> Result<(), Error> {
-        // TODO: we could resend `RequestVoteRequest`s to a peer, like previous implementation did,
-        // but we intentionally do not do this, leaving all the retrying strategies to external implementation
-        // which may decide to have different startegies of retrying
-        // Sending nothing should not break the consensus, except probably delaying the
-        // voting process for one more election timeout
-
-        Ok(())
+    fn check_compaction(&mut self, _handler: &mut H, _force: bool) -> Result<bool, Error> {
+        self.common_check_compaction(true)
     }
 
     /// Applies a client proposal to the consensus state machine.
@@ -190,8 +201,12 @@ where
         &mut self,
         _from: ClientId,
         _request: &ClientRequest,
-    ) -> ClientResponse {
-        ClientResponse::UnknownLeader
+    ) -> Result<ClientResponse, Error> {
+        Ok(ClientResponse::UnknownLeader)
+    }
+
+    fn ping_request(&self) -> Result<PingResponse, Error> {
+        self.common_client_ping_request(ConsensusState::Candidate)
     }
 
     // Configuration change messages
@@ -205,16 +220,23 @@ where
 
     fn step_down_request(
         &mut self,
-        handler: &mut H,
+        _handler: &mut H,
         from: AdminId,
-        request: Option<ServerId>,
+        _request: Option<ServerId>,
     ) -> Result<ConfigurationChangeResponse, Error> {
         trace!("request to step down from {}", from);
         Ok(ConfigurationChangeResponse::UnknownLeader)
     }
 
-    fn ping_request(&self) -> Result<PingResponse, Error> {
-        self.common_client_ping_request(ConsensusState::Candidate)
+    // Utility messages and actions
+    fn peer_connected(&mut self, _handler: &mut H, _peer: ServerId) -> Result<(), Error> {
+        // TODO: we could resend `RequestVoteRequest`s to a peer, like previous implementation did,
+        // but we intentionally do not do this, leaving all the retrying strategies to external implementation
+        // which may decide to have different startegies of retrying
+        // Sending nothing should not break the consensus, except probably delaying the
+        // voting process for one more election timeout
+
+        Ok(())
     }
 
     fn into_consensus_state(self) -> CurrentState<L, M, H> {

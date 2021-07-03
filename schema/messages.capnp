@@ -34,6 +34,9 @@ struct PeerMessage {
         requestVoteRequest @2 :RequestVoteRequest;
         requestVoteResponse @3 :RequestVoteResponse;
         timeoutNow @4 :Void;
+
+        installSnapshotRequest @5 :InstallSnapshotRequest;
+        installSnapshotResponse @6 :InstallSnapshotResponse;
     }
 
     struct AppendEntriesRequest {
@@ -56,6 +59,11 @@ struct PeerMessage {
       }
     }
 
+  struct TermAndIndex {
+        term @0 :UInt64;
+        logIndex @1 :UInt64;
+    }
+
     struct RequestVoteRequest {
         term @0 :UInt64;
         lastLogIndex @1 :UInt64;
@@ -72,10 +80,29 @@ struct PeerMessage {
       }
     }
 
-    struct TermAndIndex {
+
+    struct InstallSnapshotRequest {
         term @0 :UInt64;
-        logIndex @1 :UInt64;
+        lastIndex @1 :UInt64;
+        lastTerm @2 :UInt64;
+        leaderCommit @3 :UInt64;
+
+        lastConfig @4 :List(Peer);
+        metadata @5 :Data;
+
+        chunkNumber @6: UInt64;
+        chunkData @7 :Data;
     }
+
+    struct InstallSnapshotResponse {
+      term @0 :UInt64;
+
+      union {
+        success @1 :TermAndIndex;
+        staleTerm @2 :UInt64;
+      }
+    }
+
 }
 
 # Client messages

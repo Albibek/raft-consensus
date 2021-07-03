@@ -1,13 +1,9 @@
-use std::collections::HashMap;
 use std::marker::PhantomData;
 
 use log::{info, trace};
 
 use crate::state_machine::StateMachine;
-use crate::{
-    error::CriticalError,
-    persistent_log::{Log, LogEntry, LogEntryData},
-};
+use crate::{error::CriticalError, persistent_log::Log};
 
 use crate::config::ConsensusConfig;
 //use crate::entry::{ConsensusConfig, Entry, EntryData};
@@ -16,7 +12,7 @@ use crate::handler::Handler;
 use crate::message::*;
 use crate::raft::CurrentState;
 use crate::state_impl::StateImpl;
-use crate::{LogIndex, Peer, ServerId, Term};
+use crate::{LogIndex, ServerId, Term};
 
 use crate::follower::Follower;
 
@@ -244,6 +240,43 @@ where
             index: self.latest_log_index()?,
             state: kind,
         })
+    }
+
+    // checks snapshot only if forced,
+    pub(crate) fn common_check_compaction(&mut self, force: bool) -> Result<bool, Error> {
+        let snapshot_info = self
+            .state_machine
+            .snapshot_info(false)
+            .map_err(|e| Error::Critical(CriticalError::StateMachine(Box::new(e))))?;
+        if self.commit_index == LogIndex(0) {
+            return Ok(false);
+        }
+
+        if let Some(info) = snapshot_info {
+            if self.commit_index < info.index {
+                // snapshot is from later index, meaning it is corrupted
+                return Err(Error::Critical(CriticalError::SnapshotCorrupted));
+            } else if self.commit_index == info.index {
+                // taking snapshot is not required
+                return Ok(false);
+            } else {
+                if !force {
+                    return Ok(false);
+                }
+            }
+        }
+
+        // we should get here in 2 cases:
+        // * commit_index > info.index
+        // * snapshot_info is None
+        // both meaning there is a point to make the snapshot
+        self.state_machine
+            .take_snapshot(self.commit_index)
+            .map_err(|e| Error::Critical(CriticalError::StateMachine(Box::new(e))))?;
+        self.log
+            .discard_until(self.commit_index)
+            .map_err(|e| Error::Critical(CriticalError::PersistentLogWrite(Box::new(e))))?;
+        return Ok(true);
     }
 }
 

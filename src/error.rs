@@ -94,4 +94,10 @@ pub enum CriticalError {
 
     #[error("error writing to persistent log: {}", _0)]
     PersistentLogWrite(Box<dyn StdError + 'static>),
+
+    #[error("state machine snapshot is at later index than commit index")]
+    SnapshotCorrupted,
+
+    #[error("error interacting with the state machine {}", _0)]
+    StateMachine(Box<dyn StdError + 'static>),
 }

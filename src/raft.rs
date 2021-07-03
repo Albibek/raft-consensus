@@ -193,6 +193,90 @@ where
     ) -> Result<(), Error> {
         self.state.apply_admin_message(handler, from, request)
     }
+
+    /// Initiate a check for log compaction procedure. Since many compaction strategies may exist
+    /// depending on the log and state machine implementations, the decision of the moments
+    /// to take the snapshot (i.e. timing, byte sizes of log and snapshot, etc.)
+    /// is left to a caller.
+    ///
+    /// The force flag requests an enforcing of the snapshot, but may still provide
+    /// the refusal to make it at the moment.
+    ///
+    /// The return value will show if the snapshoting procedure happened.
+    pub fn check_compaction(&mut self, handler: &mut H, force: bool) -> Result<bool, Error> {
+        self.state.check_compaction(handler, force)
+    }
+}
+
+/// Some functions to use for querying log and state machine externally
+impl<L, M, H> Raft<L, M, H>
+where
+    L: Log,
+    M: StateMachine,
+    H: Handler,
+{
+    /// borrow the consensus log
+    pub fn log(&self) -> Option<&L> {
+        match self.state {
+            CurrentState::Lost => None,
+            CurrentState::Leader(ref s) => Some(&s.log),
+            CurrentState::Follower(ref s) => Some(&s.log),
+            CurrentState::Candidate(ref s) => Some(&s.log),
+        }
+    }
+
+    ///
+    pub fn log_mut(&mut self) -> Option<&mut L> {
+        match self.state {
+            CurrentState::Lost => None,
+            CurrentState::Leader(ref mut s) => Some(&mut s.log),
+            CurrentState::Follower(ref mut s) => Some(&mut s.log),
+            CurrentState::Candidate(ref mut s) => Some(&mut s.log),
+        }
+    }
+
+    pub fn state_machine(&self) -> Option<&M> {
+        match self.state {
+            CurrentState::Lost => None,
+            CurrentState::Leader(ref s) => Some(&s.state_machine),
+            CurrentState::Follower(ref s) => Some(&s.state_machine),
+            CurrentState::Candidate(ref s) => Some(&s.state_machine),
+        }
+    }
+
+    pub fn state_machine_mut(&mut self) -> Option<&mut M> {
+        match self.state {
+            CurrentState::Lost => None,
+            CurrentState::Leader(ref mut s) => Some(&mut s.state_machine),
+            CurrentState::Follower(ref mut s) => Some(&mut s.state_machine),
+            CurrentState::Candidate(ref mut s) => Some(&mut s.state_machine),
+        }
+    }
+
+    pub fn into_inner(self) -> Option<(ServerId, L, M)> {
+        let Self { state, .. } = self;
+        match state {
+            CurrentState::Lost => None,
+            CurrentState::Leader(State {
+                id,
+                log,
+                state_machine,
+                ..
+            }) => Some((id, log, state_machine)),
+            CurrentState::Follower(State {
+                id,
+                log,
+                state_machine,
+                ..
+            }) => Some((id, log, state_machine)),
+            CurrentState::Candidate(State {
+                id,
+                log,
+                state_machine,
+                ..
+            }) => Some((id, log, state_machine)),
+        }
+    }
 }
 
 /// These a special functions only available in debug builds.
@@ -211,24 +295,6 @@ where
             CurrentState::Leader(_) => ConsensusState::Leader,
             CurrentState::Follower(_) => ConsensusState::Follower,
             CurrentState::Candidate(_) => ConsensusState::Candidate,
-        }
-    }
-
-    pub fn log(&mut self) -> &mut L {
-        match self.state {
-            CurrentState::Lost => panic!("state is lost"),
-            CurrentState::Leader(ref mut s) => &mut s.log,
-            CurrentState::Follower(ref mut s) => &mut s.log,
-            CurrentState::Candidate(ref mut s) => &mut s.log,
-        }
-    }
-
-    pub fn state_machine(&mut self) -> &mut M {
-        match self.state {
-            CurrentState::Lost => panic!("state is lost"),
-            CurrentState::Leader(ref mut s) => &mut s.state_machine,
-            CurrentState::Follower(ref mut s) => &mut s.state_machine,
-            CurrentState::Candidate(ref mut s) => &mut s.state_machine,
         }
     }
 }
@@ -324,5 +390,9 @@ where
         request: &AdminMessage,
     ) -> Result<(), Error> {
         proxy_state!(self, s, apply_admin_message(s, handler, from, request)?)
+    }
+    pub fn check_compaction(&mut self, handler: &mut H, force: bool) -> Result<bool, Error> {
+        // we don't need packet conversions here, so no generic function required
+        proxy_state!(self, s, s.check_compaction(handler, force)?)
     }
 }
