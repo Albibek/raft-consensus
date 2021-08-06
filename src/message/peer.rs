@@ -446,13 +446,10 @@ pub struct InstallSnapshotRequest {
     /// For the first chunk: current cluster config
     pub last_config: Option<ConsensusConfig>,
 
-    /// For the first chunk: a state machine-specific metadata for the whole snapshot
-    pub metadata: Option<Vec<u8>>,
+    /// Index of snapshot being installed
+    pub snapshot_index: LogIndex,
 
-    /// the sequence number of chunk
-    pub chunk_number: usize,
-
-    /// Log entries to store (empty for heartbeat; may send more than one for efficiency)
+    /// Snapshot bytes to pass into consensus state machine
     pub chunk_data: Vec<u8>,
 }
 
@@ -511,7 +508,7 @@ impl InstallSnapshotRequest {
 #[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
 /// Response for Raft InstallSnapshotRPC
 pub enum InstallSnapshotResponse {
-    Success(Term, LogIndex, usize),
+    Success(Term, LogIndex, Option<Vec<u8>>),
     StaleTerm(Term),
 }
 

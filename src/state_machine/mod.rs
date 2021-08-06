@@ -18,14 +18,10 @@ use crate::LogIndex;
 pub struct SnapshotInfo {
     /// Index the snapshot was taken at
     pub index: LogIndex,
-    /// Size of snapshot in bytes (for decisions about snapshotting)
+
+    /// Size of snapshot in bytes (for decisions about snapshotting at the consensus level, i.e.
+    /// comparing log size with snapshot size)
     pub size: usize,
-    /// Number of chunks in snapshot (0 means single chunk and will be treated the same way as 1)
-    pub chunks: usize,
-    /// Indicates that snapshot was finished
-    pub finished: bool,
-    /// Any additional data, this state machine may want to share with another nodes' machines
-    pub metadata: Option<Vec<u8>>,
 }
 
 /// This trait is meant to be implemented such that the commands issued to it via `apply()` will
@@ -37,8 +33,21 @@ pub struct SnapshotInfo {
 /// * New: sent by leader to catching up nodes and slow followers. Should replace the current when
 /// finished
 ///
-/// Snapshots are read and written in chunks. State machine should decide the chunk size and the
-/// need for chunks at all. State machine should not do snapshots without command from consensus.
+/// State machine should not do snapshots without command from consensus.
+///
+/// Snapshots can be read and written in chunks. State machine should decide the chunk shape, specifically, their size,
+/// sequence and the need for chunks at all. Since the consensus follows the reactive model, requests and responses for
+/// chunks can only be sent sequentially, i.e. every next request will only be sent after receiving a response. This
+/// means all kinds of windowing strategies should be performed on a consensus calling level by
+/// emulating an `InstallSnapshotResponse` messages.
+///
+/// It is always the leader's state machine that decides that snapshot is
+/// complete, which means every correct response from InstallSnapsnot will be delivered to it.
+/// Only after the snapshot is transferred to follower completely and the very last chunk of it
+/// is confirmed, the leader will consider follower index changed and will recount the majority
+/// according to this new data.
+///
+/// For a state machine implementation this means
 ///
 /// Note that the implementor is responsible for **not crashing** the state machine. The production
 /// implementation is recommended not to use `.unwrap()`, `.expect()` or anything else that leads to `panic!()`
@@ -58,22 +67,35 @@ pub trait StateMachine {
     fn query(&self, query: &[u8]) -> Result<Vec<u8>, Self::Error>;
 
     /// Should return information about current snapshot, if any.
-    /// There are cases where metadata is not required. `meta_required` flag indicates,
-    /// that metadata field will not e read and may be set to None or empty vector to avoid allocations.
-    fn snapshot_info(&self, meta_required: bool) -> Result<Option<SnapshotInfo>, Self::Error>;
+    fn snapshot_info(&self) -> Result<Option<SnapshotInfo>, Self::Error>;
 
     /// Should take a snapshot of the state machine saving the snapshot's index.
+    /// The snapshot is expected to be taken synchronously, implementor must expect,
+    /// that read_snapshot_chunk will be called right away after this function
     fn take_snapshot(&mut self, index: LogIndex) -> Result<(), Self::Error>;
 
-    /// Should give away a next chunk of the current snapshot.
-    fn read_snapshot_chunk(&self, chunk: usize) -> Result<Vec<u8>, Self::Error>;
+    /// Should give away the next chunk of the current snapshot based on previous chunk data.
+    /// Option in query can be used to receive the first chunk.
+    /// Returning None means there is no chunks left, in which case the snapshot will be considered read completely.
+    /// Returning None as the first chunk will be equivalent to not having an active snapshot
+    /// ready, in which case the snapshot sending will be delayed to the heartbeat timeout.
+    ///
+    /// Note that any possible shapshot metadata useful for the remote side, i.e. to create
+    /// a correct query for the next chunk, has to be inside the returned vector.
+    fn read_snapshot_chunk(&self, query: Option<&[u8]>) -> Result<Option<Vec<u8>>, Self::Error>;
 
-    /// Should initiate a procedure of creating a new snapshot taken at external state machine
-    /// Any previous new snapshots may be discarded at will.
-    fn init_new_snapshot(&mut self, info: SnapshotInfo) -> Result<(), Self::Error>;
-
-    /// Should write a part of externally initiated new snapshot and make it current if
-    /// all chunks are received
-    fn write_snapshot_chunk(&mut self, chunk: usize, chunk_bytes: &[u8])
-        -> Result<(), Self::Error>;
+    /// Should write a part of externally initiated new snapshot make it current if
+    /// all chunks are received. Is is also up to the implementation to decide if the snapshot
+    /// is a new one and how it should be recreated based on log index.
+    ///
+    /// The index must be saved and returned from snapshot_info. The calling side
+    /// considers index to be written right after the function returns None.
+    ///
+    /// The returned value is a request for the next chunk or None if the
+    /// chunk is the last one.
+    fn write_snapshot_chunk(
+        &mut self,
+        index: LogIndex,
+        chunk_bytes: &[u8],
+    ) -> Result<Option<Vec<u8>>, Self::Error>;
 }

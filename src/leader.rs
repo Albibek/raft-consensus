@@ -4,7 +4,7 @@ use crate::error::*;
 use crate::state_machine::SnapshotInfo;
 use log::{debug, info, trace};
 
-use crate::config::ConsensusConfig;
+use crate::config::{ConsensusConfig, SlowNodeTimeouts};
 use crate::handler::Handler;
 use crate::message::*;
 use crate::persistent_log::{LogEntry, LogEntryData, LogEntryDataRef, LogEntryRef};
@@ -18,7 +18,6 @@ use crate::persistent_log::Log;
 use crate::state_machine::StateMachine;
 
 static MAX_ROUNDS: u32 = 10;
-static MAX_TIMEOUTS: u32 = 20;
 
 impl<L, M, H> StateImpl<L, M, H> for State<L, M, H, Leader>
 where
@@ -41,11 +40,11 @@ where
         }
 
         if leader_term == current_term {
-            // When new leader is at the same term, the single leader-per-term invariant is broken; there is a bug in the Raft
-            // implementation.
+            // When new leader is at the same term, the single leader-per-term invariant is broken;
+            // there is a bug in the Raft implementation.
             return Err(Error::Critical(CriticalError::AnotherLeader(
-                        from,
-                        current_term,
+                from,
+                current_term,
             )));
         }
 
@@ -68,28 +67,30 @@ where
 
         // First, check if the response is from the correct term
         // and is not some error
+        // We are ok to respond to some peers not in config in case they were there
+        // in previous terms
         match response {
             AppendEntriesResponse::Success(term, _)
-                | AppendEntriesResponse::StaleTerm(term)
-                | AppendEntriesResponse::InconsistentPrevEntry(term, _)
+            | AppendEntriesResponse::StaleTerm(term)
+            | AppendEntriesResponse::InconsistentPrevEntry(term, _)
                 if &current_term < term =>
-                {
-                    // some node has received message with term higher than ours,
-                    // that means some other leader appeared in consensus,
-                    // we should downgrade to follower immediately
-                    let new_state = self.leader_into_follower(handler, current_term)?;
-                    Ok((None, new_state.into()))
-                }
+            {
+                // some node has received message with term higher than ours,
+                // that means some other leader appeared in consensus,
+                // we should downgrade to follower immediately
+                let new_state = self.leader_into_follower(handler, current_term)?;
+                Ok((None, new_state.into()))
+            }
 
             AppendEntriesResponse::Success(term, _)
-                | AppendEntriesResponse::StaleTerm(term)
-                | AppendEntriesResponse::InconsistentPrevEntry(term, _)
+            | AppendEntriesResponse::StaleTerm(term)
+            | AppendEntriesResponse::InconsistentPrevEntry(term, _)
                 if &current_term > term =>
-                {
-                    // some follower confirmed message we've sent at previous term
-                    // it is ok for us
-                    Ok((None, self.into()))
-                }
+            {
+                // some follower confirmed message we've sent at previous term
+                // it is ok for us
+                Ok((None, self.into()))
+            }
             AppendEntriesResponse::StaleEntry => Ok((None, self.into())),
             AppendEntriesResponse::StaleTerm(_) => {
                 // The peer is reporting a stale term, but the term number matches the local term.
@@ -97,7 +98,7 @@ where
                 // has already transitioned to the new term.
 
                 Ok((None, self.into()))
-                }
+            }
             AppendEntriesResponse::InconsistentPrevEntry(_, next_index) => {
                 self.state_data.set_next_index(from, *next_index)?;
                 let message = self.next_entries_or_snapshot(
@@ -107,9 +108,9 @@ where
                     local_latest_log_index,
                 )?;
                 Ok((message, self.into()))
-                }
+            }
             AppendEntriesResponse::Success(_, follower_latest_log_index) => {
-                // peer succesfully received last AppendEntries, consider it alive and running
+                // peer successfully received last AppendEntries, consider it alive and running
                 // within current election timeout
                 self.state_data.peers_alive.insert(from);
                 trace!(
@@ -146,7 +147,9 @@ where
                         Ok((message, self.into()))
                     }
                 } else if self.state_data.is_catching_up(from) {
-                    let message = self.check_catch_up_state(
+                    // For the catching up node, receiving a number of entries means it
+                    // has made some progress,
+                    let message = self.check_catch_up_status(
                         handler,
                         from,
                         current_term,
@@ -228,60 +231,150 @@ where
         handler: &mut H,
         from: ServerId,
         request: &InstallSnapshotRequest,
-    ) -> Result<(InstallSnapshotResponse, CurrentState<L, M, H>), Error> {
-        // leaders take orders from no one
-        return Err(Error::MustNotLeader);
+    ) -> Result<(PeerMessage, CurrentState<L, M, H>), Error> {
+        // this is the same logic as in append_entries_request
+        let leader_term = request.term;
+        let current_term = self.current_term()?;
+
+        // in case of delayed request it is ok to receive something from former leader
+        if leader_term < current_term {
+            return Ok((
+                PeerMessage::InstallSnapshotResponse(InstallSnapshotResponse::StaleTerm(
+                    current_term,
+                )),
+                self.into(),
+            ));
+        }
+
+        if leader_term == current_term {
+            // When new leader is at the same term, the single leader-per-term invariant is broken;
+            // there is a bug in the Raft implementation.
+            return Err(Error::Critical(CriticalError::AnotherLeader(
+                from,
+                current_term,
+            )));
+        }
+
+        let new_state = self.leader_into_follower(handler, leader_term)?;
+        let (response, new_state) = new_state.install_snapshot_request(handler, from, request)?;
+
+        Ok((response, new_state))
     }
 
     fn install_snapshot_response(
-        self,
+        mut self,
         handler: &mut H,
         from: ServerId,
         response: &InstallSnapshotResponse,
     ) -> Result<(Option<PeerMessage>, CurrentState<L, M, H>), Error> {
+        let current_term = self.current_term()?;
+        let local_latest_log_index = self.latest_log_index()?;
+
         // we receive this when some node had received InstallSnapshotRequest
-        todo!();
         match response {
-            InstallSnapshotResponse::Success(follower_log_index, chunk_number) => {
-                todo!("send next chunk");
+            InstallSnapshotResponse::Success(term, _, _)
+            | InstallSnapshotResponse::StaleTerm(term)
+                if &current_term < term =>
+            {
+                // some node has received message with term higher than ours,
+                // that means some other leader appeared in consensus,
+                // we should downgrade to follower immediately
+                let new_state = self.leader_into_follower(handler, current_term)?;
+                Ok((None, new_state.into()))
             }
-            InstallSnapshotResponse::StaleTerm(follower_term) => {
-                // snap
 
+            InstallSnapshotResponse::Success(term, _, _)
+            | InstallSnapshotResponse::StaleTerm(term)
+                if &current_term > term =>
+            {
+                // some follower confirmed message we've sent at previous term
+                // it is ok for us
+                Ok((None, self.into()))
+            }
+            InstallSnapshotResponse::StaleTerm(_) => {
+                // The peer is reporting a stale term, but the term number matches the local term.
+                // Ignore the response, since it is to a message from a prior term, and this node
+                // has already transitioned to the new term.
 
+                Ok((None, self.into()))
+            }
+            InstallSnapshotResponse::Success(
+                _follower_term,
+                follower_snapshot_index,
+                next_chunk_request,
+            ) => {
+                // don't waste state machine resources on unknown peers
+                if !self.state_data.has_follower(&from) && !self.state_data.is_catching_up(from) {
+                    return Err(Error::UnknownPeer(from));
+                }
 
-                AppendEntriesResponse::Success(term, _)
-                    | AppendEntriesResponse::StaleTerm(term)
-                    | AppendEntriesResponse::InconsistentPrevEntry(term, _)
-                    if &current_term < term =>
-                    {
-                        // some node has received message with term higher than ours,
-                        // that means some other leader appeared in consensus,
-                        // we should downgrade to follower immediately
-                        let new_state = self.leader_into_follower(handler, current_term)?;
-                        Ok((None, new_state.into()))
-                    }
+                match self.new_install_snapshot(next_chunk_request.as_ref().map(|v| v.as_slice())) {
+                    Err(Error::SnapshotExpected) => {
+                        // snapshot may stop existing in very rare, mostly unreachable cases like fast
+                        // restarts
 
-                AppendEntriesResponse::Success(term, _)
-                    | AppendEntriesResponse::StaleTerm(term)
-                    | AppendEntriesResponse::InconsistentPrevEntry(term, _)
-                    if &current_term > term =>
-                    {
-                        // some follower confirmed message we've sent at previous term
-                        // it is ok for us
+                        // we can only delay sending by retrying a heartbeat message to the
+                        // follower, so the next response could trigger this same logic again
+                        todo!("do this only for non-catching up followers");
+                        handler.set_timeout(Timeout::Heartbeat(from));
                         Ok((None, self.into()))
                     }
-                AppendEntriesResponse::StaleEntry => Ok((None, self.into())),
-                AppendEntriesResponse::StaleTerm(_) => {
-                    // The peer is reporting a stale term, but the term number matches the local term.
-                    // Ignore the response, since it is to a message from a prior term, and this server
-                    // has already transitioned to the new term.
-
-                    Ok((None, self.into()))
+                    Ok(Some((message, _info))) => {
+                        // this behaviour is same for catching-up and follower nodes
+                        if self.state_data.is_catching_up(from) {
+                            self.state_data.update_rounds()?;
+                        }
+                        Ok((
+                            Some(PeerMessage::InstallSnapshotRequest(message)),
+                            self.into(),
+                        ))
                     }
+                    Ok(None) => {
+                        // the sending of snapshot has finished, which means
+                        // that log entries can be sent now
+                        // so we clean the snapshot status and set the follower's index,
+                        // which should be after the snapshot
+                        //
+                        // the next_entries_or_snapshot will now be able to correctly
+                        // determine, if another snapshot or AppendEntriesRequest should be sent
+                        self.state_data.pending_snapshots.remove(&from);
 
+                        // This will update data for the state on both follower types
+                        self.state_data
+                            .set_next_index(from, *follower_snapshot_index + 1)?;
+                        if self.state_data.has_follower(&from) {
+                            // Snapshots are only taken using commit index,
+                            // so advancing an index on a single follower cannot change
+                            // majority and advance index on the whole consensus.
+                            // This means we don't need to call try_advance_commit_index,
+                            // but we need to save the follower status to the state
+                            self.state_data
+                                .set_match_index(from, *follower_snapshot_index);
 
-
+                            Ok((
+                                self.next_entries_or_snapshot(
+                                    handler,
+                                    from,
+                                    current_term,
+                                    local_latest_log_index,
+                                )?,
+                                self.into(),
+                            ))
+                        } else if self.state_data.is_catching_up(from) {
+                            // this function includes checking the snapshot state
+                            let message = self.check_catch_up_status(
+                                handler,
+                                from,
+                                current_term,
+                                local_latest_log_index,
+                            )?;
+                            Ok((message, self.into()))
+                        } else {
+                            Err(Error::unreachable(module_path!()))
+                        }
+                    }
+                    Err(e) => Err(e),
+                }
             }
         }
     }
@@ -314,60 +407,41 @@ where
             debug!("leader did not receive enough responses from followers, stepping down to avoid stale leadership");
             let term = self.current_term()?;
             Ok(CurrentState::Follower(
-                    self.leader_into_follower(handler, term)?,
+                self.leader_into_follower(handler, term)?,
             ))
         } else {
             Ok(self.into())
         }
     }
 
-    fn check_compaction(&mut self, handler: &mut H, force: bool) -> Result<bool, Error> {
+    fn check_compaction(&mut self, _handler: &mut H, force: bool) -> Result<bool, Error> {
         // leader may have snapshots in progress of being sent to slow followers
-        // or catching up nodes
+        // or catching up nodes.  In that case we prefer not to taks snapshot if it is
+        // not forced. But there is an exclusion here: same index.
+        //
+        // Due to the implementation of state machine's chunk metadata mechanism,
+        // we can keep sending all previoius chunks if we guarantee that new snapshots
+        // are only taken if leader's commit index has changed (i.e. new data has been applied to
+        // state machine).  With this implemented we can use leader's commit index as a kind of
+        // snapshot ID
 
-        let have_pending_snapshots = self.state_data.snapshots.values().any(|v| v.is_some());
+        // all common checks like self.commit_index == 0 are done in state::common_check_compaction
 
         // with pending snapshots, but without forcing - do not request it, hoping
         // slow followers will catch up
-        if !force && !have_pending_snapshots {
+        if !force && !self.state_data.pending_snapshots.is_empty() {
+            trace!("not taking snapshot because leader has snapshots pending and snapshot was not forced");
             return Ok(false);
         }
 
         // without pending snapshots there is not problem: just do it regardless of forcing
-        if !have_pending_snapshots {
+        if !self.state_data.pending_snapshots.is_empty() {
             return self.common_check_compaction(force);
         }
 
         // the last case: force and pending_snapshots
-        //
-        // still, state machine may decide to take a new snapshot even
-        // if it was not forced
-
         let snapshot_changed = self.common_check_compaction(force)?;
-        if !snapshot_changed {
-            return Ok(snapshot_changed);
-        }
 
-        // the only case, where there really should be some actions:
-        // force was true, we requested the snapshot and machine decided to change it
-        // We must reset out slow followers snapshot state and start sending them
-        // a brand new snapshot instead of the old one
-
-        // create totaly new install_snapshot
-        let (message, info) = self.new_install_snapshot(0)?;
-
-        // distribute it to slow followers
-        for (id, status) in self.state_data.snapshots.iter_mut() {
-            // reset snapshot state by taking it from option
-            if let Some(_) = status.take() {
-                handler
-                    .send_peer_message(*id, PeerMessage::InstallSnapshotRequest(message.clone()));
-            }
-            *status = Some(SnapshotStatus {
-                last_chunk: 0,
-                total_chunks: info.chunks,
-            })
-        }
         Ok(snapshot_changed)
     }
 
@@ -426,8 +500,24 @@ where
         if self.state_data.config_change.is_some() {
             Ok(ConfigurationChangeResponse::AlreadyPending)
         } else {
-            self.state_data.config_change =
-                Some(ConfigChange::new(request.id, request.info.clone()));
+            let info = self
+                .state_machine
+                .snapshot_info()
+                .map_err(|e| Error::Critical(CriticalError::StateMachine(Box::new(e))))?;
+            let snapshot_index = if let Some(SnapshotInfo { index, .. }) = info {
+                index
+            } else {
+                // local node has no snapshot yet
+                LogIndex(0)
+            };
+
+            self.state_data.config_change = Some(ConfigChange::new(
+                request.id,
+                snapshot_index,
+                request.info.clone(),
+                self.options.timeouts.clone(),
+            ));
+
             // we can send a ping request to receive the log index at the catching up node
             // the first success will not be counted as a good round because
             // response_this_timeout is set to false at this point
@@ -543,7 +633,9 @@ where
         self.into_follower(handler, ConsensusState::Leader, leader_term)
     }
 
-    // while advancing index, the spet down may be required, the falg about it is returned
+    // while advancing index, the step down may be required, if one of the committed entries
+    // contains the configuration change, which removes the current node
+    // the return value is the flag showing if stepping down have to happen
     fn try_advance_commit_index(&mut self, handler: &mut H) -> Result<bool, Error> {
         let majority = self.config.majority(self.id);
         // Here we try to move commit index to one that the majority of peers in cluster already have
@@ -645,20 +737,52 @@ where
                 .map_err(|e| Error::PersistentLogRead(Box::new(e)))?;
             if follower_last_index < first_log_index {
                 trace!(
-                    "peer {} is slow and requires snapshotting",
+                    "peer {} is behind leader and requires snapshot because it is out of log index range {} < {}",
                     from,
-                    local_latest_log_index - follower_last_index
+                    local_latest_log_index, follower_last_index
                 );
-                if let Some(Some(status)) = self.state_data.snapshots {
-                    // we are already sending snapshot to follower
+                if self.state_data.pending_snapshots.contains(&from) {
+                    // We were already sending snapshot to follower, but received ApendEntries from
+                    // it with lower index than we have.
+                    // Possible reasons and solutions:
+                    // 1. AppendEntriesResponse was delayed and we already sending a snapshot to
+                    //    this follower
+                    // 2. Follower received the last chunk, but our log went too far from the last snapshot
+                    // we've sent and we already took a new snapshot
+                    //
+                    // In both these cases it is ok to sent a first chunk of the current snapshot.
+                    // For case (1) this can be handled by the state machine metadata mechanism
+                    // For case (2) it is just natural and the snapshot is really required
+
+                    // So, if no case is missed in the reasoning above, it's always the same action
+                    // regardless of the follower state
                 }
-                if true {
-                    todo!("mix snapshots and append entries???");
+                self.state_data.pending_snapshots.insert(from);
+                todo!("sending snapshot to catching up node");
+                match self.new_install_snapshot(None) {
+                    Ok(Some((message, _info))) => {
+                        Ok(Some(PeerMessage::InstallSnapshotRequest(message)))
+                    }
+                    Ok(None) | Err(Error::SnapshotExpected) => {
+                        debug!("no snapshot at leader while follower is behind, delaying InstallSnapshot for {}", from);
+                        // this should be some kind of impossible or a very rare situation: follower is
+                        // already behind, but the leader's snapshot is still not ready. Would probably
+                        // mean the leader is slow at creating the snapshot. All we can do here is to
+                        // let a follower wait for leader to recover
+                        //
+                        // we will retry  to send a snapshot to the follower after a heartbeat timeout
+                        // we need the heartbeat message
+                        //
+                        todo!("no timewout for catchin up nodes, fail catch up instead");
+                        handler.set_timeout(Timeout::Heartbeat(from));
+                        Ok(None)
+                    }
+                    Err(e) => return Err(e),
                 }
             } else {
-                // The peer is behind: send it entries to catch up.
+                // The peer is in log index range, but behind: send it entries to catch up.
                 trace!(
-                    "peer {} is missing at least {} entries, sending them",
+                    "peer {} is missing at least {} log entries, sending them",
                     from,
                     local_latest_log_index - follower_last_index
                 );
@@ -675,8 +799,8 @@ where
                     term: current_term,
                     prev_log_index,
                     prev_log_term,
-                    entries: Vec::new(),
                     leader_commit: self.commit_index,
+                    entries: Vec::new(),
                 };
 
                 self.fill_entries(
@@ -691,76 +815,72 @@ where
                 Ok(Some(PeerMessage::AppendEntriesRequest(message)))
             }
         } else {
+            // peer is in sync with leader, only catching up peers require action
             if self.state_data.is_catching_up(from) {
                 return Err(Error::unreachable(module_path!()));
             }
 
-            // since the peer is caught up, set a heartbeat timeout.
+            // since the peer has caught up, set a heartbeat timeout.
             handler.set_timeout(Timeout::Heartbeat(from));
             Ok(None)
         }
     }
 
     // read a chunk from state machine and put it into InstallSnapshot packet
-    // state machine MUST have actual snapshot at this point
-    // metadata will be placed ONLY in packet, adnd removed from info
+    // if snapshot is not required or cannot be made, None is returned
     fn new_install_snapshot(
         &self,
-        chunk_number: usize,
-    ) -> Result<(InstallSnapshotRequest, SnapshotInfo), Error> {
+        chunk_request: Option<&[u8]>,
+    ) -> Result<Option<(InstallSnapshotRequest, SnapshotInfo)>, Error> {
+        let info = self
+            .state_machine
+            .snapshot_info()
+            .map_err(|e| Error::Critical(CriticalError::StateMachine(Box::new(e))))?
+            .ok_or(Error::SnapshotExpected)?;
+
         let chunk_data = self
             .state_machine
-            .read_snapshot_chunk(chunk_number)
+            .read_snapshot_chunk(chunk_request)
             .map_err(|e| Error::Critical(CriticalError::StateMachine(Box::new(e))))?;
 
-        let mut info = if let Some(info) = self
-            .state_machine
-            .snapshot_info(true)
-            .map_err(|e| Error::Critical(CriticalError::StateMachine(Box::new(e))))?
-        {
-            info
-        } else {
-            return Err(Error::unreachable(module_path!()));
-        };
+        if let Some(chunk_data) = chunk_data {
+            let term = self.current_term()?;
+            let last_log_index = self.latest_log_index()?;
+            let last_log_term = self
+                .with_log(|log| log.term_of(last_log_index))?
+                .ok_or(Error::log_broken(last_log_index, module_path!()))?;
 
-        let term = self.current_term()?;
-        let last_log_index = self.latest_log_index()?;
-        let last_log_term = self
-            .with_log(|log| log.term_of(last_log_index))?
-            .ok_or(Error::log_broken(last_log_index, module_path!()))?;
-        let last_config = if chunk_number == 0 {
-            Some(self.config.clone())
+            let last_config = if chunk_request.is_some() {
+                Some(self.config.clone())
+            } else {
+                None
+            };
+
+            let message = InstallSnapshotRequest {
+                term,
+                last_log_index,
+                last_log_term,
+                leader_commit: self.commit_index,
+                last_config,
+                snapshot_index: info.index,
+                chunk_data,
+            };
+            Ok(Some((message, info)))
         } else {
-            None
-        };
-        let metadata = if chunk_number == 0 {
-            info.metadata.take()
-        } else {
-            None
-        };
-        let message = InstallSnapshotRequest {
-            term,
-            last_log_index,
-            last_log_term,
-            leader_commit: self.commit_index,
-            last_config,
-            metadata,
-            chunk_number,
-            chunk_data,
-        };
-        Ok((message, info))
+            Ok(None)
+        }
     }
 
-    fn check_catch_up_state(
+    fn check_catch_up_status(
         &mut self,
         handler: &mut H,
         from: ServerId,
         current_term: Term,
         local_latest_log_index: LogIndex,
-    ) -> Result<Option<AppendEntriesRequest>, Error> {
+    ) -> Result<Option<PeerMessage>, Error> {
         // having success from the catching up node, means
         // it has catched up the last round
-        // the exception here is teh very first "ping"
+        // the exception here is the very first "ping"
         // request, it will go to Some(false) because
         // last round check was not set to true intentionally
         match self.state_data.update_rounds()? {
@@ -772,7 +892,7 @@ where
                 // TODO
                 // too bad, we cannot borrow config from self at the same time with
                 // running something on self.log
-                // let's hope borrowing rules change someday
+                // let's hope borrowing rules change someday (2021 edition promises it!)
                 // until that time it's not very bad to clone a config
                 let config = self.config.clone();
 
@@ -787,7 +907,41 @@ where
                 trace!(
                     "catching up node did not catch this round, continuing the catching up process"
                 );
-                self.next_entries_or_snapshot(handler, from, current_term, local_latest_log_index)
+
+                // We need to maintain correct states here. Possible cases:
+                match self.next_entries_or_snapshot(
+                    handler,
+                    from,
+                    current_term,
+                    local_latest_log_index,
+                )? {
+                    m
+                    @
+                    Some(PeerMessage::InstallSnapshotRequest(InstallSnapshotRequest {
+                        snapshot_index,
+                        ..
+                    })) => {
+                        // Node is going to receive InstallSnapshotRequest message. Not depending on which chunk or
+                        // snapshot count it is, the state must migrate to snapshotting at snapshot
+                        // index
+                        if let Some(config_change) = &mut self.state_data.config_change {
+                            config_change.transition_to_snapshotting(snapshot_index)?;
+                            Ok(m)
+                        } else {
+                            Err(Error::unreachable(module_path!()))
+                        }
+                    }
+                    m @ Some(PeerMessage::AppendEntriesRequest(_)) => {
+                        // Node receives AppendEntriesRequest message. State must be CatchingUp.
+                        if let Some(config_change) = &mut self.state_data.config_change {
+                            config_change.transition_to_catching_up()?;
+                            Ok(m)
+                        } else {
+                            Err(Error::unreachable(module_path!()))
+                        }
+                    }
+                    _ => Err(Error::unreachable(module_path!())),
+                }
             }
             CatchUpStatus::TooSlow => {
                 trace!("catching up node was too slow, configuration change cancelled");
@@ -817,10 +971,10 @@ where
             let mut entry: Entry = log_entry.into();
             if self
                 .log
-                    .latest_config_index()
-                    .map_err(|e| Error::PersistentLogRead(Box::new(e)))?
-                    .map(|idx| idx.as_u64() == index)
-                    .unwrap_or(false)
+                .latest_config_index()
+                .map_err(|e| Error::PersistentLogRead(Box::new(e)))?
+                .map(|idx| idx.as_u64() == index)
+                .unwrap_or(false)
             {
                 entry.set_config_active(true);
             }
@@ -910,7 +1064,7 @@ pub(crate) struct Leader {
     next_index: HashMap<ServerId, LogIndex>,
     match_index: HashMap<ServerId, LogIndex>,
     peers_alive: HashSet<ServerId>,
-    snapshots: HashMap<ServerId, Option<SnapshotStatus>>,
+    pending_snapshots: HashSet<ServerId>,
     /// stores pending config change making sure there can only be one at a time
     pub(crate) config_change: Option<ConfigChange>,
     /// Stores in-flight client proposals.
@@ -944,7 +1098,7 @@ impl Leader {
             peers_alive: HashSet::new(),
             config_change: None,
             proposals: VecDeque::new(),
-            snapshots: HashMap::new(),
+            pending_snapshots: HashSet::new(),
         }
     }
 
@@ -960,39 +1114,28 @@ impl Leader {
         }
     }
 
-    fn reset_config_change<H: Handler>(&mut self, handler: &mut H) {
-        match self.config_change.take() {
-            Some(ConfigChange {
-                peer,
-                stage: ConfigChangeStage::CatchingUp { .. },
-            }) => {
-                //trace!("configuration change cancelled because of leader changing to follower");
-                // TODO: notify admin about cancelling
-                handler.clear_timeout(Timeout::Heartbeat(peer.id));
-            }
-            Some(ConfigChange {
-                stage: ConfigChangeStage::Committing { .. },
-                ..
-            }) => {}
-            None => {}
-        }
-    }
-
     /// Returns the next log entry index of the follower or a catching up peer.
+    /// Used only in AppendEntries context
     fn next_index(&mut self, follower: &ServerId) -> Result<LogIndex, Error> {
         if let Some(index) = self.next_index.get(follower) {
             return Ok(*index);
         }
 
-        if let Some(ConfigChange {
-            peer,
-            stage: ConfigChangeStage::CatchingUp { index, .. },
-        }) = &self.config_change
-        {
-            if &peer.id == follower {
-                // the index is requested for a catching up peer
-                return Ok(*index);
+        match &self.config_change {
+            Some(ConfigChange {
+                peer,
+                stage: ConfigChangeStage::CatchingUp { index, .. },
+                ..
+            }) => {
+                if &peer.id == follower {
+                    // the index is requested for a catching up peer
+                    return Ok(*index);
+                }
             }
+            Some(_) => {
+                return Err(Error::unreachable(module_path!()));
+            }
+            _ => (),
         }
 
         Err(Error::UnknownPeer(follower.clone()))
@@ -1005,17 +1148,48 @@ impl Leader {
             return Ok(());
         }
 
-        if let Some(ConfigChange {
-            peer,
-            stage: ConfigChangeStage::CatchingUp {
-                index: cf_index, ..
-            },
-        }) = &mut self.config_change
-        {
-            if peer.id == follower {
-                *cf_index = index;
-                return Ok(());
+        match &mut self.config_change {
+            Some(
+                config_change
+                @
+                ConfigChange {
+                    peer,
+                    stage:
+                        ConfigChangeStage::Snapshotting {
+                            index: cf_index, ..
+                        },
+                    ..
+                },
+            ) => {
+                // setting index while node is snapshotting means node
+                // finished a snapshot and can migrate to catching up
+                if peer.id == follower {
+                    if cf_index == &index {
+                        config_change.transition_to_catching_up()?;
+                        return Ok(());
+                    }
+                }
             }
+            Some(ConfigChange {
+                peer,
+                stage:
+                    ConfigChangeStage::CatchingUp {
+                        index: cf_index, ..
+                    },
+                ..
+            }) => {
+                if peer.id == follower {
+                    *cf_index = index;
+                    return Ok(());
+                }
+            }
+
+            Some(ConfigChange { peer, .. }) => {
+                if peer.id == follower {
+                    return Err(Error::unreachable(module_path!()));
+                }
+            }
+            _ => (),
         }
 
         Err(Error::UnknownPeer(follower))
@@ -1027,36 +1201,82 @@ impl Leader {
         self.match_index.insert(follower, index);
     }
 
-    /// config_index should be brought to save the log index the new config will
-    /// be committed to leader log at (in case of catching up success)
-    fn update_rounds(&mut self) -> Result<CatchUpStatus, Error> {
-        if let Some(ConfigChange {
-            stage:
-                ConfigChangeStage::CatchingUp {
-                    rounds,
-                    response_this_timeout,
-                    timeouts,
-                    ..
-                },
+    fn reset_config_change<H: Handler>(&mut self, handler: &mut H) {
+        match self.config_change.take() {
+            Some(ConfigChange {
+                peer,
+                stage: ConfigChangeStage::Snapshotting { .. },
                 ..
-        }) = &mut self.config_change
-        {
-            if *rounds == 0 {
-                Ok(CatchUpStatus::TooSlow)
-            } else {
-                *rounds -= 1;
-                if *response_this_timeout {
-                    // node has caught up because we already had response within this timeout
-                    Ok(CatchUpStatus::CaughtUp)
+            })
+            | Some(ConfigChange {
+                peer,
+                stage: ConfigChangeStage::CatchingUp { .. },
+                ..
+            }) => {
+                debug!(
+                    "config change has been canceled for catching-up node {}",
+                    peer.id
+                );
+                handler.clear_timeout(Timeout::Heartbeat(peer.id));
+            }
+            Some(ConfigChange {
+                stage: ConfigChangeStage::Committing { .. },
+                ..
+            }) => {}
+            None => {}
+        }
+    }
+
+    fn update_rounds(&mut self) -> Result<CatchUpStatus, Error> {
+        match &mut self.config_change {
+            Some(ConfigChange {
+                stage:
+                    ConfigChangeStage::Snapshotting {
+                        response_this_timeout,
+                        timeouts,
+                        ..
+                    },
+                max_snapshot_timeouts,
+                ..
+            }) => {
+                *response_this_timeout = true;
+                *timeouts = *max_snapshot_timeouts;
+
+                // node receiving snapshots is never ready for the config change, because it needs
+                // a log entries
+                Ok(CatchUpStatus::NotYet)
+            }
+
+            Some(ConfigChange {
+                stage:
+                    ConfigChangeStage::CatchingUp {
+                        rounds,
+                        response_this_timeout,
+                        timeouts,
+                        ..
+                    },
+                max_log_timeouts,
+                ..
+            }) => {
+                if *rounds == 0 {
+                    Ok(CatchUpStatus::TooSlow)
                 } else {
-                    *response_this_timeout = true;
-                    *timeouts = 20;
-                    Ok(CatchUpStatus::NotYet)
+                    *rounds -= 1;
+                    if *response_this_timeout {
+                        // node has caught up because we already had response within this timeout
+                        Ok(CatchUpStatus::CaughtUp)
+                    } else {
+                        *response_this_timeout = true;
+                        *timeouts = *max_log_timeouts;
+                        Ok(CatchUpStatus::NotYet)
+                    }
                 }
             }
-        } else {
-            //panic!("IMPLEMENTATION BUG: update_rounds called during wrong stage")
-            Err(Error::unreachable(module_path!()))
+            Some(_) => Err(Error::unreachable(module_path!())),
+            None => {
+                //panic!("IMPLEMENTATION BUG: update_rounds called during wrong stage")
+                Err(Error::unreachable(module_path!()))
+            }
         }
     }
 
@@ -1083,26 +1303,58 @@ impl Leader {
         }
     }
 
+    // Logic for expiring timeouts on all stages
     fn catching_up_timeout(&mut self) -> Result<bool, Error> {
-        if let Some(ConfigChange {
-            stage:
-                ConfigChangeStage::CatchingUp {
-                    response_this_timeout,
-                    timeouts,
-                    ..
-                },
+        match &mut self.config_change {
+            Some(ConfigChange {
+                stage:
+                    ConfigChangeStage::Snapshotting {
+                        response_this_timeout,
+                        timeouts,
+                        ..
+                    },
+                total_timeouts,
                 ..
-        }) = &mut self.config_change
-        {
-            *response_this_timeout = false;
-            if *timeouts > 0 {
-                *timeouts -= 1;
-                Ok(true)
-            } else {
-                Ok(false)
+            }) => {
+                *response_this_timeout = false;
+                if *total_timeouts > 0 {
+                    *total_timeouts -= 1;
+                } else {
+                    return Ok(false);
+                }
+
+                if *timeouts > 0 {
+                    *timeouts -= 1;
+                    Ok(true)
+                } else {
+                    Ok(false)
+                }
             }
-        } else {
-            Err(Error::Critical(CriticalError::Unreachable(module_path!())))
+            Some(ConfigChange {
+                stage:
+                    ConfigChangeStage::CatchingUp {
+                        response_this_timeout,
+                        timeouts,
+                        ..
+                    },
+                total_timeouts,
+                ..
+            }) => {
+                *response_this_timeout = false;
+                if *total_timeouts > 0 {
+                    *total_timeouts -= 1;
+                } else {
+                    return Ok(false);
+                }
+
+                if *timeouts > 0 {
+                    *timeouts -= 1;
+                    Ok(true)
+                } else {
+                    Ok(false)
+                }
+            }
+            _ => Err(Error::Critical(CriticalError::Unreachable(module_path!()))),
         }
     }
 
@@ -1113,12 +1365,6 @@ impl Leader {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct SnapshotStatus {
-    total_chunks: usize,
-    last_chunk: usize,
-}
-
 pub(crate) enum CatchUpStatus {
     TooSlow,
     NotYet,
@@ -1127,6 +1373,11 @@ pub(crate) enum CatchUpStatus {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ConfigChangeStage {
+    Snapshotting {
+        index: LogIndex,
+        timeouts: u32,
+        response_this_timeout: bool,
+    },
     CatchingUp {
         index: LogIndex,
         rounds: u32,
@@ -1136,22 +1387,80 @@ pub(crate) enum ConfigChangeStage {
     Committing(ConsensusConfig, LogIndex), // previous config
 }
 
+// TODO: we could adjust the amount of timeouts automatically, based on measurements
+// done for snapshotting active followers
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ConfigChange {
     pub(crate) peer: Peer,
     pub(crate) stage: ConfigChangeStage,
+    total_timeouts: u32,
+    max_snapshot_timeouts: u32,
+    max_log_timeouts: u32,
 }
 
 impl ConfigChange {
-    pub(crate) fn new(id: ServerId, metadata: Vec<u8>) -> Self {
+    pub(crate) fn new(
+        id: ServerId,
+        index: LogIndex,
+        metadata: Vec<u8>,
+        timeouts: SlowNodeTimeouts,
+    ) -> Self {
+        let SlowNodeTimeouts {
+            max_snapshot_timeouts,
+            max_log_timeouts,
+            max_total_timeouts,
+        } = timeouts;
         Self {
             peer: Peer { id, metadata },
-            stage: ConfigChangeStage::CatchingUp {
-                index: LogIndex(0),
-                rounds: MAX_ROUNDS,
-                timeouts: MAX_TIMEOUTS,
+            stage: ConfigChangeStage::Snapshotting {
+                index,
+                timeouts: max_snapshot_timeouts,
                 response_this_timeout: false,
             },
+            total_timeouts: max_total_timeouts,
+
+            max_log_timeouts,
+            max_snapshot_timeouts,
         }
+    }
+
+    fn transition_to_catching_up(&mut self) -> Result<(), Error> {
+        let new_stage = match self.stage {
+            ConfigChangeStage::CatchingUp { .. } => {
+                return Ok(());
+            }
+            ConfigChangeStage::Snapshotting {
+                index,
+                response_this_timeout,
+                ..
+            } => ConfigChangeStage::CatchingUp {
+                index,
+                rounds: MAX_ROUNDS,
+                timeouts: self.max_log_timeouts,
+                response_this_timeout: false,
+            },
+            _ => return Err(Error::unreachable(module_path!())),
+        };
+        self.stage = new_stage;
+        Ok(())
+    }
+
+    fn transition_to_snapshotting(&mut self, index: LogIndex) -> Result<(), Error> {
+        let new_stage = match self.stage {
+            ConfigChangeStage::Snapshotting { .. } => {
+                return Ok(());
+            }
+            ConfigChangeStage::CatchingUp {
+                response_this_timeout,
+                ..
+            } => ConfigChangeStage::Snapshotting {
+                index,
+                timeouts: self.max_snapshot_timeouts,
+                response_this_timeout: false,
+            },
+            _ => return Err(Error::unreachable(module_path!())),
+        };
+        self.stage = new_stage;
+        Ok(())
     }
 }

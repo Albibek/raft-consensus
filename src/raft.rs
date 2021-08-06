@@ -12,7 +12,7 @@ use crate::state_impl::{
 };
 
 use crate::candidate::Candidate;
-use crate::config::ConsensusConfig;
+use crate::config::{ConsensusConfig, StateOptions};
 use crate::follower::Follower;
 use crate::leader::Leader;
 use crate::persistent_log::Log;
@@ -32,6 +32,7 @@ where
     bootstrap_config: ConsensusConfig,
     force_bootstrap: bool,
     can_vote: Option<bool>,
+    state_options: StateOptions,
 }
 
 impl<L, M> RaftBuilder<L, M>
@@ -52,6 +53,7 @@ where
             },
             force_bootstrap: false,
             can_vote: None,
+            state_options: StateOptions::default(),
         }
     }
 
@@ -70,6 +72,23 @@ where
         self.can_vote = Some(can_vote)
     }
 
+    /// Defines a number of election timeouts the catching up node can process a single
+    /// AppendEntriesRequest
+    pub fn with_log_timeouts(&mut self, log_timeouts: u32) {
+        self.state_options.timeouts.max_log_timeouts = log_timeouts
+    }
+
+    /// Defines a number of election timeouts the catching up node can process a single
+    /// chunk of snapshot
+    pub fn with_snapshot_timeouts(&mut self, snapshot_timeouts: u32) {
+        self.state_options.timeouts.max_snapshot_timeouts = snapshot_timeouts
+    }
+
+    /// Defines a number of election timeouts the catching up can catch up in total
+    pub fn with_catch_up_timeouts(&mut self, total_timeouts: u32) {
+        self.state_options.timeouts.max_total_timeouts = total_timeouts
+    }
+
     pub fn start<H: Handler>(self, handler: &mut H) -> Result<Raft<L, M, H>, Error> {
         let Self {
             id,
@@ -78,6 +97,7 @@ where
             bootstrap_config,
             force_bootstrap,
             can_vote,
+            state_options,
         } = self;
 
         let config = if let Some(index) = log
@@ -120,6 +140,7 @@ where
             min_index: LogIndex(0),
             last_applied: LogIndex(0),
             state_data: Follower::new(can_vote),
+            options: state_options,
             _h: PhantomData,
         };
         trace!("raft id={} initialized", id);

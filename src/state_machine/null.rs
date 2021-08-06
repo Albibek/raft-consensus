@@ -10,8 +10,8 @@ pub struct NullStateMachine {
     snapshot_index: LogIndex,
 }
 
-#[error("null machine error")]
 #[derive(ThisError, Debug)]
+#[error("null machine error")]
 pub enum Error {
     NullMachineError,
 }
@@ -23,6 +23,7 @@ impl NullStateMachine {
         }
     }
 }
+
 impl StateMachine for NullStateMachine {
     type Error = Error;
 
@@ -34,14 +35,11 @@ impl StateMachine for NullStateMachine {
         Ok(Vec::new())
     }
 
-    fn snapshot_info(&self, _meta_reuqired: bool) -> Result<Option<SnapshotInfo>, Self::Error> {
+    fn snapshot_info(&self) -> Result<Option<SnapshotInfo>, Self::Error> {
         if self.snapshot_index != LogIndex(0) {
             Ok(Some(SnapshotInfo {
                 index: self.snapshot_index,
                 size: 0,
-                chunks: 1,
-                finished: true,
-                metadata: None,
             }))
         } else {
             Ok(None)
@@ -53,24 +51,16 @@ impl StateMachine for NullStateMachine {
         Ok(())
     }
 
-    fn read_snapshot_chunk(&self, chunk: usize) -> Result<Vec<u8>, Self::Error> {
-        Ok(Vec::new())
-    }
-
-    fn init_new_snapshot(&mut self, info: SnapshotInfo) -> Result<(), Self::Error> {
-        self.snapshot_index = info.index;
-        Ok(())
+    fn read_snapshot_chunk(&self, _chunk: Option<&[u8]>) -> Result<Option<Vec<u8>>, Error> {
+        Ok(None)
     }
 
     fn write_snapshot_chunk(
         &mut self,
-        chunk: usize,
-        chunk_bytes: &[u8],
-    ) -> Result<(), Self::Error> {
-        if chunk != 1 || chunk_bytes.len() > 0 {
-            Err(Error::NullMachineError)
-        } else {
-            Ok(())
-        }
+        index: LogIndex,
+        _chunk_bytes: &[u8],
+    ) -> Result<Option<Vec<u8>>, Error> {
+        self.snapshot_index = index;
+        Ok(None)
     }
 }

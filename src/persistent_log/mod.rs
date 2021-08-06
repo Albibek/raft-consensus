@@ -247,8 +247,8 @@ impl<'a> From<&'a LogEntryRef<'a>> for Entry {
 
 /// A helper type for errors in persistent log. Contains typical errors, that could happen,
 /// but no code depends on it, so it only provided to make implementor's life easier.
-#[error("persistent log error")]
 #[derive(ThisError, Debug)]
+#[error("persistent log error")]
 pub enum LogError {
     Version(u64, u64),
     BadIndex(LogIndex),

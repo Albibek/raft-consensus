@@ -219,7 +219,7 @@ where
         handler: &mut H,
         from: ServerId,
         request: &InstallSnapshotRequest,
-    ) -> Result<(InstallSnapshotResponse, CurrentState<L, M, H>), Error>;
+    ) -> Result<(PeerMessage, CurrentState<L, M, H>), Error>;
 
     /// Apply an append entries response to the consensus.
     fn install_snapshot_response(

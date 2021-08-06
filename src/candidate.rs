@@ -144,8 +144,29 @@ where
         handler: &mut H,
         from: ServerId,
         request: &InstallSnapshotRequest,
-    ) -> Result<(InstallSnapshotResponse, CurrentState<L, M, H>), Error> {
-        todo!()
+    ) -> Result<(PeerMessage, CurrentState<L, M, H>), Error> {
+        // this is the same logic as in append_entries_request
+        let leader_term = request.term;
+        let current_term = self.current_term()?;
+
+        // previous term is not counted as stale, it can happen because of
+        // the delayed request from the leader, and it is ok because node
+        // can still see the leader
+        if leader_term < current_term - 1 {
+            return Ok((
+                PeerMessage::InstallSnapshotResponse(InstallSnapshotResponse::StaleTerm(
+                    current_term,
+                )),
+                self.into(),
+            ));
+        }
+
+        // receiving InstallSnapshot within current term for candidate means new leader was found,
+        // so it must become follower now
+        let follower = self.into_follower(handler, ConsensusState::Candidate, leader_term)?;
+
+        // after becoming follower it should process the request
+        follower.install_snapshot_request(handler, from, request)
     }
 
     fn install_snapshot_response(
@@ -154,7 +175,7 @@ where
         from: ServerId,
         response: &InstallSnapshotResponse,
     ) -> Result<(Option<PeerMessage>, CurrentState<L, M, H>), Error> {
-        todo!()
+        Ok((None, self.into()))
     }
 
     // Timeout handling
@@ -320,6 +341,7 @@ where
             last_applied: self.last_applied,
             _h: PhantomData,
             state_data: state,
+            options: self.options,
         };
 
         let (_, message) = leader.add_new_entry(LogEntryDataRef::Empty)?;

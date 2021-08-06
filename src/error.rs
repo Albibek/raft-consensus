@@ -9,8 +9,8 @@ use capnp::Error as CapnpError;
 #[cfg(feature = "use_capnp")]
 use capnp::NotInSchema;
 
-#[error("raft consensus error")]
 #[derive(ThisError, Debug)]
+#[error("raft consensus error")]
 pub enum Error {
     #[error("consensus have reached unrecoverable error: {}", _0)]
     Critical(#[from] CriticalError),
@@ -55,6 +55,9 @@ pub enum Error {
 
     #[error("unable to support {} cluster members", _0)]
     BadClusterSize(usize),
+
+    #[error("state machine didn't have snapshot where it expected to exist")]
+    SnapshotExpected,
 }
 
 impl Error {
@@ -77,8 +80,8 @@ impl Error {
     }
 }
 
-#[error("Critical error in consensus")]
 #[derive(ThisError, Debug)]
+#[error("Critical error in consensus")]
 pub enum CriticalError {
     #[error("BUG: unreachable condition at {}", _0)]
     Unreachable(&'static str),

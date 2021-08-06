@@ -5,7 +5,7 @@ use log::{info, trace};
 use crate::state_machine::StateMachine;
 use crate::{error::CriticalError, persistent_log::Log};
 
-use crate::config::ConsensusConfig;
+use crate::config::{ConsensusConfig, StateOptions};
 //use crate::entry::{ConsensusConfig, Entry, EntryData};
 use crate::error::Error;
 use crate::handler::Handler;
@@ -50,6 +50,8 @@ where
 
     // State-specific data
     pub(crate) state_data: S,
+
+    pub(crate) options: StateOptions,
 
     pub(crate) _h: PhantomData<H>,
 }
@@ -153,6 +155,7 @@ where
             // node already was a candidate or a leader, meaning it definitely
             // can vote
             state_data: Follower::new(true),
+            options: self.options,
         };
 
         // Apply all changes via the new state
@@ -244,15 +247,17 @@ where
 
     // checks snapshot only if forced,
     pub(crate) fn common_check_compaction(&mut self, force: bool) -> Result<bool, Error> {
-        let snapshot_info = self
+        let info = self
             .state_machine
-            .snapshot_info(false)
+            .snapshot_info()
             .map_err(|e| Error::Critical(CriticalError::StateMachine(Box::new(e))))?;
-        if self.commit_index == LogIndex(0) {
-            return Ok(false);
-        }
 
-        if let Some(info) = snapshot_info {
+        if let Some(info) = info {
+            if info.index != self.commit_index || self.commit_index != LogIndex(0) {
+                trace!("not taking snapshot because log index did not change or commit index is not known yet");
+                return Ok(false);
+            }
+
             if self.commit_index < info.index {
                 // snapshot is from later index, meaning it is corrupted
                 return Err(Error::Critical(CriticalError::SnapshotCorrupted));
@@ -266,7 +271,7 @@ where
             }
         }
 
-        // we should get here in 2 cases:
+        // we should get here if:
         // * commit_index > info.index
         // * snapshot_info is None
         // both meaning there is a point to make the snapshot

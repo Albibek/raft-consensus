@@ -88,21 +88,23 @@ struct PeerMessage {
         leaderCommit @3 :UInt64;
 
         lastConfig @4 :List(Peer);
-        metadata @5 :Data;
 
-        chunkNumber @6: UInt64;
-        chunkData @7 :Data;
+        snapshotIndex @5 :UInt64;
+        chunkData @6 :Data;
     }
 
     struct InstallSnapshotResponse {
-      term @0 :UInt64;
-
       union {
-        success @1 :TermAndIndex;
-        staleTerm @2 :UInt64;
+        success @0 :SnapshotChunkSuccess;
+        staleTerm @1 :UInt64;
       }
     }
 
+    struct SnapshotChunkSuccess {
+        term @0 :UInt64;
+        logIndex @1 :UInt64;
+        nextChunkRequest @2 :Data;
+    }
 }
 
 # Client messages

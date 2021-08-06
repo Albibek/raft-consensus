@@ -72,7 +72,7 @@ where
         request: &RequestVoteRequest,
     ) -> Result<(Option<RequestVoteResponse>, CurrentState<L, M, H>), Error> {
         if !self.state_data.can_vote {
-            debug!("catching up node received a voting request");
+            debug!("non-voting node received a voting request");
             return Ok((None, self.into()));
         }
         // To avoid disrupting leader while configuration changes, node should ignore or delay vote requests
@@ -147,12 +147,44 @@ where
     }
 
     fn install_snapshot_request(
-        self,
-        handler: &mut H,
-        from: ServerId,
+        mut self,
+        _handler: &mut H,
+        _from: ServerId,
         request: &InstallSnapshotRequest,
-    ) -> Result<(InstallSnapshotResponse, CurrentState<L, M, H>), Error> {
-        todo!()
+    ) -> Result<(PeerMessage, CurrentState<L, M, H>), Error> {
+        let current_term = self.current_term()?;
+
+        if request.term < current_term {
+            let message = InstallSnapshotResponse::StaleTerm(current_term);
+            return Ok((PeerMessage::InstallSnapshotResponse(message), self.into()));
+        }
+
+        if let Some(ref last_config) = request.last_config {
+            self.log
+                .set_latest_config(last_config, request.snapshot_index)
+                .map_err(|e| Error::Critical(CriticalError::PersistentLogWrite(Box::new(e))))?;
+            self.config = last_config.clone();
+        }
+
+        let next_chunk_request = self
+            .state_machine
+            .write_snapshot_chunk(request.snapshot_index, &request.chunk_data)
+            .map_err(|e| Error::Critical(CriticalError::StateMachine(Box::new(e))))?;
+
+        if next_chunk_request.is_none() {
+            // the follower has finished writing the last chunk of a snapshot
+            // we don't need old records in log now
+            self.log
+                .discard_since(request.snapshot_index)
+                .map_err(|e| Error::Critical(CriticalError::PersistentLogWrite(Box::new(e))))?;
+        }
+
+        let message = InstallSnapshotResponse::Success(
+            current_term,
+            request.snapshot_index,
+            next_chunk_request,
+        );
+        Ok((PeerMessage::InstallSnapshotResponse(message), self.into()))
     }
 
     fn install_snapshot_response(
@@ -161,7 +193,9 @@ where
         from: ServerId,
         response: &InstallSnapshotResponse,
     ) -> Result<(Option<PeerMessage>, CurrentState<L, M, H>), Error> {
-        todo!()
+        // whetever the response is, the follower cannot process it because
+        // the node in follower state does not now about snapshot states of other nodes
+        return Ok((None, self.into()));
     }
 
     // Timeout handling
@@ -176,7 +210,7 @@ where
             return Err(Error::unreachable(module_path!()));
         }
 
-        // election timeout is never down, but we want handler to radomize it
+        // election timeout is never down, but we want handler to randomize it every tick
         // TODO: probably make this an option
         handler.set_timeout(Timeout::Election);
         if let Some((from, ref request)) = self.state_data.delayed_vote_request.take() {
@@ -243,7 +277,8 @@ where
     ) -> Result<ClientResponse, Error> {
         // TODO: introduce an option for allowing the response from the potentially
         // older state of the machine
-        // With such option it could be possible to reply the machine on the follower
+        // With such option it could be possible to request the state machine on the follower
+        // having eventual consistency as the result
         trace!("query from client {}", from);
         Ok(self
             .state_data
@@ -344,7 +379,7 @@ where
             // If an existing entry conflicts with a new one (same index but different terms),
             // delete the existing entry and all that follow it
 
-            self.with_log_mut(|log| log.discard_since(leader_prev_log_index))?;
+            self.with_log_mut(|log| log.discard_until(leader_prev_log_index))?;
 
             // TODO we could send a hint to a leader about existing index, so leader
             // could send the entries starting from this index instead of decrementing it each time
@@ -366,11 +401,11 @@ where
         // now, for non-empty entries
         // append only those that needs to be applied
         let AppendEntriesRequest {
-            entries,
-            ..
-                //term , prev_log_index, prev_log_term, leader_commit, entries
-        }
-        = request;
+                        entries,
+                        ..
+                            //term , prev_log_index, prev_log_term, leader_commit, entries
+                    }
+                    = request;
         let num_entries = entries.len();
         let new_latest_log_index = leader_prev_log_index + num_entries as u64;
         if new_latest_log_index < self.min_index {
@@ -382,6 +417,15 @@ where
 
         let mut append_index = leader_prev_log_index + 1;
         for entry in entries.iter() {
+            // with each send, leader marks config entries as active if they really take place
+            // as current cluster configuration, this way the follower can skip using previous
+            // inactive entries as actual ones and will not connect to some old nodes
+            if let EntryData::Config(config, is_active) = entry.data {
+                if is_active {
+                    self.config = config.clone();
+                }
+            }
+
             self.with_log_mut(|log| log.append_entry(append_index, &entry.as_entry_ref()))?;
             append_index = append_index + 1;
         }
@@ -442,6 +486,7 @@ where
             last_applied: self.last_applied,
             _h: PhantomData,
             state_data,
+            options: self.options,
         };
 
         handler.state_changed(ConsensusState::Follower, ConsensusState::Candidate);
@@ -453,11 +498,13 @@ where
 /// The state associated with a Raft consensus module in the `Follower` state.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Follower {
-    /// The most recent leader of the follower. The leader is not guaranteed to be active, so this
-    /// should only be used as a hint.
-    pub(crate) leader: Option<ServerId>,
+    // The most recent leader of the follower. The leader is not guaranteed to be active, so this
+    // should only be used as a hint.
+    leader: Option<ServerId>,
 
     delayed_vote_request: Option<(ServerId, RequestVoteRequest)>,
+
+    // makes node catching up or non-voting
     can_vote: bool,
 }
 

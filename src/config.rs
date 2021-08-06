@@ -11,7 +11,7 @@ pub use crate::handler::Handler;
 pub use crate::persistent_log::Log;
 pub use crate::state_machine::StateMachine;
 
-/// Full cluster config. Always stores all
+/// Full cluster config replicated using Raft mechanism. Always stores all
 /// nodes, including self.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 #[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
@@ -84,6 +84,48 @@ impl ConsensusConfig {
             .filter(|peer| &peer.id != this)
             .map(|peer| f(&peer.id))
             .last();
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct StateOptions {
+    pub timeouts: SlowNodeTimeouts,
+}
+
+/// Raft paper describes a multiple-round method for catching up the log where the size of the
+/// message is reduced each round due to number of log entries decreasing.
+///
+/// Still, paper says nothing about restoring snapshots on a catching up node.
+/// Since a size of chunks are most probably not decreasing each send, there is no
+/// point to measure them in rounds, so we introduce the fixed amount of election
+/// timeouts which should be enough to install a full snapshot, or even several snapshots
+/// if they go one after another.
+/// There is also a possible state where node is flapping between catching up and
+/// installing snapshot(for example snapshots install fast, but log catching
+/// is slow). To avoid flapping, there is also state independent total_timeouts
+/// counter, which decreases each election timeout regardless of the incoming messages.
+///
+/// timeouts are given per message, i.e. per snapshot chunk or a list of log entries,
+/// each timeout is given as a number of election timeouts, so it is a bit random
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SlowNodeTimeouts {
+    pub(crate) max_snapshot_timeouts: u32,
+    pub(crate) max_log_timeouts: u32,
+    pub(crate) max_total_timeouts: u32,
+}
+
+impl Default for SlowNodeTimeouts {
+    fn default() -> Self {
+        Self {
+            max_snapshot_timeouts: 40,
+            max_log_timeouts: 20,
+            // for regular network max election timeout will be around 500ms, but
+            // not less than heartbeat timeout of 250ms, which means a median of
+            // 375ms.
+            // We should allow a big time for snapshot to settle in these conditions.
+            // Let this be 10 minutes by default
+            max_total_timeouts: 10u32 * 60 * 1000 / 375,
+        }
     }
 }
 
