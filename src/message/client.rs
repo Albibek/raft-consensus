@@ -57,6 +57,37 @@ impl ClientMessage {
 /// Response to client command
 pub struct ClientRequest {
     pub data: Vec<u8>,
+    pub guarantee: ClientGuarantee,
+}
+
+/// Client can choose a tradeoff between network load and a lag of the request being committed by the majority.
+///
+/// This value is also propagated to the state machine which may or may not use it to decide on
+/// i.e. filesystem syncs or other actions
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
+pub enum ClientGuarantee {
+    /// Fastest replication, highest network load: each client proposal is replicated and committed ASAP.
+    /// The best time for such message will be around network round robin time.
+    Instant,
+    /// Fast replication, highest network load: each client proposal is replicated ASAP and
+    /// committed by heartbeat timeout. The best time for this guarantee will be a heartbeat
+    /// timeout.
+    Fast,
+    /// Severe batching(the default behaviour asumed in the Raft whitepaper):
+    /// client proposals are persisted to log and replicated by heartbeat timer. The best time is
+    /// heartbeat timeout + 1/2 of network round robin time.
+    Log,
+    /// Time/size based batching: proposals are cashed in memory and only written *to log* all at once when a
+    /// special tunable timer fires. The best time depends on the special timer. Please note that
+    /// this tradeoff is shifted towards a weaker guarantee against potentially effective writing of bigger batches.
+    Batch,
+}
+
+impl Default for ClientGuarantee {
+    fn default() -> Self {
+        ClientGuarantee::Log
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -67,7 +98,11 @@ pub enum ClientResponse {
 
     /// The proposal has been queued on the leader and waiting the majority
     /// of nodes to commit it
-    Queued,
+    Queued(LogIndex),
+
+    /// The state machine is not ready to process the query yet, so
+    /// the response is deferred until state machine moves forward
+    Deferred,
 
     /// The request failed because the Raft node is not the leader, and does
     /// not know who the leader is.

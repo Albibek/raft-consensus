@@ -5,7 +5,7 @@ use std::iter::FromIterator;
 use crate::error::Error;
 use crate::message::Timeout;
 
-use crate::{LogIndex, Peer, ServerId, Term};
+use crate::{Peer, ServerId};
 
 pub use crate::handler::Handler;
 pub use crate::persistent_log::Log;
@@ -87,10 +87,12 @@ impl ConsensusConfig {
     }
 }
 
+/// Tunables for each node. This config is per node and not replicated.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct StateOptions {
+pub struct ConsensusOptions {
     pub timeouts: SlowNodeTimeouts,
 }
+
 
 /// Raft paper describes a multiple-round method for catching up the log where the size of the
 /// message is reduced each round due to number of log entries decreasing.
@@ -108,10 +110,10 @@ pub struct StateOptions {
 /// timeouts are given per message, i.e. per snapshot chunk or a list of log entries,
 /// each timeout is given as a number of election timeouts, so it is a bit random
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct SlowNodeTimeouts {
-    pub(crate) max_snapshot_timeouts: u32,
-    pub(crate) max_log_timeouts: u32,
-    pub(crate) max_total_timeouts: u32,
+pub struct SlowNodeTimeouts {
+    pub max_snapshot_timeouts: u32,
+    pub max_log_timeouts: u32,
+    pub max_total_timeouts: u32,
 }
 
 impl Default for SlowNodeTimeouts {

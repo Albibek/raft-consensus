@@ -2,21 +2,20 @@ use crate::{error::Error, AdminId};
 
 use crate::handler::Handler;
 use crate::message::*;
-use crate::persistent_log::Log;
+
 use crate::state_machine::StateMachine;
 use crate::{ClientId, ServerId};
 
 use crate::raft::CurrentState;
 
 /// Applies a peer message to the consensus
-pub(crate) fn apply_peer_message<L, M, S: StateImpl<L, M, H>, H: Handler>(
+pub(crate) fn apply_peer_message<M, S: StateImpl<M, H>, H: Handler>(
     s: S,
     handler: &mut H,
     from: ServerId,
     message: &PeerMessage,
-) -> Result<CurrentState<L, M, H>, Error>
+) -> Result<CurrentState<M, H>, Error>
 where
-    L: Log,
     M: StateMachine,
     H: Handler,
 {
@@ -65,13 +64,12 @@ where
     }
 }
 
-pub(crate) fn apply_timeout<L, M, S: StateImpl<L, M, H>, H: Handler>(
+pub(crate) fn apply_timeout<M, S: StateImpl<M, H>, H: Handler>(
     mut s: S,
     handler: &mut H,
     timeout: Timeout,
-) -> Result<CurrentState<L, M, H>, Error>
+) -> Result<CurrentState<M, H>, Error>
 where
-    L: Log,
     M: StateMachine,
     H: Handler,
 {
@@ -83,18 +81,21 @@ where
             handler.send_peer_message(id, request);
             Ok(s.into_consensus_state())
         }
+        Timeout::Client => {
+            s.client_timeout(handler)?;
+            Ok(s.into_consensus_state())
+        }
     }
 }
 
 /// Applies a client message to the consensus state machine.
-pub(crate) fn apply_client_message<L, M, S: StateImpl<L, M, H>, H: Handler>(
+pub(crate) fn apply_client_message<M, S: StateImpl<M, H>, H: Handler>(
     s: &mut S,
     handler: &mut H,
     from: ClientId,
     message: &ClientMessage,
 ) -> Result<(), Error>
 where
-    L: Log,
     M: StateMachine,
     H: Handler,
 {
@@ -120,20 +121,19 @@ where
     }
 }
 
-pub(crate) fn apply_admin_message<L, M, S: StateImpl<L, M, H>, H: Handler>(
+pub(crate) fn apply_admin_message<M, S: StateImpl<M, H>, H: Handler>(
     s: &mut S,
     handler: &mut H,
     from: AdminId,
     message: &AdminMessage,
 ) -> Result<(), Error>
 where
-    L: Log,
     M: StateMachine,
     H: Handler,
 {
     match message {
         AdminMessage::AddServerRequest(request) => {
-            let message = s.add_server_request(handler, request)?;
+            let message = s.add_server_request(handler, from, request)?;
             handler.send_admin_message(from, AdminMessage::AddServerResponse(message));
             Ok(())
         }
@@ -168,9 +168,8 @@ where
 }
 
 /// This trait defines a consensus behaviour that should be supported in each particular state
-pub(crate) trait StateImpl<L, M, H>
+pub(crate) trait StateImpl<M, H>
 where
-    L: Log,
     M: StateMachine,
     H: Handler,
 {
@@ -182,7 +181,7 @@ where
         handler: &mut H,
         from: ServerId,
         request: &AppendEntriesRequest,
-    ) -> Result<(AppendEntriesResponse, CurrentState<L, M, H>), Error>;
+    ) -> Result<(AppendEntriesResponse, CurrentState<M, H>), Error>;
 
     /// Apply an append entries response to the consensus.
     fn append_entries_response(
@@ -190,7 +189,7 @@ where
         handler: &mut H,
         from: ServerId,
         response: &AppendEntriesResponse,
-    ) -> Result<(Option<PeerMessage>, CurrentState<L, M, H>), Error>;
+    ) -> Result<(Option<PeerMessage>, CurrentState<M, H>), Error>;
 
     ///////////////////////////
     // RequestVoteRPC
@@ -200,7 +199,7 @@ where
         handler: &mut H,
         candidate: ServerId,
         request: &RequestVoteRequest,
-    ) -> Result<(Option<RequestVoteResponse>, CurrentState<L, M, H>), Error>;
+    ) -> Result<(Option<RequestVoteResponse>, CurrentState<M, H>), Error>;
 
     /// Applies a request vote response to the consensus.
     fn request_vote_response(
@@ -208,10 +207,10 @@ where
         handler: &mut H,
         from: ServerId,
         response: &RequestVoteResponse,
-    ) -> Result<CurrentState<L, M, H>, Error>;
+    ) -> Result<CurrentState<M, H>, Error>;
 
-    /// Applies a preliminary timeout response to the consensus
-    fn timeout_now(self, handler: &mut H) -> Result<CurrentState<L, M, H>, Error>;
+    /// Applies a preliminary election timeout response to the consensus
+    fn timeout_now(self, handler: &mut H) -> Result<CurrentState<M, H>, Error>;
 
     /// Apply an append entries request to the consensus state machine.
     fn install_snapshot_request(
@@ -219,7 +218,7 @@ where
         handler: &mut H,
         from: ServerId,
         request: &InstallSnapshotRequest,
-    ) -> Result<(PeerMessage, CurrentState<L, M, H>), Error>;
+    ) -> Result<(PeerMessage, CurrentState<M, H>), Error>;
 
     /// Apply an append entries response to the consensus.
     fn install_snapshot_response(
@@ -227,7 +226,7 @@ where
         handler: &mut H,
         from: ServerId,
         response: &InstallSnapshotResponse,
-    ) -> Result<(Option<PeerMessage>, CurrentState<L, M, H>), Error>;
+    ) -> Result<(Option<PeerMessage>, CurrentState<M, H>), Error>;
 
     ///////////////////////////
     // Timeouts
@@ -235,7 +234,12 @@ where
 
     /// Handles heartbeat timeout event
     fn heartbeat_timeout(&mut self, peer: ServerId) -> Result<AppendEntriesRequest, Error>;
-    fn election_timeout(self, handler: &mut H) -> Result<CurrentState<L, M, H>, Error>;
+
+    /// Handles election timeout
+    fn election_timeout(self, handler: &mut H) -> Result<CurrentState<M, H>, Error>;
+
+    /// Handles client requests timeout if batching is enabled
+    fn client_timeout(&mut self, handler: &mut H) -> Result<(), Error>;
 
     fn check_compaction(&mut self, handler: &mut H, force: bool) -> Result<bool, Error>;
     ///////////////////////////
@@ -266,6 +270,7 @@ where
     fn add_server_request(
         &mut self,
         handler: &mut H,
+        from: AdminId,
         request: &AddServerRequest,
     ) -> Result<ConfigurationChangeResponse, Error>;
 
@@ -285,5 +290,5 @@ where
     // Utility messages and actions
     fn peer_connected(&mut self, handler: &mut H, peer: ServerId) -> Result<(), Error>;
 
-    fn into_consensus_state(self) -> CurrentState<L, M, H>;
+    fn into_consensus_state(self) -> CurrentState<M, H>;
 }

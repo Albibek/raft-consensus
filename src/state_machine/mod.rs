@@ -12,6 +12,7 @@
 pub mod null;
 
 //pub use crate::state_machine::channel::ChannelStateMachine;
+use crate::persistent_log::Log;
 pub use crate::state_machine::null::NullStateMachine;
 use crate::LogIndex;
 
@@ -41,8 +42,11 @@ pub struct SnapshotInfo {
 /// means all kinds of windowing strategies should be performed on a consensus calling level by
 /// emulating an `InstallSnapshotResponse` messages.
 ///
-/// It is always the leader's state machine that decides that snapshot is
-/// complete, which means every correct response from InstallSnapsnot will be delivered to it.
+/// Since the leader side must have the knowlege that snapshot is complete, every successfull result of `write_next_chunk`
+/// will be sent to it. In case when None is returned, the None value is not passed to the leader's state machine
+/// `read_next_chunk` function, meaning, the follower state machine MUST knows there will be no chunks from the chunk_data
+/// message itself.
+///
 /// Only after the snapshot is transferred to follower completely and the very last chunk of it
 /// is confirmed, the leader will consider follower index changed and will recount the majority
 /// according to this new data.
@@ -54,17 +58,50 @@ pub struct SnapshotInfo {
 /// Instead, the functions should return the StateMachine::Error. Any kind of error will be treated by consensus as
 /// unrecoverable.
 pub trait StateMachine {
-    type Error: std::error::Error + Sized + 'static;
-    /// Applies a command to the state machine.
-    /// if results_required is true, should return an application-specific result value.
+    /// The persistent log used by this state machine.
     ///
-    /// The situation when results are not requred happens on follower who only applies the entry from log, but does
-    /// not require sending any response. In such case the function may return an empty vector to avoid allocation.
-    fn apply(&mut self, command: &[u8], results_required: bool) -> Result<Vec<u8>, Self::Error>;
+    /// Using and assotiated type allows state machine to do some optimizations, like not copying
+    /// bytes between log and the machine itself, for example, if the log and state machine are
+    /// implemented using the same storage engine.
+    /// Those implementors who don't want this kind of specificity, may always fall toa generic
+    /// implementation.
+    type Log: Log;
+    type Error: std::error::Error + Sized + 'static;
+
+    /// Should return a read-only reference to the log, for consensus to use it directly
+    fn log(&self) -> &Self::Log;
+
+    /// Should return a mutable reference to the log, for consensus to use it directly
+    fn log_mut(&mut self) -> &mut Self::Log;
+
+    /// Applies a command to the state machine. A command should be already stored in the specified log index.
+    /// Asynchronous machines may decide if last_applied should be increased at once, but if not,
+    /// they shoul expect the same index to be requested multiple times.
+    ///
+    /// If `results_required` is true, should return an application-specific result value which will
+    /// be forwarded to client. `results_required` may be false when the command is applied on a follower which is not
+    /// expected to reply to a client.
+    /// Function may return None in cases where result is not required or in any other situation.
+    /// For example a client, which does not expect answer at all or uses `query()` for polling
+    /// state machine.
+    fn apply(
+        &mut self,
+        index: LogIndex,
+        results_required: bool,
+    ) -> Result<Option<Vec<u8>>, Self::Error>;
 
     /// Queries a value of the state machine. Does not go through the durable log, or mutate the state machine.
     /// Returns an application-specific result value.
     fn query(&self, query: &[u8]) -> Result<Vec<u8>, Self::Error>;
+
+    /// Must return currently applied index. The index must have the same persistency as the
+    /// state machine itself and will be used by a leader to decide which log entries to
+    /// delete from log.
+    /// Tthat is, if a state machine is working asynchronously, its last_applied
+    /// index may be behind conensus commit_index. In that case any unapplied entry
+    /// will be applied even if it was tried before. This is a state machine's responsibility
+    /// to decide on properly processing such duplicate applications.
+    fn last_applied(&self) -> Result<LogIndex, Self::Error>;
 
     /// Should return information about current snapshot, if any.
     fn snapshot_info(&self) -> Result<Option<SnapshotInfo>, Self::Error>;
@@ -75,14 +112,12 @@ pub trait StateMachine {
     fn take_snapshot(&mut self, index: LogIndex) -> Result<(), Self::Error>;
 
     /// Should give away the next chunk of the current snapshot based on previous chunk data.
-    /// Option in query can be used to receive the first chunk.
-    /// Returning None means there is no chunks left, in which case the snapshot will be considered read completely.
-    /// Returning None as the first chunk will be equivalent to not having an active snapshot
-    /// ready, in which case the snapshot sending will be delayed to the heartbeat timeout.
-    ///
+    /// None value as a request means the first chunk is requested, so there is no follower side
+    /// requests yet.
     /// Note that any possible shapshot metadata useful for the remote side, i.e. to create
-    /// a correct query for the next chunk, has to be inside the returned vector.
-    fn read_snapshot_chunk(&self, query: Option<&[u8]>) -> Result<Option<Vec<u8>>, Self::Error>;
+    /// a correct request for the next chunk or to understand that there is no more chunks left,
+    /// has to be inside the returned vector.
+    fn read_snapshot_chunk(&self, request: Option<&[u8]>) -> Result<Vec<u8>, Self::Error>;
 
     /// Should write a part of externally initiated new snapshot make it current if
     /// all chunks are received. Is is also up to the implementation to decide if the snapshot
@@ -92,7 +127,9 @@ pub trait StateMachine {
     /// considers index to be written right after the function returns None.
     ///
     /// The returned value is a request for the next chunk or None if the
-    /// chunk is the last one.
+    /// chunk is the last one. Any returned value including None will be sent to leader
+    /// to let leader know that snapshot is done, but None will not be passed to leader's state
+    /// machine, so it should not be confused with first chunk request.
     fn write_snapshot_chunk(
         &mut self,
         index: LogIndex,

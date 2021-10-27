@@ -22,6 +22,7 @@ pub trait Handler: Debug {
     /// exchanged messages witht hem.
     // Called when some follower(especially the catching one) receives the latest configuration change
     // so peer list may be counted updated and ready for sending messages.
+    // FIXME: insert calls into places where consensus config changes
     fn update_peers(&mut self, peers: &ConsensusConfig);
 
     #[allow(unused_variables)]

@@ -16,23 +16,17 @@ use raft_consensus::handler::{CollectHandler, Handler};
 
 use log::{debug, info, trace};
 
-pub type TestState = Raft<MemLog, HashMachine, TestHandler>;
+pub type TestState = Raft<HashMachine<MemLog>, TestHandler>;
 
 //#[derive(Clone, Debug, PartialEq, Eq)]
-#[derive(Clone, Debug, Eq)]
+#[derive(Clone, Debug)]
 pub struct TestCluster {
     pub nodes: HashMap<ServerId, TestState>,
     pub handler: TestHandler,
 }
 
-impl PartialEq for TestCluster {
-    fn eq(&self, other: &Self) -> bool {
-        self.nodes == other.nodes
-    }
-}
-
 impl TestCluster {
-    pub fn new(size: usize) -> Self {
+    pub fn new(size: usize, chunked_machine: bool) -> Self {
         pretty_env_logger::try_init().unwrap_or_else(|_| ());
         let peers: Vec<Peer> = (0..size)
             .map(|i| Peer {
@@ -44,9 +38,9 @@ impl TestCluster {
         let mut handler = TestHandler::new(size);
         for peer in &peers {
             let store = MemLog::new();
-            let machine = HashMachine::new();
+            let machine = HashMachine::new(store, chunked_machine);
 
-            let mut builder = RaftBuilder::new(peer.id, store, machine);
+            let mut builder = RaftBuilder::new(peer.id, machine);
             builder.with_bootstrap_config(ConsensusConfig::new(peers.iter().cloned()));
 
             handler.cur = peer.id;
@@ -57,6 +51,8 @@ impl TestCluster {
     }
 
     // start the consensus and  make everyone elect a leader
+    // due to no election randomization (intentionally) the
+    // leader will always be ServerId(0) after the kickstart
     pub fn kickstart(&mut self) {
         trace!("start {:?}", self.handler);
         // at the start all nodes have set their election timeouts
@@ -93,7 +89,7 @@ impl TestCluster {
         // we've missed the timeouts and need to push them back, so cluster
         // is good to correctly proceed
 
-        // TODO: as of now leader clears it's eleciton timeout, but there
+        // TODO: as of now leader clears it's election timeout, but there
         // are client API considerations that may have it always on in the future
 
         trace!("kickstart finished {:?}", self);
@@ -196,11 +192,12 @@ impl TestCluster {
 
     pub fn assert_log_condition(&mut self) {
         for (id, node) in &mut self.nodes {
-            let log = node.log();
+            let log = node.log().unwrap();
             let latest = log.latest_log_index().unwrap();
             trace!("id={} log latest {}", id, latest);
             for index in 1..(latest.as_u64() + 1) {
-                let mut log_entry = LogEntry::new_proposal(Term(0), Vec::new());
+                let mut log_entry =
+                    LogEntry::new_proposal(Term(0), Vec::new(), ClientId::default());
                 log.read_entry(LogIndex(index), &mut log_entry).unwrap();
                 trace!("id={} entry {:?}", id, log_entry);
             }
@@ -209,7 +206,7 @@ impl TestCluster {
 
     pub fn assert_machine_condition(&mut self) {
         for (id, node) in &mut self.nodes {
-            let machine = node.state_machine();
+            let machine = node.state_machine().unwrap();
             let result = machine.query(&[]);
             trace!("id={} state machine state: {:?}", id, result);
         }

@@ -6,8 +6,7 @@ use log::{debug, info, trace};
 
 use crate::handler::Handler;
 use crate::message::*;
-use crate::persistent_log::Log;
-use crate::persistent_log::{LogEntry, LogEntryData};
+use crate::persistent_log::{Log, LogEntryMeta};
 use crate::raft::CurrentState;
 use crate::state::State;
 use crate::state_impl::StateImpl;
@@ -17,9 +16,8 @@ use crate::{AdminId, ClientId, LogIndex, ServerId, Term};
 use crate::candidate::Candidate;
 
 /// Follower replicates AppendEntries requests and votes for it's leader.
-impl<L, M, H> StateImpl<L, M, H> for State<L, M, H, Follower>
+impl<M, H> StateImpl<M, H> for State<M, H, Follower>
 where
-    L: Log,
     M: StateMachine,
     H: Handler,
 {
@@ -28,7 +26,7 @@ where
         handler: &mut H,
         from: ServerId,
         request: &AppendEntriesRequest,
-    ) -> Result<(AppendEntriesResponse, CurrentState<L, M, H>), Error> {
+    ) -> Result<(AppendEntriesResponse, CurrentState<M, H>), Error> {
         let leader_term = request.term;
         let current_term = self.current_term()?;
 
@@ -57,7 +55,7 @@ where
         _handler: &mut H,
         _from: ServerId,
         _response: &AppendEntriesResponse,
-    ) -> Result<(Option<PeerMessage>, CurrentState<L, M, H>), Error> {
+    ) -> Result<(Option<PeerMessage>, CurrentState<M, H>), Error> {
         // the follower can only receive responses in case the node was a leader some time ago
         // and sent requests which triggered the reponse while response was held somewhere in network
         //
@@ -70,7 +68,7 @@ where
         handler: &mut H,
         candidate: ServerId,
         request: &RequestVoteRequest,
-    ) -> Result<(Option<RequestVoteResponse>, CurrentState<L, M, H>), Error> {
+    ) -> Result<(Option<RequestVoteResponse>, CurrentState<M, H>), Error> {
         if !self.state_data.can_vote {
             debug!("non-voting node received a voting request");
             return Ok((None, self.into()));
@@ -115,7 +113,7 @@ where
         handler: &mut H,
         from: ServerId,
         response: &RequestVoteResponse,
-    ) -> Result<CurrentState<L, M, H>, Error> {
+    ) -> Result<CurrentState<M, H>, Error> {
         let local_term = self.current_term()?;
         let voter_term = response.voter_term();
         if local_term < voter_term {
@@ -141,7 +139,7 @@ where
         }
     }
 
-    fn timeout_now(self, handler: &mut H) -> Result<CurrentState<L, M, H>, Error> {
+    fn timeout_now(self, handler: &mut H) -> Result<CurrentState<M, H>, Error> {
         let candidate = self.into_candidate(handler, true)?;
         Ok(candidate.into())
     }
@@ -151,7 +149,7 @@ where
         _handler: &mut H,
         _from: ServerId,
         request: &InstallSnapshotRequest,
-    ) -> Result<(PeerMessage, CurrentState<L, M, H>), Error> {
+    ) -> Result<(PeerMessage, CurrentState<M, H>), Error> {
         let current_term = self.current_term()?;
 
         if request.term < current_term {
@@ -160,7 +158,7 @@ where
         }
 
         if let Some(ref last_config) = request.last_config {
-            self.log
+            self.log_mut()
                 .set_latest_config(last_config, request.snapshot_index)
                 .map_err(|e| Error::Critical(CriticalError::PersistentLogWrite(Box::new(e))))?;
             self.config = last_config.clone();
@@ -174,7 +172,7 @@ where
         if next_chunk_request.is_none() {
             // the follower has finished writing the last chunk of a snapshot
             // we don't need old records in log now
-            self.log
+            self.log_mut()
                 .discard_since(request.snapshot_index)
                 .map_err(|e| Error::Critical(CriticalError::PersistentLogWrite(Box::new(e))))?;
         }
@@ -189,12 +187,20 @@ where
 
     fn install_snapshot_response(
         self,
-        handler: &mut H,
+        _handler: &mut H,
         from: ServerId,
         response: &InstallSnapshotResponse,
-    ) -> Result<(Option<PeerMessage>, CurrentState<L, M, H>), Error> {
-        // whetever the response is, the follower cannot process it because
+    ) -> Result<(Option<PeerMessage>, CurrentState<M, H>), Error> {
+        // whatever the response is, the follower cannot process it because
         // the node in follower state does not now about snapshot states of other nodes
+        // TODO: we could do some term checks and reply with StaleTerm for example,
+        // but there are cases where follower could be behind so most probably
+        // we should not
+        trace!(
+            "unknown snapshot response from {} on follower: {:?}",
+            from,
+            response
+        );
         return Ok((None, self.into()));
     }
 
@@ -204,7 +210,7 @@ where
         Err(Error::MustLeader)
     }
 
-    fn election_timeout(mut self, handler: &mut H) -> Result<CurrentState<L, M, H>, Error> {
+    fn election_timeout(mut self, handler: &mut H) -> Result<CurrentState<M, H>, Error> {
         if !self.state_data.can_vote {
             // non voters should not set election timeout
             return Err(Error::unreachable(module_path!()));
@@ -296,8 +302,10 @@ where
     fn add_server_request(
         &mut self,
         _handler: &mut H,
+        _from: AdminId,
         _request: &AddServerRequest,
     ) -> Result<ConfigurationChangeResponse, Error> {
+        // TODO: forward to leader
         self.state_data
             .leader
             .map_or(Ok(ConfigurationChangeResponse::UnknownLeader), |leader| {
@@ -325,14 +333,17 @@ where
         Ok(())
     }
 
-    fn into_consensus_state(self) -> CurrentState<L, M, H> {
+    fn into_consensus_state(self) -> CurrentState<M, H> {
         CurrentState::Follower(self)
+    }
+
+    fn client_timeout(&mut self, _handler: &mut H) -> Result<(), Error> {
+        Ok(())
     }
 }
 
-impl<L, M, H> State<L, M, H, Follower>
+impl<M, H> State<M, H, Follower>
 where
-    L: Log,
     M: StateMachine,
     H: Handler,
 {
@@ -344,7 +355,9 @@ where
     ) -> Result<AppendEntriesResponse, Error> {
         let leader_term = request.term;
         if current_term < leader_term {
-            self.with_log_mut(|log| log.set_current_term(leader_term))?;
+            self.log_mut()
+                .set_current_term(leader_term)
+                .map_err(|e| Error::Critical(CriticalError::PersistentLogWrite(Box::new(e))))?;
         }
 
         let leader_prev_log_index = request.prev_log_index;
@@ -369,7 +382,9 @@ where
             Some(Term::from(0))
         } else {
             // try to find term of specified log index and check if there is such entry
-            self.with_log(|log| log.term_of(leader_prev_log_index))?
+            self.log()
+                .term_of(leader_prev_log_index)
+                .map_err(|e| Error::PersistentLogRead(Box::new(e)))?
         };
 
         if existing_term
@@ -379,26 +394,17 @@ where
             // If an existing entry conflicts with a new one (same index but different terms),
             // delete the existing entry and all that follow it
 
-            self.with_log_mut(|log| log.discard_until(leader_prev_log_index))?;
+            self.log_mut()
+                .discard_until(leader_prev_log_index)
+                .map_err(|e| Error::Critical(CriticalError::PersistentLogWrite(Box::new(e))))?;
 
-            // TODO we could send a hint to a leader about existing index, so leader
-            // could send the entries starting from this index instead of decrementing it each time
             return Ok(AppendEntriesResponse::InconsistentPrevEntry(
                 current_term,
                 latest_log_index,
             ));
         }
 
-        // empty entries means heartbeat message
-        if request.entries.is_empty() {
-            // reply success right away
-            return Ok(AppendEntriesResponse::Success(
-                current_term,
-                latest_log_index,
-            ));
-        }
-
-        // now, for non-empty entries
+        // now, for non-empty entries list
         // append only those that needs to be applied
         let AppendEntriesRequest {
                         entries,
@@ -407,6 +413,7 @@ where
                     }
                     = request;
         let num_entries = entries.len();
+
         let new_latest_log_index = leader_prev_log_index + num_entries as u64;
         if new_latest_log_index < self.min_index {
             // Stale entry; ignore. This guards against overwriting a
@@ -416,17 +423,25 @@ where
         }
 
         let mut append_index = leader_prev_log_index + 1;
+
+        // for a heartbeat request this cycle will be skipped
+        // but all other check and actions MUST be performed
+        // because due to Raft's nature the follower's state machine(not log though) is always 1 commit behind the leader
+        // until it receives the next AppendEntries message, be it heartbeat or whatever else
         for entry in entries.iter() {
             // with each send, leader marks config entries as active if they really take place
             // as current cluster configuration, this way the follower can skip using previous
             // inactive entries as actual ones and will not connect to some old nodes
-            if let EntryData::Config(config, is_active) = entry.data {
-                if is_active {
+            if let EntryData::Config(config, is_active, _) = &entry.data {
+                if *is_active {
                     self.config = config.clone();
                 }
             }
 
-            self.with_log_mut(|log| log.append_entry(append_index, &entry.as_entry_ref()))?;
+            self.log_mut()
+                .append_entry(append_index, &entry.as_entry_ref())
+                .map_err(|e| Error::Critical(CriticalError::PersistentLogWrite(Box::new(e))))?;
+
             append_index = append_index + 1;
         }
 
@@ -444,26 +459,43 @@ where
 
     /// Applies all committed but unapplied log entries to the state machine ignoring the results.
     pub(crate) fn apply_follower_commits(&mut self) -> Result<(), Error> {
-        while self.last_applied < self.commit_index {
-            let mut entry = LogEntry::default();
-            self.log
-                .read_entry(self.last_applied + 1, &mut entry)
+        let entry_index = self
+            .state_machine
+            .last_applied()
+            .map_err(|e| Error::Critical(CriticalError::StateMachine(Box::new(e))))?;
+        trace!(
+            "applying commits from {} to {}",
+            &entry_index,
+            &self.commit_index
+        );
+        while entry_index < self.commit_index {
+            let entry_index = entry_index + 1;
+            let entry_kind = self
+                .log()
+                .entry_meta_at(entry_index)
                 .map_err(|e| Error::PersistentLogRead(Box::new(e)))?;
-            match entry.data {
-                LogEntryData::Empty => {}
-                LogEntryData::Proposal(data) => {
-                    let _ = self
-                        .state_machine
-                        .apply(&data, false)
+            //     let mut entry = LogEntry::default();
+            //self.log
+            //.read_entry(self.last_applied, &mut entry)
+            //         .map_err(|e| Error::PersistentLogRead(Box::new(e)))?;
+
+            match entry_kind {
+                LogEntryMeta::Empty => {}
+                LogEntryMeta::Proposal(_) => {
+                    self.state_machine
+                        .apply(entry_index, false)
                         .map_err(|e| Error::Critical(CriticalError::StateMachine(Box::new(e))))?;
                 }
-                LogEntryData::Config(_) => {
-                    // this is the committing stage so far, there is no need to do anything
-                    // with the configuration entries at this point
+                LogEntryMeta::Config(config, _) => {
+                    // we only saved configuration to log(an an entry) and memory, but has not persisted it yet
+                    // this is what we have to do now
+                    self.log_mut()
+                        .set_latest_config(&config, entry_index)
+                        .map_err(|e| {
+                            Error::Critical(CriticalError::PersistentLogWrite(Box::new(e)))
+                        })?;
                 }
             }
-
-            self.last_applied = self.last_applied + 1;
         }
 
         Ok(())
@@ -473,17 +505,15 @@ where
         self,
         handler: &mut H,
         voluntary: bool,
-    ) -> Result<State<L, M, H, Candidate>, Error> {
+    ) -> Result<State<M, H, Candidate>, Error> {
         trace!("id={} transitioning to candidate", self.id);
         let state_data = Candidate::new();
         let mut candidate = State {
             id: self.id,
             config: self.config,
-            log: self.log,
             state_machine: self.state_machine,
             commit_index: self.commit_index,
             min_index: self.min_index,
-            last_applied: self.last_applied,
             _h: PhantomData,
             state_data,
             options: self.options,

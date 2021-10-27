@@ -12,7 +12,7 @@ use raft_consensus::*;
 fn test_leader_transfer_error() {
     // Test the very first stage of init: election of a leader
     // after all nodes have started as followers
-    let mut cluster = TestCluster::new(3);
+    let mut cluster = TestCluster::new(3, false);
     for node in cluster.nodes.values() {
         assert_eq!(node.kind(), ConsensusState::Follower);
     }
