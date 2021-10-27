@@ -9,13 +9,19 @@ struct Entry {
     term @0 :UInt64;
     union {
         noop @1 :Void;
-        proposal @2 :Data;
+        proposal @2 :ProposalEntry;
         config @3 :ConfigChangeEntry;
     }
+    
+    struct ProposalEntry {
+        data @0 :Data;
+        clientId @1 :UInt64;
+    } 
 
     struct ConfigChangeEntry {
         peers @0 :List(Peer);
         isActual @1 :Bool;
+        admidId @2 :UInt64;
     }
 }
 
@@ -115,6 +121,20 @@ struct ClientMessage {
 
         clientQueryRequest @2 :Data;
         clientQueryResponse @3 :ClientResponse;
+    }
+
+    struct ClientRequest {
+        data @0 :Data;
+        guarantee @1 :ClientGuarantee;
+    }
+
+    struct ClientGuarantee {
+        union {
+            instant @0 :Void;
+            fast @1 :Void;
+            log @2 :Void;
+            batch @3 :Void;
+        }
     }
 
     struct ClientResponse {

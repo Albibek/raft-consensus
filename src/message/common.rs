@@ -47,6 +47,8 @@ pub enum Timeout {
     Election,
     /// A heartbeat timeout. Stable value, set by leader separately for each peer.
     Heartbeat(ServerId),
+    /// A client timeout, if time based client message batching is enabled
+    Client,
 }
 
 // TODO

@@ -5,7 +5,7 @@ use log::{info, trace};
 use crate::state_machine::StateMachine;
 use crate::{error::CriticalError, persistent_log::Log};
 
-use crate::config::{ConsensusConfig, StateOptions};
+use crate::config::{ConsensusConfig, ConsensusOptions};
 //use crate::entry::{ConsensusConfig, Entry, EntryData};
 use crate::error::Error;
 use crate::handler::Handler;
@@ -17,9 +17,8 @@ use crate::{LogIndex, ServerId, Term};
 use crate::follower::Follower;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct State<L, M, H, S>
+pub(crate) struct State<M, H, S>
 where
-    L: Log,
     M: StateMachine,
     H: Handler,
 {
@@ -28,9 +27,6 @@ where
 
     // The IDs of peers in the consensus group.
     pub(crate) config: ConsensusConfig,
-
-    // The persistent log.
-    pub(crate) log: L,
 
     // The client state machine to which client commands are applied.
     pub(crate) state_machine: M,
@@ -46,27 +42,26 @@ where
     pub(crate) min_index: LogIndex,
 
     // Index of the latest entry applied to the state machine.
-    pub(crate) last_applied: LogIndex,
+    //    pub(crate) last_applied: LogIndex,
 
     // State-specific data
     pub(crate) state_data: S,
 
-    pub(crate) options: StateOptions,
+    pub(crate) options: ConsensusOptions,
 
     pub(crate) _h: PhantomData<H>,
 }
 
 /// Common functions for any state
-impl<L, M, H, S> State<L, M, H, S>
+impl<M, H, S> State<M, H, S>
 where
-    L: Log,
     M: StateMachine,
     H: Handler,
 {
     /// Returns the current term.
     pub(crate) fn current_term(&self) -> Result<Term, Error> {
         Ok(self
-            .log
+            .log()
             .current_term()
             .map_err(|e| Error::PersistentLogRead(Box::new(e)))?)
     }
@@ -74,25 +69,26 @@ where
     /// Increases the current term and resets the voted_for value.
     pub(crate) fn inc_current_term(&mut self) -> Result<(), Error> {
         let current = self
-            .log
+            .log()
             .current_term()
             .map_err(|e| Error::PersistentLogRead(Box::new(e)))?;
-        self.log
+        self.log_mut()
             .set_voted_for(None)
             .map_err(|e| Error::Critical(CriticalError::PersistentLogWrite(Box::new(e))))?;
-        self.log
+        self.log_mut()
             .set_current_term(current + 1)
             .map_err(|e| Error::Critical(CriticalError::PersistentLogWrite(Box::new(e))))
     }
 
-    /// Returns the term of the latest applied log entry.
+    /// Helper for returning the term of the latest applied log entry.
+    #[inline]
     pub(crate) fn latest_log_term(&self) -> Result<Term, Error> {
         let index = self
-            .log
+            .log()
             .latest_log_index()
             .map_err(|e| Error::PersistentLogRead(Box::new(e)))?;
         match self
-            .log
+            .log()
             .term_of(index)
             .map_err(|e| Error::PersistentLogRead(Box::new(e)))?
         {
@@ -101,55 +97,50 @@ where
         }
     }
 
-    /// Returns the index of the latest applied log entry.
+    /// Helper for returning the index of the latest applied log entry.
+    #[inline]
     pub(crate) fn latest_log_index(&self) -> Result<LogIndex, Error> {
         Ok(self
-            .log
+            .log()
             .latest_log_index()
             .map_err(|e| Error::PersistentLogRead(Box::new(e)))?)
     }
 
-    pub(crate) fn with_log_mut<T, F>(&mut self, mut f: F) -> Result<T, Error>
-    where
-        F: FnMut(&mut L) -> Result<T, L::Error>,
-    {
-        f(&mut self.log)
-            .map_err(|e| Error::Critical(CriticalError::PersistentLogWrite(Box::new(e))))
+    /// Helper for self.state_machine.log()
+    #[inline]
+    pub(crate) fn log(&self) -> &M::Log {
+        self.state_machine.log()
     }
 
-    pub(crate) fn with_log<T, F>(&self, f: F) -> Result<T, Error>
-    where
-        F: Fn(&L) -> Result<T, L::Error>,
-    {
-        f(&self.log).map_err(|e| Error::PersistentLogRead(Box::new(e)))
+    /// Helper for self.state_machine.log_mut()
+    #[inline]
+    pub(crate) fn log_mut(&mut self) -> &mut M::Log {
+        self.state_machine.log_mut()
     }
 }
 
 // State change helpers
-impl<L, M, H, S> State<L, M, H, S>
+impl<M, H, S> State<M, H, S>
 where
-    L: Log,
     M: StateMachine,
     H: Handler,
-    Self: StateImpl<L, M, H>,
+    Self: StateImpl<M, H>,
 {
     pub(crate) fn into_follower(
         self,
         handler: &mut H,
         from: ConsensusState,
         leader_term: Term,
-    ) -> Result<State<L, M, H, Follower>, Error> {
+    ) -> Result<State<M, H, Follower>, Error> {
         trace!("id={} transitioning to follower", self.id);
         handler.state_changed(from, ConsensusState::Follower);
 
         let mut follower_state = State {
             id: self.id,
             config: self.config,
-            log: self.log,
             state_machine: self.state_machine,
             commit_index: self.commit_index,
             min_index: self.min_index,
-            last_applied: self.last_applied,
             _h: PhantomData,
             // this function is called when migrating from other states, meaning
             // node already was a candidate or a leader, meaning it definitely
@@ -159,7 +150,10 @@ where
         };
 
         // Apply all changes via the new state
-        follower_state.with_log_mut(|log| log.set_current_term(leader_term))?;
+        follower_state
+            .log_mut()
+            .set_current_term(leader_term)
+            .map_err(|e| Error::Critical(CriticalError::PersistentLogWrite(Box::new(e))))?;
 
         follower_state.config.clear_heartbeats(handler);
         handler.set_timeout(Timeout::Election);
@@ -174,7 +168,7 @@ where
         from: ServerId,
         request: &RequestVoteRequest,
         from_state: ConsensusState,
-    ) -> Result<(RequestVoteResponse, CurrentState<L, M, H>), Error> {
+    ) -> Result<(RequestVoteResponse, CurrentState<M, H>), Error> {
         let candidate_term = request.term;
         let candidate_log_term = request.last_log_term;
         let candidate_log_index = request.last_log_index;
@@ -209,9 +203,15 @@ where
             RequestVoteResponse::InconsistentLog(new_local_term)
         } else {
             // candidate_term == current_term
-            match self.with_log(|log| log.voted_for())? {
+            match self
+                .log()
+                .voted_for()
+                .map_err(|e| Error::PersistentLogRead(Box::new(e)))?
+            {
                 None => {
-                    self.with_log_mut(|log| log.set_voted_for(Some(from)))?;
+                    self.log_mut().set_voted_for(Some(from)).map_err(|e| {
+                        Error::Critical(CriticalError::PersistentLogWrite(Box::new(e)))
+                    })?;
                     trace!("granted vote to {}", from);
                     RequestVoteResponse::Granted(new_local_term)
                 }
@@ -278,7 +278,7 @@ where
         self.state_machine
             .take_snapshot(self.commit_index)
             .map_err(|e| Error::Critical(CriticalError::StateMachine(Box::new(e))))?;
-        self.log
+        self.log()
             .discard_until(self.commit_index)
             .map_err(|e| Error::Critical(CriticalError::PersistentLogWrite(Box::new(e))))?;
         return Ok(true);

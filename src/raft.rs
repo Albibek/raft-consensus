@@ -12,7 +12,7 @@ use crate::state_impl::{
 };
 
 use crate::candidate::Candidate;
-use crate::config::{ConsensusConfig, StateOptions};
+use crate::config::{ConsensusConfig, ConsensusOptions};
 use crate::follower::Follower;
 use crate::leader::Leader;
 use crate::persistent_log::Log;
@@ -21,29 +21,25 @@ use crate::state_machine::StateMachine;
 use crate::{AdminId, ClientId, LogIndex, Peer, ServerId};
 
 #[derive(Clone, Debug)]
-pub struct RaftBuilder<L, M>
+pub struct RaftBuilder<M>
 where
-    L: Log,
     M: StateMachine,
 {
     id: ServerId,
-    log: L,
     state_machine: M,
     bootstrap_config: ConsensusConfig,
     force_bootstrap: bool,
     can_vote: Option<bool>,
-    state_options: StateOptions,
+    state_options: ConsensusOptions,
 }
 
-impl<L, M> RaftBuilder<L, M>
+impl<M> RaftBuilder<M>
 where
-    L: Log,
     M: StateMachine,
 {
-    pub fn new(id: ServerId, log: L, state_machine: M) -> Self {
+    pub fn new(id: ServerId, state_machine: M) -> Self {
         Self {
             id,
-            log,
             state_machine,
             bootstrap_config: ConsensusConfig {
                 peers: vec![Peer {
@@ -53,7 +49,7 @@ where
             },
             force_bootstrap: false,
             can_vote: None,
-            state_options: StateOptions::default(),
+            state_options: ConsensusOptions::default(),
         }
     }
 
@@ -89,10 +85,9 @@ where
         self.state_options.timeouts.max_total_timeouts = total_timeouts
     }
 
-    pub fn start<H: Handler>(self, handler: &mut H) -> Result<Raft<L, M, H>, Error> {
+    pub fn start<H: Handler>(self, handler: &mut H) -> Result<Raft<M, H>, Error> {
         let Self {
             id,
-            log,
             state_machine,
             bootstrap_config,
             force_bootstrap,
@@ -100,7 +95,8 @@ where
             state_options,
         } = self;
 
-        let config = if let Some(index) = log
+        let config = if let Some(index) = state_machine
+            .log()
             .latest_config_index()
             .map_err(|e| Error::PersistentLogRead(Box::new(e)))?
         {
@@ -108,9 +104,11 @@ where
                 bootstrap_config
             } else {
                 let mut entry = LogEntry::default();
-                log.read_entry(index, &mut entry)
+                state_machine
+                    .log()
+                    .read_entry(index, &mut entry)
                     .map_err(|e| Error::PersistentLogRead(Box::new(e)))?;
-                if let LogEntryData::Config(config) = entry.data {
+                if let LogEntryData::Config(config, _) = entry.data {
                     config
                 } else {
                     return Err(Error::unreachable(module_path!()));
@@ -133,12 +131,10 @@ where
         let state = State {
             id,
             config,
-            log,
             state_machine,
             commit_index: LogIndex(0),
             // TODO: after snapshots min_index should be the index from snapshot
             min_index: LogIndex(0),
-            last_applied: LogIndex(0),
             state_data: Follower::new(can_vote),
             options: state_options,
             _h: PhantomData,
@@ -161,19 +157,17 @@ where
 // At the same time all the internal convenience and requirements like StateImpl correctness is
 // left intact and mofifiable
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Raft<L, M, H>
+pub struct Raft<M, H>
 where
-    L: Log,
     M: StateMachine,
     H: Handler,
 {
-    state: CurrentState<L, M, H>,
+    state: CurrentState<M, H>,
     _h: std::marker::PhantomData<H>,
 }
 
-impl<L, M, H> Raft<L, M, H>
+impl<M, H> Raft<M, H>
 where
-    L: Log,
     M: StateMachine,
     H: Handler,
 {
@@ -230,29 +224,28 @@ where
 }
 
 /// Some functions to use for querying log and state machine externally
-impl<L, M, H> Raft<L, M, H>
+impl<M, H> Raft<M, H>
 where
-    L: Log,
     M: StateMachine,
     H: Handler,
 {
     /// borrow the consensus log
-    pub fn log(&self) -> Option<&L> {
+    pub fn log(&self) -> Option<&M::Log> {
         match self.state {
             CurrentState::Lost => None,
-            CurrentState::Leader(ref s) => Some(&s.log),
-            CurrentState::Follower(ref s) => Some(&s.log),
-            CurrentState::Candidate(ref s) => Some(&s.log),
+            CurrentState::Leader(ref s) => Some(&s.state_machine.log()),
+            CurrentState::Follower(ref s) => Some(&s.state_machine.log()),
+            CurrentState::Candidate(ref s) => Some(&s.state_machine.log()),
         }
     }
 
     ///
-    pub fn log_mut(&mut self) -> Option<&mut L> {
+    pub fn log_mut(&mut self) -> Option<&mut M::Log> {
         match self.state {
             CurrentState::Lost => None,
-            CurrentState::Leader(ref mut s) => Some(&mut s.log),
-            CurrentState::Follower(ref mut s) => Some(&mut s.log),
-            CurrentState::Candidate(ref mut s) => Some(&mut s.log),
+            CurrentState::Leader(ref mut s) => Some(s.state_machine.log_mut()),
+            CurrentState::Follower(ref mut s) => Some(s.state_machine.log_mut()),
+            CurrentState::Candidate(ref mut s) => Some(s.state_machine.log_mut()),
         }
     }
 
@@ -274,28 +267,19 @@ where
         }
     }
 
-    pub fn into_inner(self) -> Option<(ServerId, L, M)> {
+    pub fn into_inner(self) -> Option<(ServerId, M)> {
         let Self { state, .. } = self;
         match state {
             CurrentState::Lost => None,
             CurrentState::Leader(State {
-                id,
-                log,
-                state_machine,
-                ..
-            }) => Some((id, log, state_machine)),
+                id, state_machine, ..
+            }) => Some((id, state_machine)),
             CurrentState::Follower(State {
-                id,
-                log,
-                state_machine,
-                ..
-            }) => Some((id, log, state_machine)),
+                id, state_machine, ..
+            }) => Some((id, state_machine)),
             CurrentState::Candidate(State {
-                id,
-                log,
-                state_machine,
-                ..
-            }) => Some((id, log, state_machine)),
+                id, state_machine, ..
+            }) => Some((id, state_machine)),
         }
     }
 }
@@ -304,9 +288,8 @@ where
 /// They can be only used for testing and like looking into log or state machine
 /// but not allowed in production to avoid unintentional damage
 #[cfg(debug_assertions)]
-impl<L, M, H> Raft<L, M, H>
+impl<M, H> Raft<M, H>
 where
-    L: Log,
     M: StateMachine,
     H: Handler,
 {
@@ -321,15 +304,14 @@ where
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum CurrentState<L, M, H>
+pub(crate) enum CurrentState<M, H>
 where
-    L: Log,
     M: StateMachine,
     H: Handler,
 {
-    Leader(State<L, M, H, Leader>),
-    Follower(State<L, M, H, Follower>),
-    Candidate(State<L, M, H, Candidate>),
+    Leader(State<M, H, Leader>),
+    Follower(State<M, H, Follower>),
+    Candidate(State<M, H, Candidate>),
     Lost,
 }
 
@@ -344,21 +326,19 @@ macro_rules! proxy_state {
     };
 }
 
-impl<L, M, H, T> From<State<L, M, H, T>> for CurrentState<L, M, H>
+impl<M, H, T> From<State<M, H, T>> for CurrentState<M, H>
 where
-    L: Log,
     M: StateMachine,
     H: Handler,
-    State<L, M, H, T>: StateImpl<L, M, H>,
+    State<M, H, T>: StateImpl<M, H>,
 {
-    fn from(t: State<L, M, H, T>) -> Self {
+    fn from(t: State<M, H, T>) -> Self {
         t.into_consensus_state()
     }
 }
 
-impl<L, M, H> CurrentState<L, M, H>
+impl<M, H> CurrentState<M, H>
 where
-    L: Log,
     M: StateMachine,
     H: Handler,
 {

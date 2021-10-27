@@ -89,6 +89,12 @@ pub enum CriticalError {
     #[error("BUG: leader's log could not find term for index {} at {}", _0, _1)]
     LeaderLogBroken(LogIndex, &'static str),
 
+    #[error("BUG: entry kind does not match entry data at at {}", _0)]
+    LogInconsistentEntry(LogIndex),
+
+    #[error("BUG: log returned existing voted_for in a solitary consensus: {}", _0)]
+    LogInconsistentVoted(ServerId),
+
     #[error("Consensus state become unrecoverable after last error, consensus cannot proceed")]
     Unrecoverable,
 

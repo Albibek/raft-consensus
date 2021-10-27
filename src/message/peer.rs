@@ -16,6 +16,7 @@ use capnp::message::{Allocator, Builder, HeapAllocator, Reader, ReaderSegments};
 use crate::{
     config::ConsensusConfig,
     persistent_log::{LogEntryDataRef, LogEntryRef},
+    AdminId, ClientId,
 };
 
 use crate::{LogIndex, Peer, ServerId, Term};
@@ -177,7 +178,7 @@ pub struct Entry {
 
 impl Entry {
     pub(crate) fn set_config_active(&mut self, is_active: bool) {
-        if let EntryData::Config(_, ref mut active) = self.data {
+        if let EntryData::Config(_, ref mut active, _) = self.data {
             *active = is_active
         }
     }
@@ -189,9 +190,9 @@ pub enum EntryData {
     /// An empty entry, which is added to every node's log at the beginning of each term
     Noop,
     /// A client proposal that should be provided to the state machine
-    Proposal(Vec<u8>),
+    Proposal(Vec<u8>, ClientId),
     /// A configuration change with an flag showing if it is active
-    Config(ConsensusConfig, bool),
+    Config(ConsensusConfig, bool, AdminId),
 }
 
 impl Entry {
@@ -200,8 +201,10 @@ impl Entry {
             term: self.term,
             data: match self.data {
                 EntryData::Noop => LogEntryDataRef::Empty,
-                EntryData::Proposal(ref v) => LogEntryDataRef::Proposal(v.as_slice()),
-                EntryData::Config(ref c, _) => LogEntryDataRef::Config(c),
+                EntryData::Proposal(ref v, client) => {
+                    LogEntryDataRef::Proposal(v.as_slice(), client)
+                }
+                EntryData::Config(ref c, _, admin) => LogEntryDataRef::Config(c, admin),
             },
         }
     }
@@ -210,39 +213,43 @@ impl Entry {
 #[cfg(feature = "use_capnp")]
 impl Entry {
     pub fn from_capnp<'a>(reader: entry::Reader<'a>) -> Result<Self, Error> {
-        let data = match reader.which()? {
-            entry::Which::Noop(()) => EntryData::Noop,
-            entry::Which::Proposal(reader) => EntryData::Proposal(reader?.to_vec()),
-            entry::Which::Config(reader) => {
-                let reader = reader?;
-                let peers_reader = reader.get_peers()?;
+        todo!("from_capnp for proposal");
+        // let data = match reader.which()? {
+        //entry::Which::Noop(()) => EntryData::Noop,
+        //entry::Which::Proposal(reader) => EntryData::Proposal(reader?.to_vec()),
+        //entry::Which::Config(reader) => {
+        //let reader = reader?;
+        //let peers_reader = reader.get_peers()?;
 
-                let mut config = ConsensusConfig {
-                    peers: Vec::with_capacity(peers_reader.len() as usize),
-                };
-                for e in peers_reader.iter() {
-                    let peer = Peer {
-                        id: ServerId(e.get_id()),
-                        metadata: e.get_metadata().map(|s| s.to_vec()).unwrap_or(Vec::new()),
-                    };
-                    config.peers.push(peer);
-                }
-                EntryData::Config(config, reader.get_is_actual())
-            }
-        };
+        //let mut config = ConsensusConfig {
+        //peers: Vec::with_capacity(peers_reader.len() as usize),
+        //};
+        //for e in peers_reader.iter() {
+        //let peer = Peer {
+        //id: ServerId(e.get_id()),
+        //metadata: e.get_metadata().map(|s| s.to_vec()).unwrap_or(Vec::new()),
+        //};
+        //config.peers.push(peer);
+        //}
+        //EntryData::Config(config, reader.get_is_actual())
+        //     }
+        //};
 
-        Ok(Entry {
-            term: reader.get_term().into(),
-            data,
-        })
+        //Ok(Entry {
+        //term: reader.get_term().into(),
+        //data,
+        //})
     }
 
     pub fn fill_capnp<'a>(&self, builder: &mut entry::Builder<'a>) {
         builder.set_term(self.term.as_u64());
         match self.data {
             EntryData::Noop => builder.set_noop(()),
-            EntryData::Proposal(ref data) => builder.set_proposal(data),
-            EntryData::Config(ref config, ref is_actual) => {
+            EntryData::Proposal(ref data, client_id) => {
+                todo!("capnpn for proposal struct");
+                //    builder.set_proposal(data)
+            }
+            EntryData::Config(ref config, ref is_actual, admin_id) => {
                 let mut config_builder = builder.reborrow().init_config();
                 let mut peers_builder = config_builder
                     .reborrow()
@@ -253,7 +260,9 @@ impl Entry {
                     peer_slot.set_id(peer.id.as_u64());
                     peer_slot.set_metadata(&peer.metadata);
                 }
-                config_builder.set_is_actual(*is_actual)
+                config_builder.set_is_actual(*is_actual);
+                todo!("set admin id");
+                //config_builder.set_admin_id(admin_id);
             }
         }
     }
@@ -597,7 +606,10 @@ mod test {
                 },
                 Entry {
                     term: 9.into(),
-                    data: EntryData::Proposal("qwer".to_string().into_bytes()),
+                    data: EntryData::Proposal(
+                        "qwer".to_string().into_bytes(),
+                        ClientId::from_bytes(&42u64.to_le_bytes()[..]).unwrap(),
+                    ),
                 },
                 Entry {
                     term: 9.into(),
@@ -609,6 +621,7 @@ mod test {
                             }],
                         },
                         true,
+                        AdminId::from_bytes(&(911u64.to_le_bytes())[..]).unwrap(),
                     ),
                 },
             ],

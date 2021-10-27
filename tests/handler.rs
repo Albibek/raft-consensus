@@ -33,6 +33,7 @@ impl Handler for TestHandler {
     /// Saves peer message to a vector
     fn send_peer_message(&mut self, id: ServerId, message: PeerMessage) {
         assert_ne!(self.cur, ServerId(u64::MAX));
+        trace!("peer message {:?} -> {:?}: {:?}", &self.cur, &id, &message);
         let q = self.peer_network.get_mut(&(self.cur, id)).unwrap();
         q.push_back(message);
     }
@@ -40,6 +41,12 @@ impl Handler for TestHandler {
     /// Saves client message to a vector
     fn send_client_message(&mut self, id: ClientId, message: ClientMessage) {
         assert_ne!(self.cur, ServerId(u64::MAX));
+        trace!(
+            "client message {:?} -> {:?}: {:?}",
+            &self.cur,
+            &id,
+            &message
+        );
         let q = self.client_network.get_mut(&(self.cur, id)).unwrap();
         q.push_back(message);
     }

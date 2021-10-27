@@ -1,9 +1,6 @@
 use crate::config::ConsensusConfig;
-use crate::persistent_log::{
-    Error, Log, LogEntry, LogEntryData, LogEntryDataRef, LogEntryRef, LogError,
-};
+use crate::persistent_log::{Log, LogEntry, LogEntryMeta, LogEntryRef, LogError};
 use crate::{LogIndex, ServerId, Term};
-use log::trace;
 
 /// This is a `Log` implementation that stores entries in a simple in-memory vector. Other data
 /// is stored in a struct. It is chiefly intended for testing.
@@ -65,12 +62,15 @@ impl Log for MemLog {
             .ok_or(LogError::BadIndex(index))
     }
 
+    fn entry_meta_at(&self, index: LogIndex) -> Result<LogEntryMeta, Self::Error> {
+        self.entries
+            .get((index - 1).as_u64() as usize)
+            .map(|entry| entry.meta())
+            .ok_or(LogError::BadIndex(index))
+    }
+
     /// Must append an entry to the log
-    fn append_entry<'a>(
-        &mut self,
-        at: LogIndex,
-        entry: &LogEntryRef<'a>,
-    ) -> Result<(), Self::Error> {
+    fn append_entries(&mut self, entries: &[LogEntry]) -> Result<(), Self::Error> {
         if self.latest_log_index()? + 1 < at {
             return Err(LogError::BadLogIndex);
         }
@@ -132,7 +132,7 @@ impl Default for MemLog {
 #[cfg(test)]
 mod test {
 
-    use super::*;
+    //use super::*;
 
     // TODO test not filling logindex(0) and term(0) because log indexes start from 1
     /*

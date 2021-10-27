@@ -1,6 +1,10 @@
+use std::collections::hash_map::DefaultHasher;
+use std::hash::Hasher;
+
 use crate::handler::*;
 use crate::raft::*;
 use crate::*;
+
 use log::trace;
 use raft_consensus::message::*;
 use raft_consensus::*;
@@ -14,7 +18,7 @@ use raft_consensus::*;
 fn test_kickstart() {
     // Test the very first stage of init: election of a leader
     // after all nodes have started as followers
-    let mut cluster = TestCluster::new(3);
+    let mut cluster = TestCluster::new(3, false);
     for node in cluster.nodes.values() {
         assert_eq!(node.kind(), ConsensusState::Follower);
     }
@@ -49,7 +53,7 @@ fn test_kickstart() {
 fn test_sticky_leader() {
     // Test the very first stage of init: election of a leader
     // after all nodes have started as followers
-    let mut cluster = TestCluster::new(3);
+    let mut cluster = TestCluster::new(3, false);
     for node in cluster.nodes.values() {
         assert_eq!(node.kind(), ConsensusState::Follower);
     }
@@ -83,7 +87,7 @@ fn test_sticky_leader() {
 #[test]
 fn test_leader_transfer_auto() {
     // Test the leader transfer where any follower node can become a leader
-    let mut cluster = TestCluster::new(3);
+    let mut cluster = TestCluster::new(3, false);
     for node in cluster.nodes.values() {
         assert_eq!(node.kind(), ConsensusState::Follower);
     }
@@ -128,7 +132,7 @@ fn test_leader_transfer_auto() {
 #[test]
 fn test_leader_transfer_manual() {
     // Test the leader transfer when leader ID is specified explicitly
-    let mut cluster = TestCluster::new(3);
+    let mut cluster = TestCluster::new(3, false);
     for node in cluster.nodes.values() {
         assert_eq!(node.kind(), ConsensusState::Follower);
     }
@@ -153,10 +157,44 @@ fn test_leader_transfer_manual() {
 
 #[test]
 fn test_client_proposal() {
-    let mut cluster = TestCluster::new(3);
+    let mut cluster = TestCluster::new(3, false);
     for node in cluster.nodes.values() {
         assert_eq!(node.kind(), ConsensusState::Follower);
     }
     cluster.kickstart();
-    //    todo!();
+    let client_id = ClientId(uuid::Uuid::from_slice(&[0u8; 16]).unwrap());
+    let leader_id = ServerId(0);
+
+    let query = vec![0, 0, 0, 42];
+    cluster.apply_action(Action::Client(
+        client_id,
+        leader_id,
+        ClientMessage::ClientProposalRequest(ClientRequest {
+            data: query.clone(),
+        }),
+    ));
+    cluster.apply_peer_packets();
+
+    let responses = cluster
+        .handler
+        .client_network
+        .get(&(leader_id, client_id))
+        .unwrap();
+
+    dbg!(responses);
+
+    cluster.apply_heartbeats();
+    cluster.apply_peer_packets();
+
+    let mut hasher = DefaultHasher::new();
+    for byte in &query {
+        hasher.write_u8(*byte);
+    }
+
+    let expected_hash = hasher.finish();
+
+    for (id, node) in &cluster.nodes {
+        dbg!(node.state_machine().unwrap().hash, expected_hash);
+        assert_eq!(node.state_machine().unwrap().hash, expected_hash);
+    }
 }
