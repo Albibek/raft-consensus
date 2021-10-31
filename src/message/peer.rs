@@ -123,6 +123,18 @@ impl From<AppendEntriesRequest> for PeerMessage {
     }
 }
 
+impl AppendEntriesRequest {
+    pub fn new(num_entries: usize) -> Self {
+        Self {
+            term: Term(0),
+            prev_log_index: LogIndex(0),
+            prev_log_term: Term(0),
+            leader_commit: LogIndex(0),
+            entries: Vec::with_capacity(num_entries),
+        }
+    }
+}
+
 #[cfg(feature = "use_capnp")]
 impl AppendEntriesRequest {
     pub fn from_capnp<'a>(reader: append_entries_request::Reader<'a>) -> Result<Self, Error> {

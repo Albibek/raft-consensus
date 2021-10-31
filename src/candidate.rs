@@ -219,8 +219,8 @@ where
         &mut self,
         _handler: &mut H,
         _from: ClientId,
-        _request: &ClientRequest,
-    ) -> Result<ClientResponse, Error> {
+        _request: ClientRequest,
+    ) -> Result<ClientResponse, (Error, ClientRequest)> {
         Ok(ClientResponse::UnknownLeader)
     }
 

@@ -262,13 +262,12 @@ where
         self.common_check_compaction(true)
     }
 
-    /// Applies a client proposal to the consensus state machine.
     fn client_proposal_request(
         &mut self,
         _handler: &mut H,
         _from: ClientId,
-        _request: &ClientRequest,
-    ) -> Result<ClientResponse, Error> {
+        _request: ClientRequest,
+    ) -> Result<ClientResponse, (Error, ClientRequest)> {
         self.state_data
             .leader
             .map_or(Ok(ClientResponse::UnknownLeader), |leader| {
