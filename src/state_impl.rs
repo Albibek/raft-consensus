@@ -247,12 +247,14 @@ where
     ///////////////////////////
 
     // Applies a client proposal to the state machine handled by consensus
+    // Client requests can be really big, so we require them to be sent by value to avoid copying.
+    // Hence the return value contains the original response in case of any errors.
     fn client_proposal_request(
         &mut self,
         handler: &mut H,
         from: ClientId,
-        request: &ClientRequest,
-    ) -> Result<ClientResponse, Error>;
+        request: ClientRequest,
+    ) -> Result<ClientResponse, (Error, ClientRequest)>;
 
     // Requests some client state from the state machine handled by consensus
     fn client_query_request(

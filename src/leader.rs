@@ -458,33 +458,59 @@ where
         &mut self,
         handler: &mut H,
         from: ClientId,
-        request: &ClientRequest,
-    ) -> Result<ClientResponse, Error> {
+        request: ClientRequest,
+    ) -> Result<ClientResponse, (Error, ClientRequest)> {
         // write the request to log anyways
-        let (log_index, message) = self.add_new_entry(LogEntryDataRef::Proposal(
-            request.data.as_slice(),
-            from,
-            request.guarantee,
-        ))?;
-
-        debug!("proposal request from client {}: entry {}", from, log_index);
 
         match request.guarantee {
-            ClientGuarantee::Instant | ClientGuarantee::Fast => {
-                // append an entry to the log and send the message instantly
+            ClientGuarantee::Fast => {
+                // append an entry to the log and send the message right away
+                let mut message = AppendEntriesRequest::new(1);
+                let log_index = self
+                    .add_new_entry(
+                        LogEntryData::Proposal(request.data, from, request.guarantee),
+                        Some(&mut message),
+                    )
+                    .map_err(|e| (e, request))?;
+                debug!(
+                    "proposal request from client {} assigned idx {}",
+                    from, log_index
+                );
 
-                self.send_append_entries_request(handler, log_index, message)?;
-                // the follower will read the guarantee and send the confirmation with or without waiting
-                // for the heartbeat timer
+                self.send_append_entries_request(handler, log_index, message)
+                    .map_err(|e| (e, request))?;
+
+                Ok(ClientResponse::Queued(log_index))
             }
 
             ClientGuarantee::Log => {
-                // write to log, but don't send append_entries_request right away
-            }
-            ClientGuarantee::Batch => todo!(),
-        }
+                let log_index = self
+                    .add_new_entry(
+                        LogEntryData::Proposal(request.data, from, request.guarantee),
+                        None,
+                    )
+                    .map_err(|e| (e, request))?;
+                debug!(
+                    "proposal request from client {} assigned idx {}",
+                    from, log_index
+                );
 
-        Ok(ClientResponse::Queued(log_index))
+                // write to log, but don't send append_entries_request right away
+                Ok(ClientResponse::Queued(log_index))
+            }
+            ClientGuarantee::Batch => {
+                self.state_data.client_batch.push(LogEntryData::Proposal(
+                    request.data,
+                    from,
+                    request.guarantee,
+                ));
+                if self.state_data.client_batch.len() == 1 {
+                    handler.set_timeout(Timeout::Client);
+                }
+
+                Ok(ClientResponse::BatchQueued)
+            }
+        }
     }
 
     /// Applies client query to the state machine, guarantee is ignored
@@ -648,7 +674,27 @@ where
     }
 
     fn client_timeout(&mut self, handler: &mut H) -> Result<(), Error> {
-        todo!()
+        if self.state_data.client_batch.is_empty() {
+            return Err(Error::BadLeaderBatch);
+        }
+
+        let term = self.current_term()?;
+        let prev_log_index = self.latest_log_index()?;
+
+        let log_index = prev_log_index + 1;
+        let leader_commit = self.commit_index;
+
+        let mut entries = Vec::new();
+        while let Some(data) = self.state_data.client_batch.pop() {
+            entries.push(LogEntry { term, data });
+        }
+
+        self.log_mut()
+            .append_entries(log_index, &entries)
+            .map_err(|e| Error::Critical(CriticalError::PersistentLogWrite(Box::new(e))))?;
+
+        handler.clear_timeout(Timeout::Client);
+        Ok(())
     }
 }
 
@@ -721,11 +767,6 @@ where
                         .state_machine
                         .apply(entry_index, true)
                         .map_err(|e| Error::Critical(CriticalError::StateMachine(Box::new(e))))?;
-
-                    // With instant guarantee, comfirm the
-                    if guarantee == ClientGuarantee::Instant {
-                        instant_confirmation = true;
-                    }
 
                     // As long as we know it, we've sent the connected clients the notification
                     // about their proposals being queued
@@ -950,7 +991,7 @@ where
 
                 // the config is already modified, just add it as an entry
                 let (log_index, message) =
-                    self.add_new_entry(LogEntryDataRef::Config(&config, admin_id))?;
+                    self.add_new_entry(LogEntryDataRef::Config(&config, admin_id), true)?;
                 self.send_append_entries_request(handler, log_index, message)?;
 
                 handler.set_timeout(Timeout::Heartbeat(from));
@@ -1033,42 +1074,41 @@ where
         Ok(())
     }
 
-    /// appends a single entry to a leader's log obeying all the Raft rules (log indexing etc)
-    /// returns a message ready to be sent to followers
-    pub(crate) fn add_new_entry<'a>(
+    /// Appends a single entry to a leader's log obeying all the Raft rules (log indexing etc).
+    /// Optionally, fills a message making it ready to be sent to followers. When request is None,
+    /// the entry is still written to log, but will be send to the followers using the heartbeat mechanism.
+    pub(crate) fn add_new_entry(
         &mut self,
-        entry_data: LogEntryDataRef<'a>,
-    ) -> Result<(LogIndex, AppendEntriesRequest), Error> {
+        entry_data: LogEntryData,
+        request: Option<&mut AppendEntriesRequest>,
+    ) -> Result<LogIndex, Error> {
         let prev_log_index = self.latest_log_index()?;
-        let prev_log_term = self.latest_log_term()?;
         let term = self.current_term()?;
 
         let log_index = prev_log_index + 1;
         let leader_commit = self.commit_index;
 
-        //self.with_log_mut(|log| log.append_entries(log_index, Some(&entry).into_iter()))?;
-        let log_entry = LogEntryRef {
+        let log_entry = LogEntry {
             term,
             data: entry_data,
         };
         self.log_mut()
-            .append_entry(log_index, &log_entry)
+            .append_entries(log_index, &[log_entry])
             .map_err(|e| Error::Critical(CriticalError::PersistentLogWrite(Box::new(e))))?;
 
         let mut entry: Entry = log_entry.into();
-        // this is the new addition, so if it's a configuration change, than it is definitely a new active configuration
+        // the entry is the new addition, so if it's a configuration change, than it is definitely a new active configuration
         entry.set_config_active(true);
 
-        todo!("ENQUEUE entries into self.current_append_entries instead of returning message");
-        let message = AppendEntriesRequest {
-            term,
-            prev_log_index,
-            prev_log_term,
-            leader_commit,
-            entries: vec![entry],
+        if let Some(mut request) = request {
+            let prev_log_term = self.latest_log_term()?;
+            request.term = term;
+            request.prev_log_index = prev_log_index;
+            request.prev_log_term = prev_log_term;
+            request.leader_commit = leader_commit;
+            request.entries.push(entry);
         };
-
-        Ok((log_index, message))
+        Ok(log_index)
     }
 
     fn send_append_entries_request(
@@ -1123,6 +1163,8 @@ pub(crate) struct Leader {
     peers_alive: HashSet<ServerId>,
     pending_snapshots: HashSet<ServerId>,
 
+    client_batch: Vec<LogEntryData>,
+
     // Liearizability marker set at the beginning of each term
     read_index: Option<LogIndex>,
 
@@ -1155,9 +1197,10 @@ impl Leader {
             next_index,
             match_index,
             peers_alive: HashSet::new(),
-            config_change: None,
             pending_snapshots: HashSet::new(),
+            client_batch: Vec::new(),
             read_index: None,
+            config_change: None,
         }
     }
 

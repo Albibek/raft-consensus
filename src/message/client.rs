@@ -67,20 +67,17 @@ pub struct ClientRequest {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
 pub enum ClientGuarantee {
-    /// Fastest replication, highest network load: each client proposal is replicated and committed ASAP.
-    /// The best time for such message will be around network round robin time.
-    Instant,
-    /// Fast replication, highest network load: each client proposal is replicated ASAP and
-    /// committed by heartbeat timeout. The best time for this guarantee will be a heartbeat
-    /// timeout.
+    /// Fast replication, highest network load: each client proposal is replicated ASAP.
+    /// The best replicaiton time will be around the network round robin time.
     Fast,
-    /// Severe batching(the default behaviour asumed in the Raft whitepaper):
+    /// The default behaviour asumed in the Raft whitepaper:
     /// client proposals are persisted to log and replicated by heartbeat timer. The best time is
     /// heartbeat timeout + 1/2 of network round robin time.
     Log,
     /// Time/size based batching: proposals are cashed in memory and only written *to log* all at once when a
-    /// special tunable timer fires. The best time depends on the special timer. Please note that
-    /// this tradeoff is shifted towards a weaker guarantee against potentially effective writing of bigger batches.
+    /// special tunable timer fires. The best time depends on the special timer, but replication
+    /// will only happen by the heartbeat timer anyways. This tradeoff is shifted towards a potentially
+    /// effective writing of bigger batches at the price of weaker persistence guarantees.
     Batch,
 }
 
@@ -99,6 +96,10 @@ pub enum ClientResponse {
     /// The proposal has been queued on the leader and waiting the majority
     /// of nodes to commit it
     Queued(LogIndex),
+
+    /// The proposal has been queued in memory batch, meaning log index is not
+    /// assigned to it yet
+    BatchQueued,
 
     /// The state machine is not ready to process the query yet, so
     /// the response is deferred until state machine moves forward

@@ -58,6 +58,9 @@ pub enum Error {
 
     #[error("state machine didn't have snapshot where it expected to exist")]
     SnapshotExpected,
+
+    #[error("leader client timeout while batch is empty")]
+    BadLeaderBatch,
 }
 
 impl Error {

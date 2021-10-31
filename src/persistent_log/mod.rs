@@ -86,7 +86,7 @@ pub trait Log {
 
     /// Must append an entry to the log. The sync and index shifting should be decided by implementation, but
     /// kept with no gaps and incoming ordering.
-    /// This function should persist configuration change entries, but MUST not instantly used from
+    /// This function should persist configuration change entries, but MUST not instantly be used from
     /// last_config_* functions. This will be done separately only when configuration is committed.
     fn append_entries(&mut self, start: LogIndex, entries: &[LogEntry]) -> Result<(), Self::Error>;
 
