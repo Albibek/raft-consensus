@@ -108,7 +108,7 @@ where
                     .log()
                     .read_entry(index, &mut entry)
                     .map_err(|e| Error::PersistentLogRead(Box::new(e)))?;
-                if let LogEntryData::Config(config, _) = entry.data {
+                if let LogEntryData::Config(config) = entry.data {
                     config
                 } else {
                     return Err(Error::unreachable(module_path!()));
@@ -182,7 +182,7 @@ where
         &mut self,
         handler: &mut H,
         from: ServerId,
-        message: &PeerMessage,
+        message: PeerMessage,
     ) -> Result<(), Error> {
         self.state.apply_peer_message(handler, from, message)
     }
@@ -194,7 +194,7 @@ where
         &mut self,
         handler: &mut H,
         from: ClientId,
-        message: &ClientMessage,
+        message: ClientMessage,
     ) -> Result<(), Error> {
         self.state.apply_client_message(handler, from, message)
     }
@@ -204,7 +204,7 @@ where
         &mut self,
         handler: &mut H,
         from: AdminId,
-        request: &AdminMessage,
+        request: AdminMessage,
     ) -> Result<(), Error> {
         self.state.apply_admin_message(handler, from, request)
     }
@@ -363,7 +363,7 @@ where
         &mut self,
         handler: &mut H,
         from: ServerId,
-        message: &PeerMessage,
+        message: PeerMessage,
     ) -> Result<(), Error> {
         let prev_state = self.pop()?;
         let new_state = proxy_state!(
@@ -379,7 +379,7 @@ where
         &mut self,
         handler: &mut H,
         from: ClientId,
-        message: &ClientMessage,
+        message: ClientMessage,
     ) -> Result<(), Error> {
         proxy_state!(self, s, apply_client_message(s, handler, from, message)?)
     }
@@ -388,7 +388,7 @@ where
         &mut self,
         handler: &mut H,
         from: AdminId,
-        request: &AdminMessage,
+        request: AdminMessage,
     ) -> Result<(), Error> {
         proxy_state!(self, s, apply_admin_message(s, handler, from, request)?)
     }

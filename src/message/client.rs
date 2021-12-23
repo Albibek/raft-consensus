@@ -1,3 +1,4 @@
+use bytes::Bytes;
 #[cfg(feature = "use_serde")]
 use serde::{Deserialize, Serialize};
 
@@ -56,7 +57,7 @@ impl ClientMessage {
 #[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
 /// Response to client command
 pub struct ClientRequest {
-    pub data: Vec<u8>,
+    pub data: Bytes,
     pub guarantee: ClientGuarantee,
 }
 
@@ -91,7 +92,7 @@ impl Default for ClientGuarantee {
 #[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
 /// Response to client command
 pub enum ClientResponse {
-    Success(Vec<u8>),
+    Success(Bytes),
 
     /// The proposal has been queued on the leader and waiting the majority
     /// of nodes to commit it

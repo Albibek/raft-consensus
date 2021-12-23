@@ -79,6 +79,9 @@ impl Handler for TestHandler {
                     *self.heartbeat_timeouts.get_mut(&self.cur).unwrap() = Some(timeouts);
                 }
             }
+            Timeout::Client => {
+                todo!("handle client timeouts")
+            }
         }
     }
 
@@ -100,6 +103,9 @@ impl Handler for TestHandler {
                     timeouts.insert(id, false);
                     *self.heartbeat_timeouts.get_mut(&self.cur).unwrap() = Some(timeouts);
                 }
+            }
+            Timeout::Client => {
+                todo!("handle client timeouts")
             }
         }
     }

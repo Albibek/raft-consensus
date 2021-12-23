@@ -1,5 +1,5 @@
 use crate::config::ConsensusConfig;
-use crate::persistent_log::{Log, LogEntry, LogEntryMeta, LogEntryRef, LogError};
+use crate::persistent_log::{Log, LogEntry, LogEntryMeta, LogError};
 use crate::{LogIndex, ServerId, Term};
 
 /// This is a `Log` implementation that stores entries in a simple in-memory vector. Other data
@@ -10,6 +10,7 @@ pub struct MemLog {
     voted_for: Option<ServerId>,
     entries: Vec<LogEntry>,
     latest_config: Option<(ConsensusConfig, LogIndex)>,
+    start_index: u64,
 }
 
 impl MemLog {
@@ -19,6 +20,7 @@ impl MemLog {
             voted_for: None,
             entries: Vec::new(),
             latest_config: None,
+            start_index: 0,
         }
     }
 }
@@ -26,22 +28,32 @@ impl MemLog {
 impl Log for MemLog {
     type Error = LogError;
 
-    fn latest_log_index(&self) -> Result<LogIndex, Self::Error> {
-        Ok(LogIndex(self.entries.len() as u64))
+    fn latest_index(&self) -> Result<LogIndex, Self::Error> {
+        Ok(LogIndex(self.start_index + self.entries.len() as u64))
     }
 
-    fn first_log_index(&self) -> Result<LogIndex, Self::Error> {
-        todo!()
+    fn latest_volatile_index(&self) -> Result<LogIndex, Self::Error> {
+        self.latest_index()
+    }
+
+    fn first_index(&self) -> Result<LogIndex, Self::Error> {
+        Ok(LogIndex(self.start_index))
     }
 
     fn term_of(&self, index: LogIndex) -> Result<Option<Term>, Self::Error> {
-        if index == LogIndex(0) {
+        let index: u64 = index.as_u64();
+        if index == 0 {
             return Ok(Some(Term(0)));
         }
-        self.entries
-            .get((index - 1).as_u64() as usize)
+        if index < self.start_index {
+            return Ok(None);
+        }
+        Ok(self
+            .entries
+            .get((self.start_index + index - 1) as usize)
             .map(|entry| Some(entry.term))
-            .ok_or(LogError::BadIndex(index))
+            .unwrap_or(None))
+        //.ok_or(LogError::BadIndex(LogIndex(index)))
     }
 
     fn discard_since(&mut self, index: LogIndex) -> Result<LogIndex, Self::Error> {
@@ -51,15 +63,32 @@ impl Log for MemLog {
         Ok(index)
     }
 
-    fn discard_until(&self, index: LogIndex) -> Result<LogIndex, Self::Error> {
-        todo!()
+    fn discard_until(&mut self, index: LogIndex) -> Result<LogIndex, Self::Error> {
+        let index = index.as_u64();
+        if index <= self.start_index {
+            // do nothing
+        } else if index > self.start_index + index {
+            let until = (index - self.start_index) as usize;
+            self.entries.drain(..until);
+            self.start_index += until as u64;
+        } else {
+            self.entries.clear();
+            self.start_index = index + 1;
+        }
+
+        Ok(self.start_index.into())
     }
 
     fn read_entry(&self, index: LogIndex, dest: &mut LogEntry) -> Result<(), Self::Error> {
+        let index: u64 = index.as_u64();
+
+        if index < self.start_index {
+            return Ok(());
+        }
         self.entries
-            .get((index - 1).as_u64() as usize)
+            .get((index - 1) as usize)
             .map(|entry| *dest = entry.clone())
-            .ok_or(LogError::BadIndex(index))
+            .ok_or(LogError::BadIndex(index.into()))
     }
 
     fn entry_meta_at(&self, index: LogIndex) -> Result<LogEntryMeta, Self::Error> {
@@ -69,20 +98,18 @@ impl Log for MemLog {
             .ok_or(LogError::BadIndex(index))
     }
 
-    /// Must append an entry to the log
-    fn append_entries(&mut self, entries: &[LogEntry]) -> Result<(), Self::Error> {
-        if self.latest_log_index()? + 1 < at {
+    fn append_entries(&mut self, start: LogIndex, entries: &[LogEntry]) -> Result<(), Self::Error> {
+        if self.start_index > start.as_u64() {
             return Err(LogError::BadLogIndex);
         }
 
-        let start = (at - 1).as_u64() as usize;
-        if self.entries.len() < start {
-            return Err(LogError::BadLogIndex);
-        } else {
-            self.entries.truncate(start);
+        let index = (start.as_u64() - self.start_index) as usize;
+
+        if self.entries.len() >= index {
+            self.entries.truncate(index);
         }
 
-        self.entries.push(entry.into());
+        self.entries.extend_from_slice(entries);
         Ok(())
     }
 
@@ -132,7 +159,13 @@ impl Default for MemLog {
 #[cfg(test)]
 mod test {
 
-    //use super::*;
+    use super::*;
+    use crate::testing::*;
+
+    #[test]
+    fn test_mem_log() {
+        let tester = LogTester::new(MemLog::new);
+    }
 
     // TODO test not filling logindex(0) and term(0) because log indexes start from 1
     /*

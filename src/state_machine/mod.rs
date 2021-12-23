@@ -11,6 +11,8 @@
 // FIXME pub mod channel;
 pub mod null;
 
+use bytes::Bytes;
+
 //pub use crate::state_machine::channel::ChannelStateMachine;
 use crate::persistent_log::Log;
 pub use crate::state_machine::null::NullStateMachine;
@@ -76,7 +78,7 @@ pub trait StateMachine {
 
     /// Applies a command to the state machine. A command should be already stored in the specified log index.
     /// Asynchronous machines may decide if last_applied should be increased at once, but if not,
-    /// they shoul expect the same index to be requested multiple times.
+    /// they should expect the same index to be requested multiple times.
     ///
     /// If `results_required` is true, should return an application-specific result value which will
     /// be forwarded to client. `results_required` may be false when the command is applied on a follower which is not
@@ -88,11 +90,11 @@ pub trait StateMachine {
         &mut self,
         index: LogIndex,
         results_required: bool,
-    ) -> Result<Option<Vec<u8>>, Self::Error>;
+    ) -> Result<Option<Bytes>, Self::Error>;
 
     /// Queries a value of the state machine. Does not go through the durable log, or mutate the state machine.
     /// Returns an application-specific result value.
-    fn query(&self, query: &[u8]) -> Result<Vec<u8>, Self::Error>;
+    fn query(&self, query: Bytes) -> Result<Bytes, Self::Error>;
 
     /// Must return currently applied index. The index must have the same persistency as the
     /// state machine itself and will be used by a leader to decide which log entries to

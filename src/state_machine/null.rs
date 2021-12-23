@@ -1,5 +1,6 @@
 use std::marker::PhantomData;
 
+use bytes::Bytes;
 use thiserror::Error as ThisError;
 
 use crate::persistent_log::Log;
@@ -34,13 +35,25 @@ impl<L: Log> StateMachine for NullStateMachine<L> {
     type Log = L;
     type Error = Error;
 
-    fn apply(&mut self, index: LogIndex, _: bool) -> Result<Option<Vec<u8>>, Self::Error> {
-        self.index = index;
-        Ok(Some(Vec::new()))
+    fn log(&self) -> &Self::Log {
+        todo!()
     }
 
-    fn query(&self, _query: &[u8]) -> Result<Vec<u8>, Self::Error> {
-        Ok(Vec::new())
+    fn log_mut(&mut self) -> &mut Self::Log {
+        todo!()
+    }
+
+    fn apply(&mut self, index: LogIndex, _: bool) -> Result<Option<Bytes>, Error> {
+        self.index = index;
+        Ok(Some(Bytes::new()))
+    }
+
+    fn query(&self, _query: Bytes) -> Result<Bytes, Error> {
+        Ok(Bytes::new())
+    }
+
+    fn last_applied(&self) -> Result<LogIndex, Self::Error> {
+        Ok(self.index)
     }
 
     fn snapshot_info(&self) -> Result<Option<SnapshotInfo>, Self::Error> {
@@ -70,17 +83,5 @@ impl<L: Log> StateMachine for NullStateMachine<L> {
     ) -> Result<Option<Vec<u8>>, Error> {
         self.index = index;
         Ok(None)
-    }
-
-    fn last_applied(&self) -> Result<LogIndex, Self::Error> {
-        Ok(self.index)
-    }
-
-    fn log(&self) -> &Self::Log {
-        todo!()
-    }
-
-    fn log_mut(&mut self) -> &mut Self::Log {
-        todo!()
     }
 }

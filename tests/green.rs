@@ -5,7 +5,9 @@ use crate::handler::*;
 use crate::raft::*;
 use crate::*;
 
+use bytes::Bytes;
 use log::trace;
+
 use raft_consensus::message::*;
 use raft_consensus::*;
 
@@ -165,12 +167,13 @@ fn test_client_proposal() {
     let client_id = ClientId(uuid::Uuid::from_slice(&[0u8; 16]).unwrap());
     let leader_id = ServerId(0);
 
-    let query = vec![0, 0, 0, 42];
+    let query = Bytes::from((&[0, 0, 0, 42]).as_slice());
     cluster.apply_action(Action::Client(
         client_id,
         leader_id,
         ClientMessage::ClientProposalRequest(ClientRequest {
             data: query.clone(),
+            guarantee: ClientGuarantee::default(),
         }),
     ));
     cluster.apply_peer_packets();

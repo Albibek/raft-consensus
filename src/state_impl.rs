@@ -8,12 +8,12 @@ use crate::{ClientId, ServerId};
 
 use crate::raft::CurrentState;
 
-/// Applies a peer message to the consensus
+/// Applies a peer message to the consensus in state specified by S
 pub(crate) fn apply_peer_message<M, S: StateImpl<M, H>, H: Handler>(
     s: S,
     handler: &mut H,
     from: ServerId,
-    message: &PeerMessage,
+    message: PeerMessage,
 ) -> Result<CurrentState<M, H>, Error>
 where
     M: StateMachine,
@@ -23,7 +23,6 @@ where
         PeerMessage::AppendEntriesRequest(request) => {
             // request produces response and optionally - new state
             let (response, new) = s.append_entries_request(handler, from, request)?;
-
             handler.send_peer_message(from, PeerMessage::AppendEntriesResponse(response));
             Ok(new)
         }
@@ -64,6 +63,7 @@ where
     }
 }
 
+/// Apply a timeout to consensus in state S
 pub(crate) fn apply_timeout<M, S: StateImpl<M, H>, H: Handler>(
     mut s: S,
     handler: &mut H,
@@ -88,12 +88,12 @@ where
     }
 }
 
-/// Applies a client message to the consensus state machine.
+/// Apply a client message to the consensus in state S
 pub(crate) fn apply_client_message<M, S: StateImpl<M, H>, H: Handler>(
     s: &mut S,
     handler: &mut H,
     from: ClientId,
-    message: &ClientMessage,
+    message: ClientMessage,
 ) -> Result<(), Error>
 where
     M: StateMachine,
@@ -107,6 +107,8 @@ where
         }
         ClientMessage::ClientProposalResponse(req) => {
             // TODO: message proxying
+            // don't use todo!() here, because some trailing responses
+            // could still reach this code
             Ok(())
         }
         ClientMessage::ClientQueryRequest(req) => {
@@ -125,7 +127,7 @@ pub(crate) fn apply_admin_message<M, S: StateImpl<M, H>, H: Handler>(
     s: &mut S,
     handler: &mut H,
     from: AdminId,
-    message: &AdminMessage,
+    message: AdminMessage,
 ) -> Result<(), Error>
 where
     M: StateMachine,
@@ -153,7 +155,7 @@ where
             todo!("implement removal");
         }
         AdminMessage::StepDownRequest(request) => {
-            let message = s.step_down_request(handler, from, *request)?;
+            let message = s.step_down_request(handler, from, request)?;
             handler.send_admin_message(from, AdminMessage::StepDownResponse(message));
             Ok(())
         }
@@ -180,7 +182,7 @@ where
         self,
         handler: &mut H,
         from: ServerId,
-        request: &AppendEntriesRequest,
+        request: AppendEntriesRequest,
     ) -> Result<(AppendEntriesResponse, CurrentState<M, H>), Error>;
 
     /// Apply an append entries response to the consensus.
@@ -188,7 +190,7 @@ where
         self,
         handler: &mut H,
         from: ServerId,
-        response: &AppendEntriesResponse,
+        response: AppendEntriesResponse,
     ) -> Result<(Option<PeerMessage>, CurrentState<M, H>), Error>;
 
     ///////////////////////////
@@ -198,7 +200,7 @@ where
         self,
         handler: &mut H,
         candidate: ServerId,
-        request: &RequestVoteRequest,
+        request: RequestVoteRequest,
     ) -> Result<(Option<RequestVoteResponse>, CurrentState<M, H>), Error>;
 
     /// Applies a request vote response to the consensus.
@@ -206,7 +208,7 @@ where
         self,
         handler: &mut H,
         from: ServerId,
-        response: &RequestVoteResponse,
+        response: RequestVoteResponse,
     ) -> Result<CurrentState<M, H>, Error>;
 
     /// Applies a preliminary election timeout response to the consensus
@@ -254,13 +256,13 @@ where
         handler: &mut H,
         from: ClientId,
         request: ClientRequest,
-    ) -> Result<ClientResponse, (Error, ClientRequest)>;
+    ) -> Result<ClientResponse, Error>;
 
     // Requests some client state from the state machine handled by consensus
     fn client_query_request(
         &mut self,
         from: ClientId,
-        request: &ClientRequest,
+        request: ClientRequest,
     ) -> Result<ClientResponse, Error>;
 
     ///////////////////////////
@@ -273,7 +275,7 @@ where
         &mut self,
         handler: &mut H,
         from: AdminId,
-        request: &AddServerRequest,
+        request: AddServerRequest,
     ) -> Result<ConfigurationChangeResponse, Error>;
 
     //    fn remove_server_request(

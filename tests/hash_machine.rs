@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use raft_consensus::persistent_log::{Log, LogEntry, LogEntryData};
 use raft_consensus::state_machine::{SnapshotInfo, StateMachine};
 use raft_consensus::LogIndex;
@@ -56,7 +57,7 @@ impl<L: Log> StateMachine for HashMachine<L> {
     type Error = Error;
     type Log = L;
 
-    fn apply(&mut self, index: LogIndex, results_required: bool) -> Result<Option<Vec<u8>>, Error> {
+    fn apply(&mut self, index: LogIndex, results_required: bool) -> Result<Option<Bytes>, Error> {
         let mut entry = LogEntry::default();
         self.log.read_entry(index, &mut entry);
         if let LogEntryData::Proposal(command, _) = entry.data {
@@ -66,9 +67,9 @@ impl<L: Log> StateMachine for HashMachine<L> {
 
             self.hash = self.hasher.finish();
             if results_required {
-                Ok(Some((&self.hash.to_le_bytes()[..]).to_vec()))
+                Ok(Some(Bytes::copy_from_slice(&self.hash.to_le_bytes()[..])))
             } else {
-                Ok(Some(Vec::new()))
+                Ok(Some(Bytes::new()))
             }
         } else {
             Err(Error::HashMachineError(
@@ -77,12 +78,12 @@ impl<L: Log> StateMachine for HashMachine<L> {
         }
     }
 
-    fn query(&self, query: &[u8]) -> Result<Vec<u8>, Error> {
+    fn query(&self, query: Bytes) -> Result<Bytes, Error> {
         let mut hasher = self.hasher.clone();
-        for byte in query {
+        for byte in &query {
             hasher.write_u8(*byte);
         }
-        Ok((&hasher.finish().to_le_bytes()[..]).to_vec())
+        Ok(Bytes::copy_from_slice(&hasher.finish().to_le_bytes()[..]))
     }
 
     fn snapshot_info(&self) -> Result<Option<SnapshotInfo>, Self::Error> {
@@ -149,11 +150,11 @@ impl<L: Log> StateMachine for HashMachine<L> {
     }
 
     fn log(&self) -> &Self::Log {
-        todo!()
+        &self.log
     }
 
     fn log_mut(&mut self) -> &mut Self::Log {
-        todo!()
+        &mut self.log
     }
 
     fn last_applied(&self) -> Result<LogIndex, Self::Error> {

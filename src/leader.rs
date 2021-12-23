@@ -2,12 +2,11 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::error::*;
 use crate::state_machine::SnapshotInfo;
-use log::{debug, info, trace};
 
 use crate::config::{ConsensusConfig, SlowNodeTimeouts};
 use crate::handler::Handler;
 use crate::message::*;
-use crate::persistent_log::{LogEntry, LogEntryData, LogEntryDataRef, LogEntryRef};
+use crate::persistent_log::{LogEntry, LogEntryData};
 use crate::raft::CurrentState;
 use crate::state::State;
 use crate::state_impl::StateImpl;
@@ -16,6 +15,9 @@ use crate::{AdminId, ClientId, LogIndex, Peer, ServerId, Term};
 use crate::follower::Follower;
 use crate::persistent_log::{Log, LogEntryMeta};
 use crate::state_machine::StateMachine;
+
+use bytes::Bytes;
+use log::{debug, info, trace};
 
 static MAX_ROUNDS: u32 = 10;
 
@@ -28,7 +30,7 @@ where
         self,
         handler: &mut H,
         from: ServerId,
-        request: &AppendEntriesRequest,
+        request: AppendEntriesRequest,
     ) -> Result<(AppendEntriesResponse, CurrentState<M, H>), Error> {
         // when leader receives AppendEntries, this means another leader is in action somehow
         let leader_term = request.term;
@@ -59,7 +61,7 @@ where
         mut self,
         handler: &mut H,
         from: ServerId,
-        response: &AppendEntriesResponse,
+        response: AppendEntriesResponse,
     ) -> Result<(Option<PeerMessage>, CurrentState<M, H>), Error> {
         let current_term = self.current_term()?;
         let local_latest_log_index = self.latest_log_index()?;
@@ -72,7 +74,7 @@ where
             AppendEntriesResponse::Success(term, _)
             | AppendEntriesResponse::StaleTerm(term)
             | AppendEntriesResponse::InconsistentPrevEntry(term, _)
-                if &current_term < term =>
+                if current_term < term =>
             {
                 // some node has received message with term higher than ours,
                 // that means some other leader appeared in consensus,
@@ -84,7 +86,7 @@ where
             AppendEntriesResponse::Success(term, _)
             | AppendEntriesResponse::StaleTerm(term)
             | AppendEntriesResponse::InconsistentPrevEntry(term, _)
-                if &current_term > term =>
+                if current_term > term =>
             {
                 // some follower confirmed message we've sent at previous term
                 // it is ok for us
@@ -99,7 +101,7 @@ where
                 Ok((None, self.into()))
             }
             AppendEntriesResponse::InconsistentPrevEntry(_, next_index) => {
-                self.state_data.set_next_index(from, *next_index)?;
+                self.state_data.set_next_index(from, next_index)?;
                 let message = self.next_entries_or_snapshot(
                     handler,
                     from,
@@ -114,10 +116,10 @@ where
                 self.state_data.peers_alive.insert(from);
                 trace!(
                     "follower OK, checking next entry: {} {}",
-                    *follower_latest_log_index,
+                    follower_latest_log_index,
                     local_latest_log_index
                 );
-                if *follower_latest_log_index > local_latest_log_index {
+                if follower_latest_log_index > local_latest_log_index {
                     // some follower has too high index in it's log
                     // it can only happen by mistake or incorrect log on a follower
                     // but we cannot fix it from here, so we only can report
@@ -127,9 +129,9 @@ where
 
                 // catching up node will be handled internally
                 self.state_data
-                    .set_match_index(from, *follower_latest_log_index);
+                    .set_match_index(from, follower_latest_log_index);
                 self.state_data
-                    .set_next_index(from, *follower_latest_log_index + 1)?;
+                    .set_next_index(from, follower_latest_log_index + 1)?;
 
                 if self.state_data.has_follower(&from) {
                     // advance commit only if response was from follower
@@ -169,7 +171,7 @@ where
         self,
         handler: &mut H,
         candidate: ServerId,
-        request: &RequestVoteRequest,
+        request: RequestVoteRequest,
     ) -> Result<(Option<RequestVoteResponse>, CurrentState<M, H>), Error> {
         // To avoid disrupting leader while configuration changes, node should ignore or delay vote requests
         // coming within election timeout unless there is special flag set signalling
@@ -196,7 +198,7 @@ where
         self,
         handler: &mut H,
         from: ServerId,
-        response: &RequestVoteResponse,
+        response: RequestVoteResponse,
     ) -> Result<CurrentState<M, H>, Error> {
         let local_term = self.current_term()?;
         let voter_term = response.voter_term();
@@ -459,50 +461,46 @@ where
         handler: &mut H,
         from: ClientId,
         request: ClientRequest,
-    ) -> Result<ClientResponse, (Error, ClientRequest)> {
+    ) -> Result<ClientResponse, Error> {
         // write the request to log anyways
 
         match request.guarantee {
             ClientGuarantee::Fast => {
                 // append an entry to the log and send the message right away
                 let mut message = AppendEntriesRequest::new(1);
-                let log_index = self
-                    .add_new_entry(
-                        LogEntryData::Proposal(request.data, from, request.guarantee),
-                        Some(&mut message),
-                    )
-                    .map_err(|e| (e, request))?;
+                let log_index = self.add_new_entry(
+                    LogEntryData::Proposal(request.data, request.guarantee),
+                    Some(&mut message),
+                )?;
                 debug!(
                     "proposal request from client {} assigned idx {}",
                     from, log_index
                 );
 
-                self.send_append_entries_request(handler, log_index, message)
-                    .map_err(|e| (e, request))?;
+                self.send_append_entries_request(handler, log_index, message)?;
 
+                self.state_data.proposals.push_front(from);
                 Ok(ClientResponse::Queued(log_index))
             }
 
             ClientGuarantee::Log => {
-                let log_index = self
-                    .add_new_entry(
-                        LogEntryData::Proposal(request.data, from, request.guarantee),
-                        None,
-                    )
-                    .map_err(|e| (e, request))?;
+                let log_index = self.add_new_entry(
+                    LogEntryData::Proposal(request.data, request.guarantee),
+                    None,
+                )?;
                 debug!(
                     "proposal request from client {} assigned idx {}",
                     from, log_index
                 );
 
+                self.state_data.proposals.push_front(from);
                 // write to log, but don't send append_entries_request right away
                 Ok(ClientResponse::Queued(log_index))
             }
             ClientGuarantee::Batch => {
-                self.state_data.client_batch.push(LogEntryData::Proposal(
-                    request.data,
+                self.state_data.client_batch.push((
                     from,
-                    request.guarantee,
+                    LogEntryData::Proposal(request.data, request.guarantee),
                 ));
                 if self.state_data.client_batch.len() == 1 {
                     handler.set_timeout(Timeout::Client);
@@ -517,13 +515,13 @@ where
     fn client_query_request(
         &mut self,
         from: ClientId,
-        request: &ClientRequest,
+        request: ClientRequest,
     ) -> Result<ClientResponse, Error> {
         // TODO: linerability for clients
         trace!("query from client {}", from);
         let result = self
             .state_machine
-            .query(request.data.as_slice())
+            .query(request.data)
             .map_err(|e| Error::Critical(CriticalError::StateMachine(Box::new(e))))?;
         Ok(ClientResponse::Success(result))
     }
@@ -537,7 +535,7 @@ where
         &mut self,
         handler: &mut H,
         from: AdminId,
-        request: &AddServerRequest,
+        request: AddServerRequest,
     ) -> Result<ConfigurationChangeResponse, Error> {
         // check if first empty entry has been committed by consensus, do not allow config change until it has
         let latest_log_index = self.latest_log_index()?;
@@ -685,8 +683,9 @@ where
         let leader_commit = self.commit_index;
 
         let mut entries = Vec::new();
-        while let Some(data) = self.state_data.client_batch.pop() {
+        while let Some((client_id, data)) = self.state_data.client_batch.pop() {
             entries.push(LogEntry { term, data });
+            self.state_data.proposals.push_front(client_id);
         }
 
         self.log_mut()
@@ -762,7 +761,7 @@ where
             );
             match entry_kind {
                 LogEntryMeta::Empty => {}
-                LogEntryMeta::Proposal(client_id, guarantee) => {
+                LogEntryMeta::Proposal(guarantee) => {
                     let result = self
                         .state_machine
                         .apply(entry_index, true)
@@ -775,8 +774,10 @@ where
                     // TCP connections. TODO: with linerability it will be possible to process
                     // requests correctly
 
-                    // the queued entries have to exist in the queue to be committed,
-                    // so popping a wrong index means a bug
+                    let client_id = match self.state_data.proposals.pop_back() {
+                        Some(id) => id,
+                        None => return Err(Error::unreachable(module_path!())),
+                    };
                     if let Some(response) = result {
                         trace!(
                             "responding to client {} for entry {}",
@@ -794,7 +795,7 @@ where
                         return Err(Error::unreachable(module_path!()));
                     }
                 }
-                LogEntryMeta::Config(config, _) => {
+                LogEntryMeta::Config(config) => {
                     // we only saved configuration to log and memory, but has not persisted it yet
                     // this is what we have to do now
                     self.log_mut()
@@ -834,7 +835,7 @@ where
         if follower_last_index < local_latest_log_index {
             let first_log_index = self
                 .log()
-                .first_log_index()
+                .first_index()
                 .map_err(|e| Error::PersistentLogRead(Box::new(e)))?;
             if follower_last_index < first_log_index {
                 trace!(
@@ -990,8 +991,10 @@ where
                 let config = self.config.clone();
 
                 // the config is already modified, just add it as an entry
-                let (log_index, message) =
-                    self.add_new_entry(LogEntryDataRef::Config(&config, admin_id), true)?;
+                let mut message = AppendEntriesRequest::new(1);
+
+                let log_index =
+                    self.add_new_entry(LogEntryData::Config(config), Some(&mut message))?;
                 self.send_append_entries_request(handler, log_index, message)?;
 
                 handler.set_timeout(Timeout::Heartbeat(from));
@@ -1054,7 +1057,8 @@ where
         // this may be kind of dangerous sometimes because of amount being too big
         // but most probably snapshotting would solve it
         for index in from.as_u64()..until.as_u64() {
-            let mut log_entry = LogEntry::new_proposal(Term(0), Vec::new(), ClientId::default());
+            let mut log_entry =
+                LogEntry::new_proposal(Term(0), Bytes::new(), ClientGuarantee::default());
             self.log()
                 .read_entry(LogIndex(index), &mut log_entry)
                 .map_err(|e| Error::PersistentLogRead(Box::new(e)))?;
@@ -1093,7 +1097,7 @@ where
             data: entry_data,
         };
         self.log_mut()
-            .append_entries(log_index, &[log_entry])
+            .append_entries(log_index, &[log_entry.clone()])
             .map_err(|e| Error::Critical(CriticalError::PersistentLogWrite(Box::new(e))))?;
 
         let mut entry: Entry = log_entry.into();
@@ -1163,7 +1167,8 @@ pub(crate) struct Leader {
     peers_alive: HashSet<ServerId>,
     pending_snapshots: HashSet<ServerId>,
 
-    client_batch: Vec<LogEntryData>,
+    client_batch: Vec<(ClientId, LogEntryData)>,
+    proposals: VecDeque<ClientId>,
 
     // Liearizability marker set at the beginning of each term
     read_index: Option<LogIndex>,
@@ -1199,6 +1204,7 @@ impl Leader {
             peers_alive: HashSet::new(),
             pending_snapshots: HashSet::new(),
             client_batch: Vec::new(),
+            proposals: VecDeque::new(),
             read_index: None,
             config_change: None,
         }
@@ -1398,8 +1404,9 @@ impl Leader {
             if current_config.add_or_remove_peer(peer.clone())? {
                 // peer did not exist - added
             } else {
-                // peer existed - remove it
-                todo!("removing server is not implemented yet, must think about giving away leadership");
+                // peer existed - this cannot happen because the function is only called
+                // when catching up node being added is caught up
+                return Err(Error::Critical(CriticalError::Unreachable(module_path!())));
             }
             *stage = ConfigChangeStage::Committing(current_config.clone(), config_index);
             Ok(admin_id.clone())

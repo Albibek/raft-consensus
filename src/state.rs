@@ -85,7 +85,7 @@ where
     pub(crate) fn latest_log_term(&self) -> Result<Term, Error> {
         let index = self
             .log()
-            .latest_log_index()
+            .latest_index()
             .map_err(|e| Error::PersistentLogRead(Box::new(e)))?;
         match self
             .log()
@@ -102,7 +102,7 @@ where
     pub(crate) fn latest_log_index(&self) -> Result<LogIndex, Error> {
         Ok(self
             .log()
-            .latest_log_index()
+            .latest_index()
             .map_err(|e| Error::PersistentLogRead(Box::new(e)))?)
     }
 
@@ -166,7 +166,7 @@ where
         mut self,
         handler: &mut H,
         from: ServerId,
-        request: &RequestVoteRequest,
+        request: RequestVoteRequest,
         from_state: ConsensusState,
     ) -> Result<(RequestVoteResponse, CurrentState<M, H>), Error> {
         let candidate_term = request.term;
@@ -278,8 +278,9 @@ where
         self.state_machine
             .take_snapshot(self.commit_index)
             .map_err(|e| Error::Critical(CriticalError::StateMachine(Box::new(e))))?;
-        self.log()
-            .discard_until(self.commit_index)
+        let cut_until = self.commit_index;
+        self.log_mut()
+            .discard_until(cut_until)
             .map_err(|e| Error::Critical(CriticalError::PersistentLogWrite(Box::new(e))))?;
         return Ok(true);
     }

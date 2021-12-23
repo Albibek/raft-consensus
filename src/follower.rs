@@ -25,7 +25,7 @@ where
         mut self,
         handler: &mut H,
         from: ServerId,
-        request: &AppendEntriesRequest,
+        request: AppendEntriesRequest,
     ) -> Result<(AppendEntriesResponse, CurrentState<M, H>), Error> {
         let leader_term = request.term;
         let current_term = self.current_term()?;
@@ -54,7 +54,7 @@ where
         self,
         _handler: &mut H,
         _from: ServerId,
-        _response: &AppendEntriesResponse,
+        _response: AppendEntriesResponse,
     ) -> Result<(Option<PeerMessage>, CurrentState<M, H>), Error> {
         // the follower can only receive responses in case the node was a leader some time ago
         // and sent requests which triggered the reponse while response was held somewhere in network
@@ -67,7 +67,7 @@ where
         mut self,
         handler: &mut H,
         candidate: ServerId,
-        request: &RequestVoteRequest,
+        request: RequestVoteRequest,
     ) -> Result<(Option<RequestVoteResponse>, CurrentState<M, H>), Error> {
         if !self.state_data.can_vote {
             debug!("non-voting node received a voting request");
@@ -112,7 +112,7 @@ where
         self,
         handler: &mut H,
         from: ServerId,
-        response: &RequestVoteResponse,
+        response: RequestVoteResponse,
     ) -> Result<CurrentState<M, H>, Error> {
         let local_term = self.current_term()?;
         let voter_term = response.voter_term();
@@ -219,7 +219,7 @@ where
         // election timeout is never down, but we want handler to randomize it every tick
         // TODO: probably make this an option
         handler.set_timeout(Timeout::Election);
-        if let Some((from, ref request)) = self.state_data.delayed_vote_request.take() {
+        if let Some((from, request)) = self.state_data.delayed_vote_request.take() {
             // Since voting has started already, we must process the delayed vote request.
             // For the node this means it has to vote for another candidate instead of itself
             // This in turn means, that becoming candidate may not be required
@@ -267,7 +267,7 @@ where
         _handler: &mut H,
         _from: ClientId,
         _request: ClientRequest,
-    ) -> Result<ClientResponse, (Error, ClientRequest)> {
+    ) -> Result<ClientResponse, Error> {
         self.state_data
             .leader
             .map_or(Ok(ClientResponse::UnknownLeader), |leader| {
@@ -278,12 +278,14 @@ where
     fn client_query_request(
         &mut self,
         from: ClientId,
-        _request: &ClientRequest,
+        _request: ClientRequest,
     ) -> Result<ClientResponse, Error> {
         // TODO: introduce an option for allowing the response from the potentially
         // older state of the machine
         // With such option it could be possible to request the state machine on the follower
         // having eventual consistency as the result
+        // TODO:
+        // When option is not set, the request should be proxied to the assumed leader
         trace!("query from client {}", from);
         Ok(self
             .state_data
@@ -302,7 +304,7 @@ where
         &mut self,
         _handler: &mut H,
         _from: AdminId,
-        _request: &AddServerRequest,
+        _request: AddServerRequest,
     ) -> Result<ConfigurationChangeResponse, Error> {
         // TODO: forward to leader
         self.state_data
@@ -346,10 +348,9 @@ where
     M: StateMachine,
     H: Handler,
 {
-    /// AppendEntries processing function for
     pub(crate) fn append_entries(
         &mut self,
-        request: &AppendEntriesRequest,
+        request: AppendEntriesRequest,
         current_term: Term,
     ) -> Result<AppendEntriesResponse, Error> {
         let leader_term = request.term;
@@ -427,22 +428,24 @@ where
         // but all other check and actions MUST be performed
         // because due to Raft's nature the follower's state machine(not log though) is always 1 commit behind the leader
         // until it receives the next AppendEntries message, be it heartbeat or whatever else
-        for entry in entries.iter() {
+        let mut log_entries = Vec::with_capacity(entries.len());
+        for entry in entries.into_iter() {
             // with each send, leader marks config entries as active if they really take place
             // as current cluster configuration, this way the follower can skip using previous
             // inactive entries as actual ones and will not connect to some old nodes
-            if let EntryData::Config(config, is_active, _) = &entry.data {
+            if let EntryData::Config(config, is_active) = &entry.data {
                 if *is_active {
                     self.config = config.clone();
                 }
             }
 
-            self.log_mut()
-                .append_entry(append_index, &entry.as_entry_ref())
-                .map_err(|e| Error::Critical(CriticalError::PersistentLogWrite(Box::new(e))))?;
-
+            log_entries.push(entry.into());
             append_index = append_index + 1;
         }
+
+        self.log_mut()
+            .append_entries(append_index, &log_entries)
+            .map_err(|e| Error::Critical(CriticalError::PersistentLogWrite(Box::new(e))))?;
 
         self.min_index = new_latest_log_index;
 
@@ -485,7 +488,7 @@ where
                         .apply(entry_index, false)
                         .map_err(|e| Error::Critical(CriticalError::StateMachine(Box::new(e))))?;
                 }
-                LogEntryMeta::Config(config, _) => {
+                LogEntryMeta::Config(config) => {
                     // we only saved configuration to log(an an entry) and memory, but has not persisted it yet
                     // this is what we have to do now
                     self.log_mut()

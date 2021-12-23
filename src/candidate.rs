@@ -8,7 +8,7 @@ use crate::handler::Handler;
 use crate::leader::Leader;
 use crate::message::*;
 use crate::persistent_log::Log;
-use crate::persistent_log::LogEntryDataRef;
+use crate::persistent_log::LogEntryData;
 use crate::raft::CurrentState;
 use crate::state::State;
 use crate::state_impl::StateImpl;
@@ -24,7 +24,7 @@ where
         self,
         handler: &mut H,
         from: ServerId,
-        request: &AppendEntriesRequest,
+        request: AppendEntriesRequest,
     ) -> Result<(AppendEntriesResponse, CurrentState<M, H>), Error> {
         let leader_term = request.term;
         let current_term = self.current_term()?;
@@ -52,7 +52,7 @@ where
         self,
         _handler: &mut H,
         _from: ServerId,
-        _response: &AppendEntriesResponse,
+        _response: AppendEntriesResponse,
     ) -> Result<(Option<PeerMessage>, CurrentState<M, H>), Error> {
         // the candidate can only receive responses in case the node was a leader some time ago
         // and sent requests which triggered the reponse while response was held somewhere in network
@@ -66,7 +66,7 @@ where
         self,
         handler: &mut H,
         candidate: ServerId,
-        request: &RequestVoteRequest,
+        request: RequestVoteRequest,
     ) -> Result<(Option<RequestVoteResponse>, CurrentState<M, H>), Error> {
         // To avoid disrupting leader while configuration changes, node should ignore or delay vote requests
         // coming within election timeout unless there is special flag set signalling
@@ -88,7 +88,7 @@ where
         mut self,
         handler: &mut H,
         from: ServerId,
-        response: &RequestVoteResponse,
+        response: RequestVoteResponse,
     ) -> Result<CurrentState<M, H>, Error> {
         debug!("RequestVoteResponse from peer {}", from);
 
@@ -220,14 +220,14 @@ where
         _handler: &mut H,
         _from: ClientId,
         _request: ClientRequest,
-    ) -> Result<ClientResponse, (Error, ClientRequest)> {
+    ) -> Result<ClientResponse, Error> {
         Ok(ClientResponse::UnknownLeader)
     }
 
     fn client_query_request(
         &mut self,
         _from: ClientId,
-        _request: &ClientRequest,
+        _request: ClientRequest,
     ) -> Result<ClientResponse, Error> {
         Ok(ClientResponse::UnknownLeader)
     }
@@ -241,7 +241,7 @@ where
         &mut self,
         _handler: &mut H,
         _from: AdminId,
-        _request: &AddServerRequest,
+        _request: AddServerRequest,
     ) -> Result<ConfigurationChangeResponse, Error> {
         Ok(ConfigurationChangeResponse::UnknownLeader)
     }
@@ -368,9 +368,11 @@ where
             options: self.options,
         };
 
-        let (_, message) = leader.add_new_entry(LogEntryDataRef::Empty)?;
+        let mut message = AppendEntriesRequest::new(1);
+        leader.add_new_entry(LogEntryData::Empty, Some(&mut message))?;
 
-        // send a message wiht empty entry to all peers, this will work as heartbeat
+        // send the message with the empty entry to all peers, this will work as heartbeat too,
+        // but is not equal to heartbeat, because index needs to be shifted
         leader.config.with_remote_peers(&leader.id, |id| {
             handler.send_peer_message(*id, PeerMessage::AppendEntriesRequest(message.clone()));
             handler.set_timeout(Timeout::Heartbeat(*id));

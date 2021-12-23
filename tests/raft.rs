@@ -5,6 +5,7 @@ use std::iter::FromIterator;
 
 use crate::handler::*;
 use crate::hash_machine::HashMachine;
+use bytes::Bytes;
 use itertools::Itertools;
 
 use raft_consensus::message::*;
@@ -132,7 +133,7 @@ impl TestCluster {
                 self.handler.cur = to;
                 let node = self.nodes.get_mut(&to).unwrap();
                 trace!("{} -> {} peer: {:?}", from, to, msg);
-                node.apply_peer_message(&mut self.handler, from, &msg)
+                node.apply_peer_message(&mut self.handler, from, msg)
                     .unwrap();
                 self.handler.reset_cur();
             }
@@ -147,14 +148,14 @@ impl TestCluster {
                 self.handler.cur = to;
                 trace!("{} -> {} client: {:?}", from, to, msg);
                 let node = self.nodes.get_mut(&to).unwrap();
-                node.apply_client_message(&mut self.handler, from, &msg)
+                node.apply_client_message(&mut self.handler, from, msg)
                     .unwrap();
             }
             Action::Admin(from, to, msg) => {
                 self.handler.cur = to;
                 trace!("{} -> {}: admin {:?} ", from, to, msg);
                 let node = self.nodes.get_mut(&to).unwrap();
-                node.apply_admin_message(&mut self.handler, from, &msg)
+                node.apply_admin_message(&mut self.handler, from, msg)
                     .unwrap();
             }
         }
@@ -167,7 +168,7 @@ impl TestCluster {
         let admin_id = AdminId(uuid::Uuid::from_slice(&[0u8; 16]).unwrap());
         for (id, node) in &mut self.nodes {
             self.handler.cur = *id;
-            node.apply_admin_message(&mut self.handler, admin_id, &AdminMessage::PingRequest)
+            node.apply_admin_message(&mut self.handler, admin_id, AdminMessage::PingRequest)
                 .unwrap();
 
             let (_, queue) = self.handler.admin_network.iter_mut().next().unwrap();
@@ -193,11 +194,11 @@ impl TestCluster {
     pub fn assert_log_condition(&mut self) {
         for (id, node) in &mut self.nodes {
             let log = node.log().unwrap();
-            let latest = log.latest_log_index().unwrap();
+            let latest = log.latest_index().unwrap();
             trace!("id={} log latest {}", id, latest);
             for index in 1..(latest.as_u64() + 1) {
                 let mut log_entry =
-                    LogEntry::new_proposal(Term(0), Vec::new(), ClientId::default());
+                    LogEntry::new_proposal(Term(0), Bytes::new(), ClientGuarantee::default());
                 log.read_entry(LogIndex(index), &mut log_entry).unwrap();
                 trace!("id={} entry {:?}", id, log_entry);
             }
@@ -207,7 +208,7 @@ impl TestCluster {
     pub fn assert_machine_condition(&mut self) {
         for (id, node) in &mut self.nodes {
             let machine = node.state_machine().unwrap();
-            let result = machine.query(&[]);
+            let result = machine.query(Bytes::new());
             trace!("id={} state machine state: {:?}", id, result);
         }
     }

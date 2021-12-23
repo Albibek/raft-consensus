@@ -83,6 +83,9 @@ pub mod messages_capnp {
     include!(concat!(env!("OUT_DIR"), "/schema/messages_capnp.rs"));
 }
 
+#[cfg(feature = "testing")]
+pub mod testing;
+
 // Data and functions for all states
 mod state;
 
@@ -230,6 +233,19 @@ impl fmt::Display for LogIndex {
 pub struct Peer {
     pub id: ServerId,
     pub metadata: Vec<u8>,
+}
+
+impl Peer {
+    pub fn new(id: ServerId) -> Self {
+        Self {
+            id,
+            metadata: Vec::new(),
+        }
+    }
+
+    pub fn with_metadata(id: ServerId, metadata: Vec<u8>) -> Self {
+        Self { id, metadata }
+    }
 }
 
 /// The ID of a Raft peer node. Must be unique among the participants in a
