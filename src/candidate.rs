@@ -329,11 +329,12 @@ where
             .log_mut()
             .set_voted_for(Some(id))
             .map_err(|e| Error::Critical(CriticalError::PersistentLogWrite(Box::new(e))))?;
-        let last_log_term = self.latest_log_term()?;
+        let latest_log_index = self.latest_log_index()?;
+        let last_log_term = self.latest_log_term(Some(latest_log_index))?;
 
         let message = RequestVoteRequest {
             term: self.current_term()?,
-            last_log_index: self.latest_log_index()?,
+            last_log_index: latest_log_index,
             last_log_term,
             is_voluntary_step_down: voluntary,
         };

@@ -164,9 +164,11 @@ fn test_client_proposal() {
         assert_eq!(node.kind(), ConsensusState::Follower);
     }
     cluster.kickstart();
+    // LogIndex = 1 because of empty entry after voting)
     let client_id = ClientId(uuid::Uuid::from_slice(&[0u8; 16]).unwrap());
     let leader_id = ServerId(0);
 
+    // client proposal will be inserted at LogIndex = 2
     let query = Bytes::from((&[0, 0, 0, 42]).as_slice());
     cluster.apply_action(Action::Client(
         client_id,
@@ -176,6 +178,9 @@ fn test_client_proposal() {
             guarantee: ClientGuarantee::default(),
         }),
     ));
+    // send the proposal to followers (after timeout, because of default client guarantee)
+    // and process their responses
+    cluster.apply_heartbeats();
     cluster.apply_peer_packets();
 
     let responses = cluster
@@ -186,9 +191,13 @@ fn test_client_proposal() {
 
     dbg!(responses);
 
+    // TODO: apply client packets, make sure the hash is good there
+
+    // ping the followers so they could know the the proposal is committed
     cluster.apply_heartbeats();
     cluster.apply_peer_packets();
 
+    // ensure the hash is the same on all the state machines and in the response
     let mut hasher = DefaultHasher::new();
     for byte in &query {
         hasher.write_u8(*byte);
@@ -197,7 +206,7 @@ fn test_client_proposal() {
     let expected_hash = hasher.finish();
 
     for (id, node) in &cluster.nodes {
-        dbg!(node.state_machine().unwrap().hash, expected_hash);
+        dbg!(id, node.state_machine().unwrap().hash, expected_hash);
         assert_eq!(node.state_machine().unwrap().hash, expected_hash);
     }
 }

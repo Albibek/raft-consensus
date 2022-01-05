@@ -1,6 +1,8 @@
 use crate::config::ConsensusConfig;
-use crate::persistent_log::{Log, LogEntry, LogEntryMeta, LogError};
+use crate::persistent_log::{Log, LogEntry, LogEntryMeta};
 use crate::{LogIndex, ServerId, Term};
+
+use thiserror::Error as ThisError;
 
 /// This is a `Log` implementation that stores entries in a simple in-memory vector. Other data
 /// is stored in a struct. It is chiefly intended for testing.
@@ -10,7 +12,7 @@ pub struct MemLog {
     voted_for: Option<ServerId>,
     entries: Vec<LogEntry>,
     latest_config: Option<(ConsensusConfig, LogIndex)>,
-    start_index: u64,
+    first_index: u64,
 }
 
 impl MemLog {
@@ -20,96 +22,154 @@ impl MemLog {
             voted_for: None,
             entries: Vec::new(),
             latest_config: None,
-            start_index: 0,
+            first_index: 0,
         }
+    }
+
+    fn entry_at(&self, index: LogIndex) -> Option<&LogEntry> {
+        let index = index.as_u64();
+        let entry_index = index - self.first_index;
+        self.entries.get(entry_index as usize)
     }
 }
 
 impl Log for MemLog {
-    type Error = LogError;
+    type Error = MemLogError;
 
     fn latest_index(&self) -> Result<LogIndex, Self::Error> {
-        Ok(LogIndex(self.start_index + self.entries.len() as u64))
+        if self.first_index == 0 {
+            Ok(LogIndex(0))
+        } else if self.entries.len() == 0 {
+            // edge case: entry does not exist, but index must be there
+            Ok(self.first_index.into())
+        } else {
+            Ok(LogIndex((self.first_index - 1) + self.entries.len() as u64))
+        }
     }
 
+    #[inline]
     fn latest_volatile_index(&self) -> Result<LogIndex, Self::Error> {
         self.latest_index()
     }
 
     fn first_index(&self) -> Result<LogIndex, Self::Error> {
-        Ok(LogIndex(self.start_index))
+        Ok(LogIndex(self.first_index))
     }
 
-    fn term_of(&self, index: LogIndex) -> Result<Option<Term>, Self::Error> {
+    fn term_of(&self, index: LogIndex) -> Result<Term, MemLogError> {
         let index: u64 = index.as_u64();
         if index == 0 {
-            return Ok(Some(Term(0)));
+            return Err(MemLogError::ConsensusGuarantee(
+                "consensus should not request a term for LogIndex(0)".into(),
+            ));
         }
-        if index < self.start_index {
-            return Ok(None);
+        if self.entries.len() == 0 {
+            return Err(MemLogError::ConsensusGuarantee(
+                "consensus should not request a term when log is empty".into(),
+            ));
         }
-        Ok(self
-            .entries
-            .get((self.start_index + index - 1) as usize)
-            .map(|entry| Some(entry.term))
-            .unwrap_or(None))
-        //.ok_or(LogError::BadIndex(LogIndex(index)))
+        if index < self.first_index || index > self.latest_index().unwrap().as_u64() {
+            return Err(MemLogError::ConsensusGuarantee(
+                "consensus should not request a term for non-existent entry".into(),
+            ));
+        }
+        self.entry_at(LogIndex(index))
+            .map(|entry| entry.term)
+            .ok_or(MemLogError::ConsensusGuarantee(
+                "consensus should not request a term for non-existent entry".into(),
+            ))
     }
 
     fn discard_since(&mut self, index: LogIndex) -> Result<LogIndex, Self::Error> {
-        if index.as_usize() < self.entries.len() {
-            self.entries.truncate(index.as_usize())
+        if index > self.latest_index()? {
+            return self.latest_index();
+        } else if index.as_u64() < self.first_index {
+            return Err(MemLogError::ConsensusGuarantee(format!(
+                "discarding non existent index {}, only {} exists",
+                index, self.first_index
+            )));
+        } else if index.as_u64() == self.first_index {
+            self.first_index = index.as_u64();
+            self.entries.drain(..).last();
         }
-        Ok(index)
+
+        let trunc = index.as_u64() - self.first_index;
+        self.entries.truncate(trunc as usize);
+        Ok(index - 1)
     }
 
-    fn discard_until(&mut self, index: LogIndex) -> Result<LogIndex, Self::Error> {
+    fn discard_until(&mut self, index: LogIndex) -> Result<(), MemLogError> {
         let index = index.as_u64();
-        if index <= self.start_index {
+        if index <= self.first_index {
             // do nothing
-        } else if index > self.start_index + index {
-            let until = (index - self.start_index) as usize;
+        } else if index <= self.latest_index()?.as_u64() {
+            let until = (index - self.first_index) as usize;
             self.entries.drain(..until);
-            self.start_index += until as u64;
+            self.first_index += until as u64;
         } else {
+            // index is beyond last_index: discard the whole log
             self.entries.clear();
-            self.start_index = index + 1;
+            self.first_index = index + 1;
         }
 
-        Ok(self.start_index.into())
+        Ok(())
     }
 
     fn read_entry(&self, index: LogIndex, dest: &mut LogEntry) -> Result<(), Self::Error> {
         let index: u64 = index.as_u64();
 
-        if index < self.start_index {
-            return Ok(());
+        if index < self.first_index {
+            return Err(MemLogError::ConsensusGuarantee(format!(
+                "reading entry  at {} which is before first index {}",
+                index, self.first_index
+            )));
         }
-        self.entries
-            .get((index - 1) as usize)
+        self.entry_at(LogIndex(index))
             .map(|entry| *dest = entry.clone())
-            .ok_or(LogError::BadIndex(index.into()))
+            .ok_or(MemLogError::BadIndex(index.into()))
     }
 
     fn entry_meta_at(&self, index: LogIndex) -> Result<LogEntryMeta, Self::Error> {
         self.entries
             .get((index - 1).as_u64() as usize)
             .map(|entry| entry.meta())
-            .ok_or(LogError::BadIndex(index))
+            .ok_or(MemLogError::BadIndex(index))
     }
 
     fn append_entries(&mut self, start: LogIndex, entries: &[LogEntry]) -> Result<(), Self::Error> {
-        if self.start_index > start.as_u64() {
-            return Err(LogError::BadLogIndex);
+        // this check can be skipped in implementations and only checks consensus logic
+        if start == LogIndex(0) {
+            return Err(MemLogError::ConsensusGuarantee(
+                "appending to LogIndex(0)".into(),
+            ));
+        }
+        if self.first_index > start.as_u64() {
+            return Err(MemLogError::ConsensusGuarantee(format!(
+                "appending at older index: {} > {}",
+                self.first_index, start
+            )));
+            //return Err(MemLogError::BadIndex(start));
         }
 
-        let index = (start.as_u64() - self.start_index) as usize;
+        let latest_index = self.latest_index()?.as_u64();
+        //let index = (start.as_u64() - self.first_index) as usize;
 
-        if self.entries.len() >= index {
-            self.entries.truncate(index);
+        if start.as_u64() > latest_index + 1 {
+            // while we can easily overcome rewriting, consensus
+            // should not do it, so we intentionally return error here co catch
+            // this
+            return Err(MemLogError::ConsensusGuarantee(format!(
+                "appending rewrites entries without truncation: requested {} while index must be {}",
+                start,
+                latest_index
+            )));
         }
 
         self.entries.extend_from_slice(entries);
+        if self.first_index == 0 {
+            self.first_index = 1
+        }
+
         Ok(())
     }
 
@@ -156,6 +216,14 @@ impl Default for MemLog {
     }
 }
 
+#[derive(ThisError, Debug)]
+#[error("memory log error")]
+pub enum MemLogError {
+    BadIndex(LogIndex),
+    #[error("consensus guarantee violation: {}", _0)]
+    ConsensusGuarantee(String),
+}
+
 #[cfg(test)]
 mod test {
 
@@ -164,117 +232,7 @@ mod test {
 
     #[test]
     fn test_mem_log() {
-        let tester = LogTester::new(MemLog::new);
+        let mut tester = LogTester::new(MemLog::new);
+        tester.test_all();
     }
-
-    // TODO test not filling logindex(0) and term(0) because log indexes start from 1
-    /*
-           use crate::persistent_log::{append_entries, get_entry, Log};
-
-           use {LogIndex, ServerId, Term};
-
-           #[test]
-           fn test_current_term() {
-           let mut store = MemLog::new();
-           assert_eq!(Term(0), store.current_term().unwrap());
-           store.set_voted_for(ServerId::from(0)).unwrap();
-           store.set_current_term(Term(42)).unwrap();
-           assert_eq!(None, store.voted_for().unwrap());
-           assert_eq!(Term(42), store.current_term().unwrap());
-           store.inc_current_term().unwrap();
-           assert_eq!(Term(43), store.current_term().unwrap());
-           }
-
-           #[test]
-           fn test_voted_for() {
-           let mut store = MemLog::new();
-           assert_eq!(None, store.voted_for().unwrap());
-           let id = ServerId::from(0);
-           store.set_voted_for(id).unwrap();
-           assert_eq!(Some(id), store.voted_for().unwrap());
-           }
-
-           #[test]
-           fn test_append_entries() {
-           let mut store = MemLog::new();
-           assert_eq!(LogIndex::from(0), store.latest_log_index().unwrap());
-           assert_eq!(Term::from(0), store.latest_log_term().unwrap());
-
-        // [0.1, 0.2, 0.3, 1.4]
-        append_entries(
-        &mut store,
-        LogIndex(1),
-        &[
-        (Term::from(0), &[1]),
-        (Term::from(0), &[2]),
-        (Term::from(0), &[3]),
-        (Term::from(1), &[4]),
-        ],
-        )
-        .unwrap();
-        assert_eq!(LogIndex::from(4), store.latest_log_index().unwrap());
-        assert_eq!(Term::from(1), store.latest_log_term().unwrap());
-
-        assert_eq!(
-        (Term::from(0), vec![1u8]),
-        get_entry(&store, LogIndex::from(1))
-        );
-        assert_eq!(
-        (Term::from(0), vec![2u8]),
-        get_entry(&store, LogIndex::from(2))
-        );
-        assert_eq!(
-        (Term::from(0), vec![3u8]),
-        get_entry(&store, LogIndex::from(3))
-        );
-        assert_eq!(
-        (Term::from(1), vec![4u8]),
-        get_entry(&store, LogIndex::from(4))
-        );
-
-        // [0.1, 0.2, 0.3]
-        append_entries(&mut store, LogIndex::from(4), &[]).unwrap();
-        assert_eq!(LogIndex(3), store.latest_log_index().unwrap());
-        assert_eq!(Term::from(0), store.latest_log_term().unwrap());
-        assert_eq!(
-        (Term::from(0), vec![1u8]),
-        get_entry(&store, LogIndex::from(1))
-        );
-        assert_eq!(
-            (Term::from(0), vec![2u8]),
-            get_entry(&store, LogIndex::from(2))
-        );
-        assert_eq!(
-            (Term::from(0), vec![3u8]),
-            get_entry(&store, LogIndex::from(3))
-        );
-
-        // [0.1, 0.2, 2.3, 3.4]
-        append_entries(
-            &mut store,
-            LogIndex::from(3),
-            &[(Term(2), &[3]), (Term(3), &[4])],
-        )
-            .unwrap();
-        assert_eq!(LogIndex(4), store.latest_log_index().unwrap());
-        assert_eq!(Term::from(3), store.latest_log_term().unwrap());
-        assert_eq!(
-            (Term::from(0), vec![1u8]),
-            get_entry(&store, LogIndex::from(1))
-        );
-        assert_eq!(
-            (Term::from(0), vec![2u8]),
-            get_entry(&store, LogIndex::from(2))
-        );
-        assert_eq!(
-            (Term::from(2), vec![3u8]),
-            get_entry(&store, LogIndex::from(3))
-        );
-        assert_eq!(
-            (Term::from(3), vec![4u8]),
-            get_entry(&store, LogIndex::from(4))
-        );
-    }
-
-    */
 }

@@ -9,9 +9,9 @@ use crate::config::{ConsensusConfig, ConsensusOptions};
 //use crate::entry::{ConsensusConfig, Entry, EntryData};
 use crate::error::Error;
 use crate::handler::Handler;
-use crate::message::*;
 use crate::raft::CurrentState;
 use crate::state_impl::StateImpl;
+use crate::{debug_where, message::*};
 use crate::{LogIndex, ServerId, Term};
 
 use crate::follower::Follower;
@@ -81,20 +81,26 @@ where
     }
 
     /// Helper for returning the term of the latest applied log entry.
+    /// Hints are for cases when values were already read from log.
     #[inline]
-    pub(crate) fn latest_log_term(&self) -> Result<Term, Error> {
-        let index = self
-            .log()
-            .latest_index()
-            .map_err(|e| Error::PersistentLogRead(Box::new(e)))?;
-        match self
-            .log()
-            .term_of(index)
-            .map_err(|e| Error::PersistentLogRead(Box::new(e)))?
-        {
-            Some(term) => Ok(term),
-            None => Err(Error::unreachable(module_path!())),
+    pub(crate) fn latest_log_term(
+        &self,
+        latest_index_hint: Option<LogIndex>,
+    ) -> Result<Term, Error> {
+        let latest_index = if let Some(index) = latest_index_hint {
+            index
+        } else {
+            self.log()
+                .latest_index()
+                .map_err(|e| Error::PersistentLogRead(Box::new(e)))?
+        };
+        if latest_index == LogIndex(0) {
+            return Ok(Term(0));
         }
+
+        self.log()
+            .term_of(latest_index)
+            .map_err(|e| Error::PersistentLogRead(Box::new(e)))
     }
 
     /// Helper for returning the index of the latest applied log entry.
@@ -195,10 +201,11 @@ where
             (current_term, false)
         };
 
+        let latest_log_index = self.latest_log_index()?;
         let message = if candidate_term < current_term {
             RequestVoteResponse::StaleTerm(new_local_term)
-        } else if candidate_log_term < self.latest_log_term()?
-            || candidate_log_index < self.latest_log_index()?
+        } else if candidate_log_term < self.latest_log_term(Some(latest_log_index))?
+            || candidate_log_index < latest_log_index
         {
             RequestVoteResponse::InconsistentLog(new_local_term)
         } else {
@@ -275,8 +282,12 @@ where
         // * commit_index > info.index
         // * snapshot_info is None
         // both meaning there is a point to make the snapshot
+        let commit_term = self
+            .log()
+            .term_of(self.commit_index)
+            .map_err(|e| Error::PersistentLogRead(Box::new(e)))?;
         self.state_machine
-            .take_snapshot(self.commit_index)
+            .take_snapshot(self.commit_index, commit_term)
             .map_err(|e| Error::Critical(CriticalError::StateMachine(Box::new(e))))?;
         let cut_until = self.commit_index;
         self.log_mut()

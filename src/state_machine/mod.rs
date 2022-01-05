@@ -16,11 +16,14 @@ use bytes::Bytes;
 //pub use crate::state_machine::channel::ChannelStateMachine;
 use crate::persistent_log::Log;
 pub use crate::state_machine::null::NullStateMachine;
-use crate::LogIndex;
+use crate::{LogIndex, Term};
 
 pub struct SnapshotInfo {
-    /// Index the snapshot was taken at
+    /// Last index of the entry contained in the snapshot
     pub index: LogIndex,
+
+    /// Term of the last entry contained in the snapshot
+    pub term: Term,
 
     /// Size of snapshot in bytes (for decisions about snapshotting at the consensus level, i.e.
     /// comparing log size with snapshot size)
@@ -108,10 +111,10 @@ pub trait StateMachine {
     /// Should return information about current snapshot, if any.
     fn snapshot_info(&self) -> Result<Option<SnapshotInfo>, Self::Error>;
 
-    /// Should take a snapshot of the state machine saving the snapshot's index.
+    /// Should take a snapshot of the state machine saving the snapshot's index and term.
     /// The snapshot is expected to be taken synchronously, implementor must expect,
     /// that read_snapshot_chunk will be called right away after this function
-    fn take_snapshot(&mut self, index: LogIndex) -> Result<(), Self::Error>;
+    fn take_snapshot(&mut self, index: LogIndex, term: Term) -> Result<(), Self::Error>;
 
     /// Should give away the next chunk of the current snapshot based on previous chunk data.
     /// None value as a request means the first chunk is requested, so there is no follower side

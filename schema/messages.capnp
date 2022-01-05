@@ -58,16 +58,17 @@ struct PeerMessage {
         term @0 :UInt64;
 
       union {
-        success @1 :TermAndIndex;
+        success @1 :TermAndIndexes;
         staleTerm @2 :UInt64;
-        inconsistentPrevEntry @3 :TermAndIndex;
+        inconsistentPrevEntry @3 :TermAndIndexes;
         staleEntry @4 :Void;
       }
     }
 
-  struct TermAndIndex {
+  struct TermAndIndexes {
         term @0 :UInt64;
-        logIndex @1 :UInt64;
+        latestLogIndex @1 :UInt64;
+        volatileLogIndex @2: UInt64;
     }
 
     struct RequestVoteRequest {

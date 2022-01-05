@@ -111,7 +111,7 @@ pub struct AppendEntriesRequest {
     /// The Leader’s commit log index.
     pub leader_commit: LogIndex,
 
-    /// Log entries to store (empty for heartbeat; may send more than one for efficiency)
+    /// Log entries to store (empty for heartbeat)
     pub entries: Vec<Entry>,
 }
 
@@ -299,9 +299,9 @@ impl Entry {
 #[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
 /// Response for Raft AppendEntriesRPC
 pub enum AppendEntriesResponse {
-    Success(Term, LogIndex),
+    Success(Term, LogIndex, LogIndex),
     StaleTerm(Term),
-    InconsistentPrevEntry(Term, LogIndex),
+    InconsistentPrevEntry(Term, LogIndex, LogIndex),
     StaleEntry,
 }
 
@@ -317,14 +317,19 @@ impl AppendEntriesResponse {
         let message = match reader.which().map_err(Error::CapnpSchema)? {
             append_entries_response::Success(m) => {
                 let m = m.map_err(Error::Capnp)?;
-                AppendEntriesResponse::Success(m.get_term().into(), m.get_log_index().into())
+                AppendEntriesResponse::Success(
+                    m.get_term().into(),
+                    m.get_latest_log_index().into(),
+                    m.get_volatile_log_index().into(),
+                )
             }
             append_entries_response::StaleTerm(m) => AppendEntriesResponse::StaleTerm(m.into()),
             append_entries_response::InconsistentPrevEntry(m) => {
                 let m = m.map_err(Error::Capnp)?;
                 AppendEntriesResponse::InconsistentPrevEntry(
                     m.get_term().into(),
-                    m.get_log_index().into(),
+                    m.get_latest_log_index().into(),
+                    m.get_volatile_log_index().into(),
                 )
             }
             append_entries_response::StaleEntry(()) => AppendEntriesResponse::StaleEntry,
@@ -334,16 +339,18 @@ impl AppendEntriesResponse {
 
     pub fn fill_capnp<'a>(&self, builder: &mut append_entries_response::Builder<'a>) {
         match self {
-            &AppendEntriesResponse::Success(term, log_index) => {
+            &AppendEntriesResponse::Success(term, log_index, volatile_index) => {
                 let mut message = builder.reborrow().init_success();
                 message.set_term(term.into());
-                message.set_log_index(log_index.into());
+                message.set_latest_log_index(log_index.into());
+                message.set_volatile_log_index(log_index.into());
             }
             &AppendEntriesResponse::StaleTerm(term) => builder.set_stale_term(term.into()),
-            &AppendEntriesResponse::InconsistentPrevEntry(term, log_index) => {
+            &AppendEntriesResponse::InconsistentPrevEntry(term, log_index, volatile_index) => {
                 let mut message = builder.reborrow().init_inconsistent_prev_entry();
                 message.set_term(term.into());
-                message.set_log_index(log_index.into());
+                message.set_latest_log_index(log_index.into());
+                message.set_volatile_log_index(log_index.into());
             }
             &AppendEntriesResponse::StaleEntry => builder.set_stale_entry(()),
         }

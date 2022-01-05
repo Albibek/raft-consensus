@@ -4,6 +4,7 @@ use bytes::Bytes;
 use thiserror::Error as ThisError;
 
 use crate::persistent_log::Log;
+use crate::Term;
 use crate::{state_machine::StateMachine, LogIndex};
 
 use super::SnapshotInfo;
@@ -13,6 +14,7 @@ use super::SnapshotInfo;
 #[derive(Debug)]
 pub struct NullStateMachine<L: Log> {
     index: LogIndex,
+    term: Term,
     _pd: PhantomData<L>,
 }
 
@@ -26,6 +28,7 @@ impl<L: Log> NullStateMachine<L> {
     pub fn new() -> Self {
         Self {
             index: LogIndex(0),
+            term: Term(0),
             _pd: PhantomData,
         }
     }
@@ -60,6 +63,7 @@ impl<L: Log> StateMachine for NullStateMachine<L> {
         if self.index != LogIndex(0) {
             Ok(Some(SnapshotInfo {
                 index: self.index,
+                term: self.term,
                 size: 0,
             }))
         } else {
@@ -67,8 +71,9 @@ impl<L: Log> StateMachine for NullStateMachine<L> {
         }
     }
 
-    fn take_snapshot(&mut self, index: LogIndex) -> Result<(), Self::Error> {
+    fn take_snapshot(&mut self, index: LogIndex, term: Term) -> Result<(), Self::Error> {
         self.index = index;
+        self.term = term;
         Ok(())
     }
 

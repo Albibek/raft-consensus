@@ -173,8 +173,15 @@ where
             // the follower has finished writing the last chunk of a snapshot
             // we don't need old records in log now
             self.log_mut()
-                .discard_since(request.snapshot_index)
+                .discard_until(request.snapshot_index)
                 .map_err(|e| Error::Critical(CriticalError::PersistentLogWrite(Box::new(e))))?;
+
+            // we also do not need a new ones, if there are any
+            if self.latest_log_index()? > request.snapshot_index {
+                self.log_mut()
+                    .discard_since(request.snapshot_index + 1)
+                    .map_err(|e| Error::Critical(CriticalError::PersistentLogWrite(Box::new(e))))?;
+            }
         }
 
         let message = InstallSnapshotResponse::Success(
@@ -365,21 +372,39 @@ where
         let current_term = self.current_term()?;
 
         let latest_log_index = self.latest_log_index()?;
+        let latest_volatile_log_index = self
+            .log()
+            .latest_volatile_index()
+            .map_err(|e| Error::PersistentLogRead(Box::new(e)))?;
+        let first_log_index = self
+            .log()
+            .first_index()
+            .map_err(|e| Error::PersistentLogRead(Box::new(e)))?;
 
-        // check for gaps
-        if latest_log_index < leader_prev_log_index {
-            // If the previous entries index was not the same we'd leave a gap! Reply failure.
+        // Check for gaps and possibility to find the corresponding entry in term
+        if latest_log_index < leader_prev_log_index || leader_prev_log_index < first_log_index {
+            trace!(
+                "leader send prev_entry {} which is not in follower's log {}..{}",
+                leader_prev_log_index,
+                first_log_index,
+                latest_log_index
+            );
+            // If the previous entries index was not the same we would leave a gap.
             return Ok(AppendEntriesResponse::InconsistentPrevEntry(
                 current_term,
                 latest_log_index,
+                latest_volatile_log_index,
             ));
         }
 
+        // Now, due to follower making snapshots independentyl of the leader,
+        // the incoming request from it may have some extra entries, that follower
+        // does not need.
         let existing_term = if leader_prev_log_index == LogIndex::from(0) {
-            // zeroes mean the very start, when everything is empty at leader and follower
+            // zero mean the very start, when everything is empty at leader and follower
             // we better leave this here as special case rather than requiring it from
             // persistent log implementation
-            Some(Term::from(0))
+            Term(0)
         } else {
             // try to find term of specified log index and check if there is such entry
             self.log()
@@ -387,20 +412,21 @@ where
                 .map_err(|e| Error::PersistentLogRead(Box::new(e)))?
         };
 
-        if existing_term
-            .map(|term| term != leader_prev_log_term)
-            .unwrap_or(true)
-        {
-            // If an existing entry conflicts with a new one (same index but different terms),
+        if existing_term != leader_prev_log_term {
+            // If an existing entry conflicts with a new one (same index but different terms):
             // delete the existing entry and all that follow it
 
-            self.log_mut()
-                .discard_until(leader_prev_log_index)
+            let new_latest_log_index = self
+                .log_mut()
+                .discard_since(leader_prev_log_index)
                 .map_err(|e| Error::Critical(CriticalError::PersistentLogWrite(Box::new(e))))?;
 
+            // since the entry at prev_log_index was not sent, we cannot work with
+            // all other entries without gap, this is bad, but this is life :(
             return Ok(AppendEntriesResponse::InconsistentPrevEntry(
                 current_term,
-                latest_log_index,
+                new_latest_log_index,
+                latest_volatile_log_index,
             ));
         }
 
@@ -422,7 +448,7 @@ where
             return Ok(AppendEntriesResponse::StaleEntry);
         }
 
-        let mut append_index = leader_prev_log_index + 1;
+        let append_index = leader_prev_log_index + 1;
 
         // for a heartbeat request this cycle will be skipped
         // but all other check and actions MUST be performed
@@ -440,9 +466,9 @@ where
             }
 
             log_entries.push(entry.into());
-            append_index = append_index + 1;
         }
 
+        trace!("follower appending at {}: {:?}", append_index, &log_entries);
         self.log_mut()
             .append_entries(append_index, &log_entries)
             .map_err(|e| Error::Critical(CriticalError::PersistentLogWrite(Box::new(e))))?;
@@ -453,25 +479,44 @@ where
         self.commit_index = cmp::min(request.leader_commit, new_latest_log_index);
         self.apply_follower_commits()?;
 
+        // re-read latest_log_index to consider some those that may be applied after
+        // the last append
+        let latest_log_index = self.latest_log_index()?;
+        let latest_volatile_log_index = self
+            .log()
+            .latest_volatile_index()
+            .map_err(|e| Error::PersistentLogRead(Box::new(e)))?;
+
+        trace!("follower latest index after append: {}", latest_log_index);
         Ok(AppendEntriesResponse::Success(
             current_term,
-            new_latest_log_index,
+            latest_log_index,
+            latest_volatile_log_index,
         ))
     }
 
     /// Applies all committed but unapplied log entries to the state machine ignoring the results.
     pub(crate) fn apply_follower_commits(&mut self) -> Result<(), Error> {
-        let entry_index = self
+        let mut entry_index = self
             .state_machine
             .last_applied()
             .map_err(|e| Error::Critical(CriticalError::StateMachine(Box::new(e))))?;
-        trace!(
-            "applying commits from {} to {}",
-            &entry_index,
-            &self.commit_index
-        );
+
+        if entry_index < self.commit_index {
+            trace!(
+                "applying commits from {} to {}",
+                entry_index + 1,
+                &self.commit_index
+            );
+        } else {
+            trace!(
+                "not applying commits: {} >= {}",
+                entry_index,
+                &self.commit_index
+            );
+        };
         while entry_index < self.commit_index {
-            let entry_index = entry_index + 1;
+            entry_index = entry_index + 1;
             let entry_kind = self
                 .log()
                 .entry_meta_at(entry_index)

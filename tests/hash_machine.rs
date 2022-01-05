@@ -1,7 +1,7 @@
 use bytes::Bytes;
 use raft_consensus::persistent_log::{Log, LogEntry, LogEntryData};
 use raft_consensus::state_machine::{SnapshotInfo, StateMachine};
-use raft_consensus::LogIndex;
+use raft_consensus::{LogIndex, Term};
 use std::hash::Hasher;
 
 use std::{collections::hash_map::DefaultHasher, fmt::Debug};
@@ -12,6 +12,7 @@ use thiserror::Error as ThisError;
 #[error("Hash machine error")]
 pub enum Error {
     HashMachineError(&'static str),
+    LogError(Box<dyn std::error::Error>),
 }
 
 /// A state machine which hashes an incoming request with it's current state on apply.
@@ -29,6 +30,8 @@ pub struct HashMachine<L: Log> {
     pub pending_snapshot: [u8; 8],
     hasher: DefaultHasher,
     pub index: LogIndex,
+    pub term: Term,
+    last_applied: LogIndex,
     pub chunked: bool,
     log: L,
 }
@@ -41,6 +44,8 @@ impl<L: Log> HashMachine<L> {
             pending_snapshot: [0u8; 8],
             hasher: DefaultHasher::new(),
             index: LogIndex(0),
+            term: Term(0),
+            last_applied: LogIndex(0),
             chunked,
             log,
         }
@@ -59,7 +64,10 @@ impl<L: Log> StateMachine for HashMachine<L> {
 
     fn apply(&mut self, index: LogIndex, results_required: bool) -> Result<Option<Bytes>, Error> {
         let mut entry = LogEntry::default();
-        self.log.read_entry(index, &mut entry);
+        self.last_applied = index;
+        self.log
+            .read_entry(index, &mut entry)
+            .map_err(|e| Error::LogError(Box::new(e)))?;
         if let LogEntryData::Proposal(command, _) = entry.data {
             for byte in command {
                 self.hasher.write_u8(byte);
@@ -72,9 +80,8 @@ impl<L: Log> StateMachine for HashMachine<L> {
                 Ok(Some(Bytes::new()))
             }
         } else {
-            Err(Error::HashMachineError(
-                "state machine can only apply proposals",
-            ))
+            // don't apply other types of entries, only last_applied should change the hash
+            Ok(None)
         }
     }
 
@@ -92,13 +99,15 @@ impl<L: Log> StateMachine for HashMachine<L> {
         } else {
             Ok(Some(SnapshotInfo {
                 index: self.index,
+                term: self.term,
                 size: 64,
             }))
         }
     }
 
-    fn take_snapshot(&mut self, index: LogIndex) -> Result<(), Self::Error> {
+    fn take_snapshot(&mut self, index: LogIndex, term: Term) -> Result<(), Self::Error> {
         self.index = index;
+        self.term = term;
         self.current_snapshot = self.hash.to_le_bytes();
         Ok(())
     }
@@ -158,6 +167,6 @@ impl<L: Log> StateMachine for HashMachine<L> {
     }
 
     fn last_applied(&self) -> Result<LogIndex, Self::Error> {
-        todo!()
+        Ok(self.last_applied)
     }
 }

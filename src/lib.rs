@@ -325,3 +325,10 @@ impl fmt::Display for AdminId {
         fmt::Display::fmt(&self.0, f)
     }
 }
+
+#[macro_export]
+macro_rules! debug_where {
+    () => {
+        concat!(module_path!(), "@", file!(), ": ", line!(), ", ", column!())
+    };
+}

@@ -92,6 +92,9 @@ pub enum CriticalError {
     #[error("BUG: leader's log could not find term for index {} at {}", _0, _1)]
     LeaderLogBroken(LogIndex, &'static str),
 
+    #[error("BUG: follower's log could not find term for index {} at {}", _0, _1)]
+    FollowerLogBroken(LogIndex, &'static str),
+
     #[error("BUG: entry kind does not match entry data at at {}", _0)]
     LogInconsistentEntry(LogIndex),
 
@@ -107,6 +110,9 @@ pub enum CriticalError {
     #[error("error writing to persistent log: {}", _0)]
     PersistentLogWrite(Box<dyn StdError + 'static>),
 
+    #[error("state machine gave no snapshot info when it was expected")]
+    SnapshotExpected,
+ 
     #[error("state machine snapshot is at later index than commit index")]
     SnapshotCorrupted,
 
