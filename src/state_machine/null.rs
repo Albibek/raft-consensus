@@ -1,5 +1,3 @@
-use std::marker::PhantomData;
-
 use bytes::Bytes;
 use thiserror::Error as ThisError;
 
@@ -15,7 +13,8 @@ use super::SnapshotInfo;
 pub struct NullStateMachine<L: Log> {
     index: LogIndex,
     term: Term,
-    _pd: PhantomData<L>,
+    state: Bytes,
+    log: L,
 }
 
 #[derive(ThisError, Debug)]
@@ -25,11 +24,12 @@ pub enum Error {
 }
 
 impl<L: Log> NullStateMachine<L> {
-    pub fn new() -> Self {
+    pub fn new(log: L) -> Self {
         Self {
             index: LogIndex(0),
             term: Term(0),
-            _pd: PhantomData,
+            state: Bytes::new(),
+            log,
         }
     }
 }
@@ -39,20 +39,20 @@ impl<L: Log> StateMachine for NullStateMachine<L> {
     type Error = Error;
 
     fn log(&self) -> &Self::Log {
-        todo!()
+        &self.log
     }
 
     fn log_mut(&mut self) -> &mut Self::Log {
-        todo!()
+        &mut self.log
     }
 
     fn apply(&mut self, index: LogIndex, _: bool) -> Result<Option<Bytes>, Error> {
         self.index = index;
-        Ok(Some(Bytes::new()))
+        Ok(Some(self.state.clone()))
     }
 
-    fn query(&self, _query: Bytes) -> Result<Bytes, Error> {
-        Ok(Bytes::new())
+    fn query(&mut self, _query: Bytes) -> Result<Bytes, Error> {
+        Ok(self.state.clone())
     }
 
     fn last_applied(&self) -> Result<LogIndex, Self::Error> {
@@ -84,9 +84,28 @@ impl<L: Log> StateMachine for NullStateMachine<L> {
     fn write_snapshot_chunk(
         &mut self,
         index: LogIndex,
+        term: Term,
         _chunk_bytes: &[u8],
     ) -> Result<Option<Vec<u8>>, Error> {
         self.index = index;
+        self.term = term;
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod test {
+
+    use super::*;
+    use crate::persistent_log::MemLog;
+    use crate::testing::*;
+
+    #[test]
+    fn test_null_machine() {
+        let mut tester = MachineTester::new(|| {
+            let log = MemLog::new();
+            NullStateMachine::new(log)
+        });
+        tester.test_all();
     }
 }

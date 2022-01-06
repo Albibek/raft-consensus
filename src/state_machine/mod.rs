@@ -1,12 +1,6 @@
 //! A `StateMachine` is a single instance of a distributed application. It is the consensus
 //! responsibility to take commands from the `Client` and apply them to each `StateMachine`
 //! instance in a globally consistent order.
-//!
-//! The `StateMachine` is interface is intentionally generic so that any distributed application
-//! needing consistent state can be built on it. For instance, a distributed hash table
-//! application could implement `StateMachine`, with commands corresponding to `insert`, and
-//! `remove`. Raft consensus would guarantee that the same order of `insert` and `remove`
-//! commands would be seen by all consensus modules.
 
 // FIXME pub mod channel;
 pub mod null;
@@ -95,49 +89,65 @@ pub trait StateMachine {
         results_required: bool,
     ) -> Result<Option<Bytes>, Self::Error>;
 
-    /// Queries a value of the state machine. Does not go through the durable log, or mutate the state machine.
-    /// Returns an application-specific result value.
-    fn query(&self, query: Bytes) -> Result<Bytes, Self::Error>;
+    /// Queries a value of the state machine. Goes right from the clients, bypassing the persistent log, but
+    /// can mutate the state machine if required by the implementation.
+    ///
+    /// Returns a state machine specific result value.
+    fn query(&mut self, query: Bytes) -> Result<Bytes, Self::Error>;
 
     /// Must return currently applied index. The index must have the same persistency as the
     /// state machine itself and will be used by a leader to decide which log entries to
     /// delete from log.
-    /// Tthat is, if a state machine is working asynchronously, its last_applied
+    /// If a state machine is working asynchronously, its last_applied
     /// index may be behind conensus commit_index. In that case any unapplied entry
     /// will be applied even if it was tried before. This is a state machine's responsibility
     /// to decide on properly processing such duplicate applications.
     fn last_applied(&self) -> Result<LogIndex, Self::Error>;
 
     /// Should return information about current snapshot, if any.
+    /// Must return only totally completed snapshot. The implementation must be aware, that
+    /// log entries preceeding (inclusively) the returned index will be asked to be discarded
+    /// in log.
     fn snapshot_info(&self) -> Result<Option<SnapshotInfo>, Self::Error>;
 
     /// Should take a snapshot of the state machine saving the snapshot's index and term.
-    /// The snapshot is expected to be taken synchronously, implementor must expect,
-    /// that read_snapshot_chunk will be called right away after this function
+    /// Implementation may decide the index to take snapshot at itself, but only at earlier or
+    /// equal index, never later. The term must be taken from the entry at the index the snapshot
+    /// is taken from.
+    /// If asynchronous snapshotting is performed, the implementation have to be ready,
+    /// that the attempts
     fn take_snapshot(&mut self, index: LogIndex, term: Term) -> Result<(), Self::Error>;
 
     /// Should give away the next chunk of the current snapshot based on previous chunk data.
     /// None value as a request means the first chunk is requested, so there is no follower side
     /// requests yet.
-    /// Note that any possible shapshot metadata useful for the remote side, i.e. to create
-    /// a correct request for the next chunk or to understand that there is no more chunks left,
-    /// has to be inside the returned vector.
+    /// Note that the returned value may contain any possible shapshot metadata useful for the remote side,
+    /// i.e. to create a correct request for the next chunk or to understand that there is no more chunks left.
     fn read_snapshot_chunk(&self, request: Option<&[u8]>) -> Result<Vec<u8>, Self::Error>;
 
-    /// Should write a part of externally initiated new snapshot make it current if
+    /// Should write a part of externally initiated new snapshot. May make it current if
     /// all chunks are received. Is is also up to the implementation to decide if the snapshot
     /// is a new one and how it should be recreated based on log index.
     ///
-    /// The index must be saved and returned from snapshot_info. The calling side
-    /// considers index to be written right after the function returns None.
+    /// The index and term must be saved to be returned from snapshot_info.
     ///
     /// The returned value is a request for the next chunk or None if the
-    /// chunk is the last one. Any returned value including None will be sent to leader
-    /// to let leader know that snapshot is done, but None will not be passed to leader's state
-    /// machine, so it should not be confused with first chunk request.
+    /// chunk is the last one. On follower any returned value, including None, will be sent to leader
+    /// to let leader know that the chunk was the last one which will mean the follower is ready
+    /// to apply entries from the log.
     fn write_snapshot_chunk(
         &mut self,
         index: LogIndex,
+        term: Term,
         chunk_bytes: &[u8],
     ) -> Result<Option<Vec<u8>>, Self::Error>;
+
+    /// Expected to flush all the pending state on disk, if any.
+    ///
+    /// Function is not called by consensus and only used when state machine is tested. It also
+    /// may be useful in other scenarios, calling it is not prohibited.
+    /// The default implementation always succeds without action.
+    fn sync(&self) -> Result<(), Self::Error> {
+        Ok(())
+    }
 }
