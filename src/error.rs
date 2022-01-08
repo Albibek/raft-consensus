@@ -76,11 +76,6 @@ impl Error {
     pub(crate) fn unreachable(at: &'static str) -> Error {
         Error::Critical(CriticalError::Unreachable(at))
     }
-
-    #[inline]
-    pub(crate) fn log_broken(index: LogIndex, at: &'static str) -> Error {
-        Error::Critical(CriticalError::LeaderLogBroken(index, at))
-    }
 }
 
 #[derive(ThisError, Debug)]
@@ -88,9 +83,6 @@ impl Error {
 pub enum CriticalError {
     #[error("BUG: unreachable condition at {}", _0)]
     Unreachable(&'static str),
-
-    #[error("BUG: leader's log could not find term for index {} at {}", _0, _1)]
-    LeaderLogBroken(LogIndex, &'static str),
 
     #[error("BUG: follower's log could not find term for index {} at {}", _0, _1)]
     FollowerLogBroken(LogIndex, &'static str),
@@ -112,9 +104,12 @@ pub enum CriticalError {
 
     #[error("state machine gave no snapshot info when it was expected")]
     SnapshotExpected,
- 
+
     #[error("state machine snapshot is at later index than commit index")]
     SnapshotCorrupted,
+
+    #[error("state machine snapshot is at later index than commit index")]
+    SnapshotInfoCorrupted,
 
     #[error("error interacting with the state machine {}", _0)]
     StateMachine(Box<dyn StdError + 'static>),

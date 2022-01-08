@@ -12,7 +12,8 @@ pub struct MemLog {
     voted_for: Option<ServerId>,
     entries: Vec<LogEntry>,
     latest_config: Option<(ConsensusConfig, LogIndex)>,
-    first_index: u64,
+    zero_index: u64,
+    zero_term: Term,
 }
 
 impl MemLog {
@@ -22,13 +23,14 @@ impl MemLog {
             voted_for: None,
             entries: Vec::new(),
             latest_config: None,
-            first_index: 0,
+            zero_index: 0,
+            zero_term: Term(0),
         }
     }
 
     fn entry_at(&self, index: LogIndex) -> Option<&LogEntry> {
         let index = index.as_u64();
-        let entry_index = index - self.first_index;
+        let entry_index = index - self.zero_index - 1;
         self.entries.get(entry_index as usize)
     }
 }
@@ -37,79 +39,69 @@ impl Log for MemLog {
     type Error = MemLogError;
 
     fn latest_index(&self) -> Result<LogIndex, Self::Error> {
-        if self.first_index == 0 {
-            Ok(LogIndex(0))
-        } else if self.entries.len() == 0 {
+        if self.entries.len() == 0 {
             // edge case: entry does not exist, but index must be there
-            Ok(self.first_index.into())
+            Ok(self.zero_index.into())
         } else {
-            Ok(LogIndex((self.first_index - 1) + self.entries.len() as u64))
+            Ok(LogIndex(self.zero_index + self.entries.len() as u64))
         }
     }
 
-    #[inline]
-    fn latest_volatile_index(&self) -> Result<LogIndex, Self::Error> {
-        self.latest_index()
-    }
-
-    fn first_index(&self) -> Result<LogIndex, Self::Error> {
-        Ok(LogIndex(self.first_index))
+    fn zero_index(&self) -> Result<LogIndex, Self::Error> {
+        Ok(LogIndex(self.zero_index))
     }
 
     fn term_of(&self, index: LogIndex) -> Result<Term, MemLogError> {
         let index: u64 = index.as_u64();
-        if index == 0 {
-            return Err(MemLogError::ConsensusGuarantee(
-                "consensus should not request a term for LogIndex(0)".into(),
-            ));
+        if index == self.zero_index {
+            return Ok(self.zero_term);
         }
-        if self.entries.len() == 0 {
+
+        if index < self.zero_index || index > self.latest_index().unwrap().as_u64() {
             return Err(MemLogError::ConsensusGuarantee(
-                "consensus should not request a term when log is empty".into(),
-            ));
-        }
-        if index < self.first_index || index > self.latest_index().unwrap().as_u64() {
-            return Err(MemLogError::ConsensusGuarantee(
-                "consensus should not request a term for non-existent entry".into(),
+                "consensus should not request a term for non-existent entry except zero entry"
+                    .into(),
             ));
         }
         self.entry_at(LogIndex(index))
             .map(|entry| entry.term)
             .ok_or(MemLogError::ConsensusGuarantee(
-                "consensus should not request a term for non-existent entry".into(),
+                "consensus should not request a term for non-existent entry except zero entry"
+                    .into(),
             ))
     }
 
-    fn discard_since(&mut self, index: LogIndex) -> Result<LogIndex, Self::Error> {
+    fn discard_since(&mut self, index: LogIndex) -> Result<(), Self::Error> {
         if index > self.latest_index()? {
-            return self.latest_index();
-        } else if index.as_u64() < self.first_index {
+            return Ok(());
+        } else if index.as_u64() <= self.zero_index {
             return Err(MemLogError::ConsensusGuarantee(format!(
-                "discarding non existent index {}, only {} exists",
-                index, self.first_index
+                "discarding since non existent index {}, only {} exists",
+                index,
+                self.zero_index + 1
             )));
-        } else if index.as_u64() == self.first_index {
-            self.first_index = index.as_u64();
+        } else if index.as_u64() == self.zero_index + 1 {
+            self.zero_index = index.as_u64() - 1;
             self.entries.drain(..).last();
         }
 
-        let trunc = index.as_u64() - self.first_index;
+        let trunc = index.as_u64() - self.zero_index - 1;
         self.entries.truncate(trunc as usize);
-        Ok(index - 1)
+        Ok(())
     }
 
-    fn discard_until(&mut self, index: LogIndex) -> Result<(), MemLogError> {
+    fn compact_until(&mut self, index: LogIndex, zero_term: Term) -> Result<(), MemLogError> {
         let index = index.as_u64();
-        if index <= self.first_index {
-            // do nothing
-        } else if index <= self.latest_index()?.as_u64() {
-            let until = (index - self.first_index) as usize;
+        if index > self.zero_index && index <= self.latest_index()?.as_u64() {
+            let until = (index - self.zero_index) as usize;
             self.entries.drain(..until);
-            self.first_index += until as u64;
+            self.zero_index += until as u64;
         } else {
-            // index is beyond last_index: discard the whole log
+            // index is beyond log indices: discard the whole log
+            // and save zero index and term
             self.entries.clear();
-            self.first_index = index + 1;
+            self.zero_index = index;
+            self.zero_term = zero_term;
         }
 
         Ok(())
@@ -118,10 +110,10 @@ impl Log for MemLog {
     fn read_entry(&self, index: LogIndex, dest: &mut LogEntry) -> Result<(), Self::Error> {
         let index: u64 = index.as_u64();
 
-        if index < self.first_index {
+        if index <= self.zero_index {
             return Err(MemLogError::ConsensusGuarantee(format!(
-                "reading entry  at {} which is before first index {}",
-                index, self.first_index
+                "reading entry at {} which is earlier than first index {}",
+                index, self.zero_index
             )));
         }
         self.entry_at(LogIndex(index))
@@ -130,29 +122,30 @@ impl Log for MemLog {
     }
 
     fn entry_meta_at(&self, index: LogIndex) -> Result<LogEntryMeta, Self::Error> {
+        let index: u64 = index.as_u64();
+        if index <= self.zero_index {
+            return Err(MemLogError::ConsensusGuarantee(format!(
+                "reading entry meta at {} which is earlier than first index {}",
+                index, self.zero_index
+            )));
+        }
         self.entries
-            .get((index - 1).as_u64() as usize)
+            .get((index - 1) as usize)
             .map(|entry| entry.meta())
-            .ok_or(MemLogError::BadIndex(index))
+            .ok_or(MemLogError::BadIndex(index.into()))
     }
 
     fn append_entries(&mut self, start: LogIndex, entries: &[LogEntry]) -> Result<(), Self::Error> {
-        // this check can be skipped in implementations and only checks consensus logic
-        if start == LogIndex(0) {
-            return Err(MemLogError::ConsensusGuarantee(
-                "appending to LogIndex(0)".into(),
-            ));
-        }
-        if self.first_index > start.as_u64() {
+        if start.as_u64() <= self.zero_index {
             return Err(MemLogError::ConsensusGuarantee(format!(
-                "appending at older index: {} > {}",
-                self.first_index, start
+                "appending at {} is beyond log boundaries ({}, {})",
+                start,
+                self.zero_index + 1,
+                start
             )));
-            //return Err(MemLogError::BadIndex(start));
         }
 
         let latest_index = self.latest_index()?.as_u64();
-        //let index = (start.as_u64() - self.first_index) as usize;
 
         if start.as_u64() > latest_index + 1 {
             // while we can easily overcome rewriting, consensus
@@ -161,15 +154,11 @@ impl Log for MemLog {
             return Err(MemLogError::ConsensusGuarantee(format!(
                 "appending rewrites entries without truncation: requested {} while index must be {}",
                 start,
-                latest_index
+                latest_index + 1
             )));
         }
 
         self.entries.extend_from_slice(entries);
-        if self.first_index == 0 {
-            self.first_index = 1
-        }
-
         Ok(())
     }
 

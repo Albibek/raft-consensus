@@ -12,11 +12,11 @@ struct Entry {
         proposal @2 :ProposalEntry;
         config @3 :ConfigChangeEntry;
     }
-    
+
     struct ProposalEntry {
         data @0 :Data;
         clientId @1 :UInt64;
-    } 
+    }
 
     struct ConfigChangeEntry {
         peers @0 :List(Peer);
@@ -90,14 +90,12 @@ struct PeerMessage {
 
     struct InstallSnapshotRequest {
         term @0 :UInt64;
-        lastIndex @1 :UInt64;
-        lastTerm @2 :UInt64;
-        leaderCommit @3 :UInt64;
 
-        lastConfig @4 :List(Peer);
+        lastConfig @1 :List(Peer);
 
-        snapshotIndex @5 :UInt64;
-        chunkData @6 :Data;
+        snapshotIndex @2 :UInt64;
+        snapshotTerm @3 :UInt64;
+        chunkData @4 :Data;
     }
 
     struct InstallSnapshotResponse {

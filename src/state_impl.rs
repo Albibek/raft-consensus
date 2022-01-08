@@ -54,11 +54,17 @@ where
             let new = s.timeout_now(handler)?;
             Ok(new)
         }
-        PeerMessage::InstallSnapshotRequest(_) => {
-            todo!("snapshot request")
+        PeerMessage::InstallSnapshotRequest(request) => {
+            let (response, new) = s.install_snapshot_request(handler, from, request)?;
+            handler.send_peer_message(from, response);
+            Ok(new)
         }
-        PeerMessage::InstallSnapshotResponse(_) => {
-            todo!("snapshot response")
+        PeerMessage::InstallSnapshotResponse(response) => {
+            let (request, new) = s.install_snapshot_response(handler, from, response)?;
+            if let Some(request) = request {
+                handler.send_peer_message(from, request);
+            }
+            Ok(new)
         }
     }
 }
@@ -219,7 +225,7 @@ where
         self,
         handler: &mut H,
         from: ServerId,
-        request: &InstallSnapshotRequest,
+        request: InstallSnapshotRequest,
     ) -> Result<(PeerMessage, CurrentState<M, H>), Error>;
 
     /// Apply an append entries response to the consensus.
@@ -227,7 +233,7 @@ where
         self,
         handler: &mut H,
         from: ServerId,
-        response: &InstallSnapshotResponse,
+        response: InstallSnapshotResponse,
     ) -> Result<(Option<PeerMessage>, CurrentState<M, H>), Error>;
 
     ///////////////////////////

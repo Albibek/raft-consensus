@@ -1,12 +1,10 @@
-use crate::handler::*;
-use crate::raft::*;
-use crate::*;
-use log::trace;
+use raft_consensus::testing::emulation::cluster::*;
+use raft_consensus::testing::emulation::handler::*;
+
 use raft_consensus::message::admin::*;
-use raft_consensus::message::*;
 use raft_consensus::*;
 
-/// Tests where cluster should generate errors
+/// Tests where node should generate errors
 
 #[test]
 fn test_leader_transfer_error() {

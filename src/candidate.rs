@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::marker::PhantomData;
 
 use crate::error::*;
-use log::{debug, info, trace};
+use tracing::{debug, info, trace};
 
 use crate::handler::Handler;
 use crate::leader::Leader;
@@ -119,8 +119,8 @@ where
                 self.state_data.record_vote(from);
                 if self.state_data.count_votes() >= majority {
                     info!(
-                        "id={} election for term {} won; transitioning to Leader",
-                        self.id, local_term
+                        at_term = %local_term,
+                        "election won, transitioning to Leader",
                     );
                     let new_state = self.into_leader(handler)?;
                     Ok(new_state.into())
@@ -142,7 +142,7 @@ where
         self,
         handler: &mut H,
         from: ServerId,
-        request: &InstallSnapshotRequest,
+        request: InstallSnapshotRequest,
     ) -> Result<(PeerMessage, CurrentState<M, H>), Error> {
         // this is the same logic as in append_entries_request
         let leader_term = request.term;
@@ -172,7 +172,7 @@ where
         self,
         handler: &mut H,
         from: ServerId,
-        response: &InstallSnapshotResponse,
+        response: InstallSnapshotResponse,
     ) -> Result<(Option<PeerMessage>, CurrentState<M, H>), Error> {
         Ok((None, self.into()))
     }

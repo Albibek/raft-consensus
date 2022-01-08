@@ -475,20 +475,14 @@ pub struct InstallSnapshotRequest {
     /// The leader's term.
     pub term: Term,
 
-    /// Index of the last log entry in leader's log
-    pub last_log_index: LogIndex,
-
-    /// Term of last_index
-    pub last_log_term: Term,
-
-    /// The Leader’s commit log index.
-    pub leader_commit: LogIndex,
-
     /// For the first chunk: current cluster config
     pub last_config: Option<ConsensusConfig>,
 
-    /// Index of snapshot being installed
+    /// Index of the last entry included in the snapshot
     pub snapshot_index: LogIndex,
+
+    /// Term of the last entry included in the snapshot
+    pub snapshot_term: Term,
 
     /// Snapshot bytes to pass into consensus state machine
     pub chunk_data: Vec<u8>,

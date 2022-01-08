@@ -30,9 +30,10 @@ where
     }
 
     pub fn test_all(&mut self) {
-        self.test_append_entries_simple();
+        self.test_append_entries_basic();
         self.test_store_values();
         self.test_log_truncations();
+        self.test_config_stored_separately();
     }
 
     pub fn create_log(&self) -> L {
@@ -44,9 +45,9 @@ where
             "latest_index should return LogIndex(0) for empty log"
         );
         assert_eq!(
-            log.first_index().unwrap(),
+            log.zero_index().unwrap(),
             LogIndex(0),
-            "first_index should return LogIndex(0) for empty log"
+            "zero_index should return LogIndex(0) for empty log"
         );
         assert_eq!(
             log.latest_volatile_index().unwrap(),
@@ -84,7 +85,7 @@ where
     }
 
     /// Ensure entries of all types appended in order and read
-    pub fn test_append_entries_simple(&mut self) {
+    pub fn test_append_entries_basic(&mut self) {
         let mut log = self.create_log();
         let empty_entry = LogEntry {
             term: Term(0),
@@ -134,8 +135,9 @@ where
         // ensure log indexes conform the requirements
         assert_eq!(log.latest_index().unwrap(), LogIndex(3));
         assert_eq!(log.latest_volatile_index().unwrap(), LogIndex(3));
-        assert_eq!(log.first_index().unwrap(), LogIndex(1));
+        assert_eq!(log.zero_index().unwrap(), LogIndex(0));
 
+        assert_eq!(log.term_of(LogIndex(0)).unwrap(), Term(0));
         assert_eq!(log.term_of(LogIndex(1)).unwrap(), Term(0));
         assert_eq!(log.term_of(LogIndex(2)).unwrap(), Term(0));
         assert_eq!(log.term_of(LogIndex(3)).unwrap(), Term(1));
@@ -159,6 +161,10 @@ where
 
         log.append_entries(LogIndex(1), &[config_entry.clone()])
             .unwrap();
+        log.sync().unwrap();
+
+        // make sure appending entry did not affect latest_config
+        assert_eq!(log.latest_config().unwrap(), None);
 
         log.set_latest_config(&config, LogIndex(1)).unwrap();
         assert_eq!(log.latest_config().unwrap(), Some(config.clone()));
@@ -224,12 +230,12 @@ where
                 data: LogEntryData::Proposal(Bytes::from(format!("{}", i)), ClientGuarantee::Fast),
             });
         }
-        let new_index = log.discard_since(LogIndex(5)).unwrap();
+        log.discard_since(LogIndex(5)).unwrap();
         log.sync().unwrap();
 
         // log should be cut properly
+        let new_index = log.latest_index().unwrap();
         assert!(new_index < LogIndex(5));
-        assert!(log.latest_index().unwrap() < LogIndex(5));
         assert!(log.latest_volatile_index().unwrap() < LogIndex(5));
 
         // if log is cut to some earlier value, fill it with the old entries first
@@ -244,7 +250,7 @@ where
         log.append_entries(LogIndex(5), &new_entries).unwrap();
         log.sync().unwrap();
 
-        assert_eq!(log.first_index().unwrap(), LogIndex(1));
+        assert_eq!(log.zero_index().unwrap(), LogIndex(0));
         assert_eq!(log.latest_index().unwrap(), LogIndex(13));
         assert_eq!(log.latest_volatile_index().unwrap(), LogIndex(13));
 
@@ -266,32 +272,101 @@ where
             }
         }
 
+        // while log exists, take zero term from the log
+        let zero_term = log.term_of(LogIndex(3)).unwrap();
+
         // Now truncate the head of log up until 103
-        log.discard_until(LogIndex(3)).unwrap();
+        log.compact_until(LogIndex(3), zero_term).unwrap();
         log.sync().unwrap();
-        assert!(log.first_index().unwrap() <= LogIndex(4));
+
+        // log must be cut until exactly requested index
+        assert_eq!(log.zero_index().unwrap(), LogIndex(3));
+        // logmust save the provided term
+        assert_eq!(log.term_of(LogIndex(3)).unwrap(), zero_term);
         assert_eq!(log.latest_index().unwrap(), LogIndex(13));
         assert_eq!(log.latest_volatile_index().unwrap(), LogIndex(13));
 
-        // fully discarded log should store first index intact, even having no
-        // entries.
-        let new_index = log.discard_since(log.first_index().unwrap()).unwrap();
+        // fully discarded log should store it's indexes index intact, even having no
+        // entries, must point to zero index and be able to read zero term
+        log.discard_since(log.zero_index().unwrap() + 1).unwrap();
         log.sync().unwrap();
 
-        assert!(new_index < log.first_index().unwrap());
-        assert_ne!(log.first_index().unwrap(), LogIndex(0));
-        assert!(log.first_index().unwrap() <= LogIndex(4), "first");
-        assert_eq!(log.latest_index().unwrap(), log.first_index().unwrap(),);
+        assert_eq!(log.zero_index().unwrap(), LogIndex(3));
+        assert_eq!(log.term_of(LogIndex(3)).unwrap(), zero_term);
+        assert_eq!(log.latest_index().unwrap(), log.zero_index().unwrap());
         assert_eq!(
             log.latest_volatile_index().unwrap(),
-            log.first_index().unwrap(),
+            log.zero_index().unwrap()
         );
 
+        // Append a single entry to the emptied log
+        let replaced_entry = LogEntry {
+            term: Term(5),
+            data: LogEntryData::Proposal(Bytes::from(format!("{}", 5)), ClientGuarantee::Fast),
+        };
+        log.append_entries(log.zero_index().unwrap() + 1, &[replaced_entry.clone()])
+            .unwrap();
         log.sync().unwrap();
+
+        // make sure entry is placed at LogIndex(4)
+        assert_eq!(log.zero_index().unwrap(), LogIndex(3));
+        assert_eq!(log.term_of(LogIndex(4)).unwrap(), Term(5));
+        assert_eq!(log.latest_index().unwrap(), LogIndex(4));
+        assert_eq!(log.latest_volatile_index().unwrap(), LogIndex(4));
+
+        let mut entry = LogEntry::default();
+        log.read_entry(LogIndex(4), &mut entry).unwrap();
+        assert_eq!(entry, replaced_entry);
+
+        // Now, imagine some snapshot happening at LogIndex(42) with Term(128) (why not)
+        log.compact_until(LogIndex(42), Term(128)).unwrap();
+        log.sync().unwrap();
+
+        // ensure log is emptied again and zero term is retrievable
+        assert_eq!(log.zero_index().unwrap(), LogIndex(42));
+        assert_eq!(log.term_of(LogIndex(42)).unwrap(), Term(128));
+        assert_eq!(log.latest_index().unwrap(), LogIndex(42));
+        assert_eq!(log.latest_volatile_index().unwrap(), LogIndex(42));
+
+        // Now, imagine some snapshot required to be reset to LogIndex(4) with Term(2) (why not)
+        log.compact_until(LogIndex(4), Term(2)).unwrap();
+        log.sync().unwrap();
+
+        // ensure log is emptied again and zero term is retrievable
+        assert_eq!(log.zero_index().unwrap(), LogIndex(4));
+        assert_eq!(log.term_of(LogIndex(4)).unwrap(), Term(2));
+        assert_eq!(log.latest_index().unwrap(), LogIndex(4));
+        assert_eq!(log.latest_volatile_index().unwrap(), LogIndex(4));
     }
 
     /// Ensure latest config is not stored in log, and returned even if log is truncated
     pub fn test_config_stored_separately(&mut self) {
-        // TODO: cut the log, try to request latest config
+        let mut log = self.create_log();
+
+        log.set_current_term(Term(2)).unwrap();
+        log.sync().unwrap();
+        assert_eq!(log.current_term().unwrap(), (Term(2)));
+
+        let config = ConsensusConfig {
+            peers: vec![Peer::new(42.into()), Peer::new(69.into())],
+        };
+        let config_entry = LogEntry {
+            term: Term(2),
+            data: LogEntryData::Config(config.clone()),
+        };
+
+        log.append_entries(LogIndex(1), &[config_entry.clone()])
+            .unwrap();
+        log.sync().unwrap();
+
+        log.set_latest_config(&config, LogIndex(1)).unwrap();
+
+        // discard the whole log
+        log.compact_until(LogIndex(1), Term(2)).unwrap();
+        log.sync().unwrap();
+
+        // make sure config and its data is readable, meaning it is not taken from the entry data
+        assert_eq!(log.latest_config().unwrap(), Some(config.clone()));
+        assert_eq!(log.latest_config_index().unwrap(), Some(LogIndex(1)));
     }
 }

@@ -18,7 +18,7 @@ use crate::persistent_log::{Log, LogEntryMeta};
 use crate::state_machine::StateMachine;
 
 use bytes::Bytes;
-use log::{debug, info, trace};
+use tracing::{debug, info, trace};
 
 static MAX_ROUNDS: u32 = 10;
 
@@ -72,11 +72,12 @@ where
         // We are ok to respond to some peers not in config in case they were there
         // in previous terms
         match response {
-            AppendEntriesResponse::Success(term, _, _)
-            | AppendEntriesResponse::StaleTerm(term)
-            | AppendEntriesResponse::InconsistentPrevEntry(term, _, _)
-                if current_term < term =>
+            AppendEntriesResponse::Success(follower_term, _, _)
+            | AppendEntriesResponse::StaleTerm(follower_term)
+            | AppendEntriesResponse::InconsistentPrevEntry(follower_term, _, _)
+                if current_term < follower_term =>
             {
+                debug!("leader found a peer with the higher term, stepping down");
                 // some node has received message with term higher than ours,
                 // that means some other leader appeared in consensus,
                 // we should downgrade to follower immediately
@@ -84,10 +85,10 @@ where
                 Ok((None, new_state.into()))
             }
 
-            AppendEntriesResponse::Success(term, _, _)
-            | AppendEntriesResponse::StaleTerm(term)
-            | AppendEntriesResponse::InconsistentPrevEntry(term, _, _)
-                if current_term > term =>
+            AppendEntriesResponse::Success(follower_term, _, _)
+            | AppendEntriesResponse::StaleTerm(follower_term)
+            | AppendEntriesResponse::InconsistentPrevEntry(follower_term, _, _)
+                if current_term > follower_term =>
             {
                 // some follower confirmed message we've sent at previous term
                 // it is ok for us
@@ -101,14 +102,21 @@ where
 
                 Ok((None, self.into()))
             }
-            AppendEntriesResponse::InconsistentPrevEntry(_, next_index, next_volatile_index) => {
-                self.state_data.set_next_index(from, next_volatile_index)?;
+            AppendEntriesResponse::InconsistentPrevEntry(
+                _follower_term,
+                follower_last_index,
+                follower_volatile_index,
+            ) => {
+                self.state_data.set_match_index(from, follower_last_index);
+                self.state_data
+                    .set_next_index(from, follower_volatile_index + 1)?;
                 let message = self.next_entries_or_snapshot(
                     handler,
                     from,
                     current_term,
                     local_latest_log_index,
                 )?;
+                trace!("follower behind: {:?}", message);
                 Ok((message, self.into()))
             }
             AppendEntriesResponse::Success(
@@ -120,9 +128,9 @@ where
                 // within current election timeout
                 self.state_data.peers_alive.insert(from);
                 trace!(
-                    "follower responded OK, checking next entry: {} {}",
-                    follower_latest_log_index,
-                    local_latest_log_index
+                    follower_latest_log_index = %follower_latest_log_index,
+                    local_latest_log_index = %local_latest_log_index,
+                    "follower responded success, checking next entry"
                 );
                 if follower_latest_log_index > local_latest_log_index {
                     // some follower has too high index in it's log
@@ -161,15 +169,13 @@ where
                         // LeaderCommit) should be sent here, because it does
                         // not request replying and only needs follower to
                         // try moving it's commit index
-                        let heartbeat = PeerMessage::AppendEntriesRequest(AppendEntriesRequest {
-                            term: current_term,
-                            prev_log_index: local_latest_log_index,
-                            prev_log_term: self.latest_log_term(Some(local_latest_log_index))?,
-                            leader_commit: self.commit_index,
-                            entries: Vec::new(),
-                        });
+
                         for id in &self.state_data.peers_alive {
-                            handler.send_peer_message(*id, heartbeat.clone());
+                            let heartbeat = self.new_heartbeat_request(&id)?;
+                            handler.send_peer_message(
+                                *id,
+                                PeerMessage::AppendEntriesRequest(heartbeat),
+                            );
                         }
                     }
 
@@ -263,7 +269,7 @@ where
     }
 
     fn timeout_now(self, _handler: &mut H) -> Result<CurrentState<M, H>, Error> {
-        info!("TimeoutNow on leader ignored");
+        info!("ignored timeout_now");
         Ok(self.into())
     }
 
@@ -271,7 +277,7 @@ where
         self,
         handler: &mut H,
         from: ServerId,
-        request: &InstallSnapshotRequest,
+        request: InstallSnapshotRequest,
     ) -> Result<(PeerMessage, CurrentState<M, H>), Error> {
         // this is the same logic as in append_entries_request
         let leader_term = request.term;
@@ -306,7 +312,7 @@ where
         mut self,
         handler: &mut H,
         from: ServerId,
-        response: &InstallSnapshotResponse,
+        response: InstallSnapshotResponse,
     ) -> Result<(Option<PeerMessage>, CurrentState<M, H>), Error> {
         let current_term = self.current_term()?;
         let local_latest_log_index = self.latest_log_index()?;
@@ -315,7 +321,7 @@ where
         match response {
             InstallSnapshotResponse::Success(term, _, _)
             | InstallSnapshotResponse::StaleTerm(term)
-                if &current_term < term =>
+                if &current_term < &term =>
             {
                 // some node has received message with term higher than ours,
                 // that means some other leader appeared in consensus,
@@ -326,7 +332,7 @@ where
 
             InstallSnapshotResponse::Success(term, _, _)
             | InstallSnapshotResponse::StaleTerm(term)
-                if &current_term > term =>
+                if &current_term > &term =>
             {
                 // some follower confirmed message we've sent at previous term
                 // it is ok for us
@@ -395,7 +401,7 @@ where
                 // This will update data for the state on both follower types - regular and cathing
                 // up
                 self.state_data
-                    .set_next_index(from, *follower_snapshot_index + 1)?;
+                    .set_next_index(from, follower_snapshot_index + 1)?;
                 if self.state_data.has_follower(&from) {
                     // Snapshots are only taken using commit index,
                     // so advancing an index on a single follower cannot change
@@ -403,7 +409,7 @@ where
                     // This means we don't need to call try_advance_commit_index,
                     // but we need to save the follower status to the state
                     self.state_data
-                        .set_match_index(from, *follower_snapshot_index);
+                        .set_match_index(from, follower_snapshot_index);
 
                     Ok((
                         self.next_entries_or_snapshot(
@@ -434,14 +440,7 @@ where
     fn heartbeat_timeout(&mut self, peer: ServerId) -> Result<AppendEntriesRequest, Error> {
         debug!("heartbeat timeout for peer: {}", peer);
         self.state_data.peers_alive.remove(&peer);
-        let latest_log_index = self.latest_log_index()?;
-        Ok(AppendEntriesRequest {
-            term: self.current_term()?,
-            prev_log_index: latest_log_index,
-            prev_log_term: self.latest_log_term(Some(latest_log_index))?,
-            leader_commit: self.commit_index,
-            entries: Vec::new(),
-        })
+        self.new_heartbeat_request(&peer)
     }
 
     fn election_timeout(mut self, handler: &mut H) -> Result<CurrentState<M, H>, Error> {
@@ -468,7 +467,7 @@ where
 
     fn check_compaction(&mut self, _handler: &mut H, force: bool) -> Result<bool, Error> {
         // leader may have snapshots in progress of being sent to slow followers
-        // or catching up nodes.  In that case we prefer not to taks snapshot if it is
+        // or catching up nodes.  In that case we prefer not to take snapshot if it is
         // not forced. But there is an exclusion here: same index.
         //
         // Due to the implementation of state machine's chunk metadata mechanism,
@@ -597,12 +596,7 @@ where
                 .map_err(|e| Error::Critical(CriticalError::StateMachine(Box::new(e))))?;
             let snapshot_index = if let Some(SnapshotInfo { index, .. }) = info {
                 index
-            } else if self
-                .log()
-                .first_index()
-                .map_err(|e| Error::PersistentLogRead(Box::new(e)))?
-                != LogIndex(0)
-            {
+            } else if self.zero_log_index()? != LogIndex(0) {
                 // state machine may be broken, storing no snapshot
                 // when it is expected
                 return Err(Error::Critical(CriticalError::SnapshotExpected));
@@ -763,26 +757,37 @@ where
     // contains the configuration change, which removes the current node
     // the return value is the flag showing if stepping down have to happen
     fn try_advance_commit_index(&mut self, handler: &mut H) -> Result<(bool, bool), Error> {
-        let majority = self.config.majority(self.id);
         // Here we try to move commit index to one that the majority of peers in cluster already have
         let latest_log_index = self.latest_log_index()?;
 
         // find a new commit index to advance to
         let mut new_commit_index = self.commit_index;
-        while new_commit_index <= latest_log_index
-            && self.state_data.count_match_indexes(new_commit_index + 1) >= majority
-        {
-            new_commit_index = new_commit_index + 1;
+        let majority = self.config.majority(self.id);
+
+        while new_commit_index < latest_log_index {
+            if self.state_data.count_match_indexes(new_commit_index) < majority {
+                break;
+            } else {
+                new_commit_index = new_commit_index + 1;
+            }
         }
 
+        /*while new_commit_index < latest_log_index*/
+        /*&& self.state_data.count_match_indexes(new_commit_index) >= majority*/
+        /*{*/
+        /*new_commit_index = new_commit_index + 1;*/
+        /*}*/
+
         if new_commit_index == self.commit_index {
-            trace!("commit index not advanced: {}", new_commit_index,);
-            return Ok((false, false)); // an index of majority did not change, so there is nothing to commit
+            trace!(index = %self.commit_index, "commit index not advanced");
+            // an index of majority did not change, so there is nothing to commit
+            return Ok((false, false));
         } else {
             trace!(
-                "commit index advanced from {} to {}",
-                self.commit_index,
-                new_commit_index
+                from = %self.commit_index,
+                to = %new_commit_index,
+                latest_log_index = %latest_log_index,
+                "commit index advanced"
             );
             self.commit_index = new_commit_index;
         }
@@ -885,6 +890,8 @@ where
         Ok((step_down_required, instant_commit))
     }
 
+    // having all the required information about the follower,
+    // decide if we should send it new entries or snapshot
     fn next_entries_or_snapshot(
         &mut self,
         handler: &mut H,
@@ -899,16 +906,12 @@ where
         };
 
         if follower_last_index < local_latest_log_index {
-            let first_log_index = self
-                .log()
-                .first_index()
-                .map_err(|e| Error::PersistentLogRead(Box::new(e)))?;
-            if follower_last_index < first_log_index {
+            let zero_log_index = self.zero_log_index()?;
+            if follower_last_index < zero_log_index {
                 trace!(
-                    "peer {} is behind leader and requires snapshot because it is out of log index range {} < {}",
-                    from,
-                     follower_last_index,
-                    local_latest_log_index
+                    peer_match_index = %follower_last_index,
+                    local_latest_log_index = %local_latest_log_index,
+                    "peer is behind leader and requires snapshot because it is out of log index range"
                 );
                 //if self.state_data.pending_snapshots.contains(&from) {
                 // We were already sending snapshot to follower, but received ApendEntries from
@@ -939,13 +942,12 @@ where
                     Err(e) => return Err(e),
                 }
             } else {
-                // We are not getting here if log is empty, because of follower_last_index <
+                // We are not getting here if our log is empty, because of follower_last_index <
                 // local_latest_log_index check above
                 //
                 // The peer is in log index range, but behind: send it entries to catch up.
                 trace!(
-                    "peer {} is missing at least {} log entries, sending them",
-                    from,
+                    "peer is missing at least {} log entries, sending them",
                     local_latest_log_index - follower_last_index
                 );
 
@@ -953,14 +955,11 @@ where
                 // so the message's prev_* entries have to contain information about this
                 // index
                 let prev_log_index = follower_last_index;
-                let prev_log_term = if prev_log_index == LogIndex(0) {
-                    Term(0)
-                } else {
-                    self.state_machine
-                        .log()
-                        .term_of(prev_log_index)
-                        .map_err(|e| Error::PersistentLogRead(Box::new(e)))?
-                };
+                let prev_log_term = self
+                    .state_machine
+                    .log()
+                    .term_of(prev_log_index)
+                    .map_err(|e| Error::PersistentLogRead(Box::new(e)))?;
 
                 let mut message = AppendEntriesRequest {
                     term: current_term,
@@ -1022,16 +1021,49 @@ where
 
         let message = InstallSnapshotRequest {
             term,
-            last_log_index: latest_log_index,
-            last_log_term,
-            leader_commit: self.commit_index,
             last_config,
             snapshot_index: info.index,
+            snapshot_term: info.term,
             chunk_data,
         };
         Ok((message, info))
     }
 
+    fn new_heartbeat_request(&self, peer: &ServerId) -> Result<AppendEntriesRequest, Error> {
+        let follower_last_known_index = self.state_data.next_index(peer)? - 1; // next_index is never LogIndex(0) by implementation
+
+        let latest_log_index = self.latest_log_index()?;
+        let zero_log_index = self.zero_log_index()?;
+        let (prev_log_index, prev_log_term) = if follower_last_known_index < zero_log_index {
+            // follower's index is behind the snapshot
+            // so we can only send our zero index and its term
+            (
+                zero_log_index,
+                self.log()
+                    .term_of(zero_log_index)
+                    .map_err(|e| Error::PersistentLogRead(Box::new(e)))?,
+            )
+        } else if follower_last_known_index > latest_log_index {
+            // this should notbe possible because of the checks done
+            // before calling set_next_index
+            return Err(Error::unreachable(debug_where!()));
+        } else {
+            (
+                follower_last_known_index,
+                self.log()
+                    .term_of(follower_last_known_index)
+                    .map_err(|e| Error::PersistentLogRead(Box::new(e)))?,
+            )
+        };
+
+        Ok(AppendEntriesRequest {
+            term: self.current_term()?,
+            prev_log_index,
+            prev_log_term,
+            leader_commit: self.commit_index,
+            entries: Vec::new(),
+        })
+    }
     fn check_catch_up_status(
         &mut self,
         handler: &mut H,
@@ -1299,7 +1331,7 @@ impl Leader {
 
     /// Returns the next log entry index of the follower or a catching up peer.
     /// Used only in AppendEntries context
-    fn next_index(&mut self, follower: &ServerId) -> Result<LogIndex, Error> {
+    fn next_index(&self, follower: &ServerId) -> Result<LogIndex, Error> {
         if let Some(index) = self.next_index.get(follower) {
             return Ok(*index);
         }
@@ -1326,11 +1358,11 @@ impl Leader {
 
     /// Sets the next log entry index of the follower or a catching up peer.
     fn set_next_index(&mut self, follower: ServerId, index: LogIndex) -> Result<(), Error> {
+        trace!(id = %follower, index = %index, "moved next index for follower");
         if let Some(stored_index) = self.next_index.get_mut(&follower) {
             *stored_index = index;
             return Ok(());
         }
-        trace!("next index for {:?} = {:?}", &follower, &index);
         if let Some(config_change) = &mut self.config_change {
             match config_change {
                 ConfigChange {

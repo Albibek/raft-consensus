@@ -1,6 +1,6 @@
 use std::{marker::PhantomData, mem};
 
-use log::trace;
+use tracing::trace;
 
 use crate::error::{CriticalError, Error};
 use crate::handler::Handler;
@@ -139,7 +139,7 @@ where
             options: state_options,
             _h: PhantomData,
         };
-        trace!("raft id={} initialized", id);
+        trace!("new consensus id={} initialized", id);
         Ok(Raft {
             state: state.into(),
             _h: PhantomData,
@@ -156,6 +156,7 @@ where
 // This structure is just a facade, hiding the internal state transitions from the caller.
 // At the same time all the internal convenience and requirements like StateImpl correctness is
 // left intact and mofifiable
+//
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Raft<M, H>
 where
@@ -174,6 +175,13 @@ where
     /// Apply a timeout event to the consensus
     // timeout is just the enum, it's easier to pass it by value
     pub fn apply_timeout(&mut self, handler: &mut H, timeout: Timeout) -> Result<(), Error> {
+        let span = tracing::trace_span!(
+            "timeout",
+            state = %self.kind_str_short(),
+            id = self.state.id().as_u64(),
+            timeout = ?timeout
+        );
+        let _guard = span.enter();
         self.state.apply_timeout(handler, timeout)
     }
 
@@ -184,6 +192,15 @@ where
         from: ServerId,
         message: PeerMessage,
     ) -> Result<(), Error> {
+        let span = tracing::trace_span!(
+            "peer",
+            state = %self.kind_str_short(),
+            id = self.state.id().as_u64(),
+            from = from.as_u64()
+        );
+        let _guard = span.enter();
+
+        trace!(msg = ?message);
         self.state.apply_peer_message(handler, from, message)
     }
 
@@ -196,6 +213,13 @@ where
         from: ClientId,
         message: ClientMessage,
     ) -> Result<(), Error> {
+        let span = tracing::trace_span!(
+            "client",
+            state = %self.kind_str_short(),
+            id = self.state.id().as_u64(),
+            client = %from
+        );
+        let _guard = span.enter();
         self.state.apply_client_message(handler, from, message)
     }
 
@@ -206,6 +230,13 @@ where
         from: AdminId,
         request: AdminMessage,
     ) -> Result<(), Error> {
+        let span = tracing::trace_span!(
+            "admin",
+            state = %self.kind_str_short(),
+            id = self.state.id().as_u64(),
+            client = %from
+        );
+        let _guard = span.enter();
         self.state.apply_admin_message(handler, from, request)
     }
 
@@ -219,6 +250,12 @@ where
     ///
     /// The return value will show if the snapshoting procedure happened.
     pub fn check_compaction(&mut self, handler: &mut H, force: bool) -> Result<bool, Error> {
+        let span = tracing::trace_span!(
+            "check_compaction",
+            state = %self.kind_str_short(),
+            id = self.state.id().as_u64(),
+        );
+        let _guard = span.enter();
         self.state.check_compaction(handler, force)
     }
 }
@@ -299,6 +336,15 @@ where
             CurrentState::Leader(_) => ConsensusState::Leader,
             CurrentState::Follower(_) => ConsensusState::Follower,
             CurrentState::Candidate(_) => ConsensusState::Candidate,
+        }
+    }
+
+    pub fn kind_str_short(&self) -> &'static str {
+        match self.state {
+            CurrentState::Lost => "FAILED",
+            CurrentState::Leader(_) => "L",
+            CurrentState::Follower(_) => "F",
+            CurrentState::Candidate(_) => "C",
         }
     }
 }
@@ -395,5 +441,15 @@ where
     pub fn check_compaction(&mut self, handler: &mut H, force: bool) -> Result<bool, Error> {
         // we don't need packet conversions here, so no generic function required
         proxy_state!(self, s, s.check_compaction(handler, force)?)
+    }
+
+    fn id(&self) -> ServerId {
+        match self {
+            // TODO impl tracing::Value to avoid unreachable
+            CurrentState::Lost => unreachable!(),
+            CurrentState::Leader(s) => s.id,
+            CurrentState::Candidate(s) => s.id,
+            CurrentState::Follower(s) => s.id,
+        }
     }
 }

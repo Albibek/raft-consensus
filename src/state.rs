@@ -1,6 +1,6 @@
 use std::marker::PhantomData;
 
-use log::{info, trace};
+use tracing::{info, trace};
 
 use crate::state_machine::StateMachine;
 use crate::{error::CriticalError, persistent_log::Log};
@@ -109,6 +109,23 @@ where
         Ok(self
             .log()
             .latest_index()
+            .map_err(|e| Error::PersistentLogRead(Box::new(e)))?)
+    }
+
+    /// Helper for returning the index of the latest in flight log entry.
+    #[inline]
+    pub(crate) fn latest_volatile_log_index(&self) -> Result<LogIndex, Error> {
+        Ok(self
+            .log()
+            .latest_volatile_index()
+            .map_err(|e| Error::PersistentLogRead(Box::new(e)))?)
+    }
+
+    #[inline]
+    pub(crate) fn zero_log_index(&self) -> Result<LogIndex, Error> {
+        Ok(self
+            .log()
+            .zero_index()
             .map_err(|e| Error::PersistentLogRead(Box::new(e)))?)
     }
 
@@ -260,7 +277,7 @@ where
             .map_err(|e| Error::Critical(CriticalError::StateMachine(Box::new(e))))?;
 
         if let Some(info) = info {
-            if info.index != self.commit_index || self.commit_index != LogIndex(0) {
+            if info.index == self.commit_index || self.commit_index == LogIndex(0) {
                 trace!("not taking snapshot because log index did not change or commit index is not known yet");
                 return Ok(false);
             }
@@ -289,10 +306,18 @@ where
         self.state_machine
             .take_snapshot(self.commit_index, commit_term)
             .map_err(|e| Error::Critical(CriticalError::StateMachine(Box::new(e))))?;
-        let cut_until = self.commit_index;
-        self.log_mut()
-            .discard_until(cut_until)
-            .map_err(|e| Error::Critical(CriticalError::PersistentLogWrite(Box::new(e))))?;
+
+        // request new info in case the snapshot was taken synchronously
+        if let Some(new_info) = self
+            .state_machine
+            .snapshot_info()
+            .map_err(|e| Error::Critical(CriticalError::StateMachine(Box::new(e))))?
+        {
+            trace!("took snapshot at {}", new_info.index);
+            self.log_mut()
+                .compact_until(new_info.index, new_info.term)
+                .map_err(|e| Error::Critical(CriticalError::PersistentLogWrite(Box::new(e))))?;
+        }
         return Ok(true);
     }
 }

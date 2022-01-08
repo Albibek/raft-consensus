@@ -2,7 +2,7 @@ use std::cmp;
 use std::marker::PhantomData;
 
 use crate::error::*;
-use log::{debug, info, trace};
+use tracing::{debug, info, trace, warn};
 
 use crate::handler::Handler;
 use crate::message::*;
@@ -148,7 +148,7 @@ where
         mut self,
         _handler: &mut H,
         _from: ServerId,
-        request: &InstallSnapshotRequest,
+        request: InstallSnapshotRequest,
     ) -> Result<(PeerMessage, CurrentState<M, H>), Error> {
         let current_term = self.current_term()?;
 
@@ -166,22 +166,33 @@ where
 
         let next_chunk_request = self
             .state_machine
-            .write_snapshot_chunk(request.snapshot_index, &request.chunk_data)
+            .write_snapshot_chunk(
+                request.snapshot_index,
+                request.snapshot_term,
+                &request.chunk_data,
+            )
             .map_err(|e| Error::Critical(CriticalError::StateMachine(Box::new(e))))?;
 
         if next_chunk_request.is_none() {
             // the follower has finished writing the last chunk of a snapshot
             // we don't need old records in log now
             self.log_mut()
-                .discard_until(request.snapshot_index)
+                .compact_until(request.snapshot_index, request.snapshot_term)
                 .map_err(|e| Error::Critical(CriticalError::PersistentLogWrite(Box::new(e))))?;
-
-            // we also do not need a new ones, if there are any
+            // we also do not need a new ones, if there are any, including the one
+            // in the snapshot
             if self.latest_log_index()? > request.snapshot_index {
                 self.log_mut()
                     .discard_since(request.snapshot_index + 1)
                     .map_err(|e| Error::Critical(CriticalError::PersistentLogWrite(Box::new(e))))?;
             }
+            debug!(
+                snapshot_index = %request.snapshot_index,
+                snapshot_term = %request.snapshot_term,
+                zero_log_index = %self.zero_log_index()?,
+                latest_log_index = %self.latest_log_index()?,
+                "follower finished receiving snapshot"
+            );
         }
 
         let message = InstallSnapshotResponse::Success(
@@ -196,7 +207,7 @@ where
         self,
         _handler: &mut H,
         from: ServerId,
-        response: &InstallSnapshotResponse,
+        response: InstallSnapshotResponse,
     ) -> Result<(Option<PeerMessage>, CurrentState<M, H>), Error> {
         // whatever the response is, the follower cannot process it because
         // the node in follower state does not now about snapshot states of other nodes
@@ -372,22 +383,16 @@ where
         let current_term = self.current_term()?;
 
         let latest_log_index = self.latest_log_index()?;
-        let latest_volatile_log_index = self
-            .log()
-            .latest_volatile_index()
-            .map_err(|e| Error::PersistentLogRead(Box::new(e)))?;
-        let first_log_index = self
-            .log()
-            .first_index()
-            .map_err(|e| Error::PersistentLogRead(Box::new(e)))?;
+        let latest_volatile_log_index = self.latest_volatile_log_index()?;
+        let zero_log_index = self.zero_log_index()?;
 
         // Check for gaps and possibility to find the corresponding entry in term
-        if latest_log_index < leader_prev_log_index || leader_prev_log_index < first_log_index {
+        if latest_log_index < leader_prev_log_index || leader_prev_log_index < zero_log_index {
             trace!(
-                "leader send prev_entry {} which is not in follower's log {}..{}",
-                leader_prev_log_index,
-                first_log_index,
-                latest_log_index
+                leader_prev_log_index = %leader_prev_log_index,
+                zero_log_index = %zero_log_index,
+                latest_log_index = %latest_log_index,
+                "leader sent prev_entry not in follower's log",
             );
             // If the previous entries index was not the same we would leave a gap.
             return Ok(AppendEntriesResponse::InconsistentPrevEntry(
@@ -397,30 +402,84 @@ where
             ));
         }
 
-        // Now, due to follower making snapshots independentyl of the leader,
+        // Now, due to follower making snapshots independently of the leader,
         // the incoming request from it may have some extra entries, that follower
         // does not need.
-        let existing_term = if leader_prev_log_index == LogIndex::from(0) {
-            // zero mean the very start, when everything is empty at leader and follower
-            // we better leave this here as special case rather than requiring it from
-            // persistent log implementation
-            Term(0)
-        } else {
-            // try to find term of specified log index and check if there is such entry
-            self.log()
-                .term_of(leader_prev_log_index)
-                .map_err(|e| Error::PersistentLogRead(Box::new(e)))?
-        };
+        // try to find term of specified log index and check if there is such entry
+        let existing_term = self
+            .log()
+            .term_of(leader_prev_log_index)
+            .map_err(|e| Error::PersistentLogRead(Box::new(e)))?;
 
         if existing_term != leader_prev_log_term {
-            // If an existing entry conflicts with a new one (same index but different terms):
-            // delete the existing entry and all that follow it
+            // An existing entry conflicts with a new one (same index but different terms):
+            // we have to delete the existing entries after AND INCLUDING the zero entry
+            // LogIndex(0) is not possible here because term will always be 0
+            if leader_prev_log_index == zero_log_index && leader_prev_log_term != existing_term {
+                // something really bad happened: most probably local snapshot was broken
+                // why: because in good scenario the same indexes must match the terms on
+                // leader and follower
+                //
+                // all we can do is recheck the snapshot on the state machine if it was
+                // out of sync with log for some reason
+                let info = self
+                    .state_machine
+                    .snapshot_info()
+                    .map_err(|e| Error::Critical(CriticalError::StateMachine(Box::new(e))))?;
+                if let Some(info) = info {
+                    if info.index != zero_log_index || info.term != existing_term {
+                        // just not matching ths snapshot witht the index is fixable by resetting the log
+                        warn!(
+                            local_zero_index = %zero_log_index,
+                            local_zero_term = %existing_term,
+                            snapshot_index = %info.index,
+                            snapshot_term = %info.term,
+                            "follower snapshot is out of sync with state machine");
+                        self.log_mut()
+                            .compact_until(info.index, info.term)
+                            .map_err(|e| {
+                                Error::Critical(CriticalError::PersistentLogWrite(Box::new(e)))
+                            })?;
+                    } else {
+                        // snapshot data is the same, but still not the same as on leader's prev entry
+                        // to fix this we can only ask leader to send us a newer snapshot or some
+                        // earlier entries
+                        // TODO maybe ask for snapshot explicitly
+                        warn!(
+                            local_zero_index = %zero_log_index,
+                            local_zero_term = %existing_term,
+                            leadev_prev_index = %leader_prev_log_index,
+                            leader_prev_term = %leader_prev_log_term,
+                            "follower term does not match leader term at the same index, follower is probably broken");
+                        return Ok(AppendEntriesResponse::InconsistentPrevEntry(
+                            current_term,
+                            leader_prev_log_index - 1,
+                            leader_prev_log_index - 1,
+                        ));
+                    }
+                } else {
+                    trace!(
+                            local_zero_index = %zero_log_index,
+                            local_zero_term = %existing_term,
+                            "follower snapshot is absent");
+                    // we are at index != LogIndex(0), but there is no snapshot:
+                    // we are definitely broken
+                    return Err(Error::Critical(CriticalError::SnapshotExpected));
+                }
+            }
 
-            let new_latest_log_index = self
-                .log_mut()
-                .discard_since(leader_prev_log_index)
-                .map_err(|e| Error::Critical(CriticalError::PersistentLogWrite(Box::new(e))))?;
+            trace!(%existing_term, %leader_prev_log_term);
+            if leader_prev_log_index == zero_log_index && latest_log_index != zero_log_index {
+                // if log needs to be completely discarded and contains any entries after zero entry
+                self.log_mut()
+                    .discard_since(leader_prev_log_index + 1)
+                    .map_err(|e| Error::Critical(CriticalError::PersistentLogWrite(Box::new(e))))?;
+            } else if latest_log_index != zero_log_index {
 
+                // if log needs to be discarded, but not completely,
+            };
+
+            let new_latest_log_index = self.latest_log_index()?;
             // since the entry at prev_log_index was not sent, we cannot work with
             // all other entries without gap, this is bad, but this is life :(
             return Ok(AppendEntriesResponse::InconsistentPrevEntry(
@@ -450,30 +509,31 @@ where
 
         let append_index = leader_prev_log_index + 1;
 
-        // for a heartbeat request this cycle will be skipped
+        // for a heartbeat request appending entries may be skipped,
         // but all other check and actions MUST be performed
         // because due to Raft's nature the follower's state machine(not log though) is always 1 commit behind the leader
         // until it receives the next AppendEntries message, be it heartbeat or whatever else
-        let mut log_entries = Vec::with_capacity(entries.len());
-        for entry in entries.into_iter() {
-            // with each send, leader marks config entries as active if they really take place
-            // as current cluster configuration, this way the follower can skip using previous
-            // inactive entries as actual ones and will not connect to some old nodes
-            if let EntryData::Config(config, is_active) = &entry.data {
-                if *is_active {
-                    self.config = config.clone();
+        if entries.len() > 0 {
+            let mut log_entries = Vec::with_capacity(entries.len());
+            for entry in entries.into_iter() {
+                // with each send, leader marks config entries as active if they really take place
+                // as current cluster configuration, this way the follower can skip using previous
+                // inactive entries as actual ones and will not connect to some old nodes
+                if let EntryData::Config(config, is_active) = &entry.data {
+                    if *is_active {
+                        self.config = config.clone();
+                    }
                 }
+
+                log_entries.push(entry.into());
             }
 
-            log_entries.push(entry.into());
+            trace!("appending at {}: {:?}", append_index, &log_entries);
+            self.log_mut()
+                .append_entries(append_index, &log_entries)
+                .map_err(|e| Error::Critical(CriticalError::PersistentLogWrite(Box::new(e))))?;
+            self.min_index = new_latest_log_index;
         }
-
-        trace!("follower appending at {}: {:?}", append_index, &log_entries);
-        self.log_mut()
-            .append_entries(append_index, &log_entries)
-            .map_err(|e| Error::Critical(CriticalError::PersistentLogWrite(Box::new(e))))?;
-
-        self.min_index = new_latest_log_index;
 
         // We are matching the leader's log up to and including `new_latest_log_index`.
         self.commit_index = cmp::min(request.leader_commit, new_latest_log_index);
@@ -487,7 +547,6 @@ where
             .latest_volatile_index()
             .map_err(|e| Error::PersistentLogRead(Box::new(e)))?;
 
-        trace!("follower latest index after append: {}", latest_log_index);
         Ok(AppendEntriesResponse::Success(
             current_term,
             latest_log_index,
@@ -527,13 +586,20 @@ where
             //         .map_err(|e| Error::PersistentLogRead(Box::new(e)))?;
 
             match entry_kind {
-                LogEntryMeta::Empty => {}
+                LogEntryMeta::Empty => {
+                    self.state_machine
+                        .apply(entry_index, false)
+                        .map_err(|e| Error::Critical(CriticalError::StateMachine(Box::new(e))))?;
+                }
                 LogEntryMeta::Proposal(_) => {
                     self.state_machine
                         .apply(entry_index, false)
                         .map_err(|e| Error::Critical(CriticalError::StateMachine(Box::new(e))))?;
                 }
                 LogEntryMeta::Config(config) => {
+                    self.state_machine
+                        .apply(entry_index, false)
+                        .map_err(|e| Error::Critical(CriticalError::StateMachine(Box::new(e))))?;
                     // we only saved configuration to log(an an entry) and memory, but has not persisted it yet
                     // this is what we have to do now
                     self.log_mut()

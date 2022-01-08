@@ -1,3 +1,4 @@
+pub mod emulation;
 pub mod log;
 pub mod machine;
 

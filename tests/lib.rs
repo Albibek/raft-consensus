@@ -1,9 +1,11 @@
-pub mod handler;
-pub mod hash_machine;
-pub mod raft;
+#[cfg(test)]
+mod core;
 
 #[cfg(test)]
-mod green;
+mod config_change;
+
+#[cfg(test)]
+mod snapshot;
 
 #[cfg(test)]
 mod errors;

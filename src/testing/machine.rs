@@ -34,6 +34,7 @@ where
     pub fn test_all(&mut self) {
         self.test_all_entries_applied();
         self.test_snapshot_index_and_term_correct();
+        self.test_snapshot_transfer();
     }
 
     pub fn test_all_entries_applied(&mut self) {
@@ -98,5 +99,43 @@ where
                 assert_eq!(LogIndex(info.term.as_u64()), LogIndex(i));
             }
         }
+    }
+
+    pub fn test_snapshot_transfer(&mut self) {
+        let mut source_machine = (self.new_machine)();
+        let source_log = source_machine.log_mut();
+        let proposal_entry = LogEntry {
+            term: Term(2),
+            data: LogEntryData::Proposal(Bytes::from("hi"), ClientGuarantee::Fast),
+        };
+
+        source_log
+            .append_entries(LogIndex(1), &[proposal_entry.clone()])
+            .unwrap();
+        source_log.sync().unwrap();
+
+        source_machine.apply(LogIndex(1), false).unwrap();
+        source_machine.take_snapshot(LogIndex(1), Term(2)).unwrap();
+        source_machine.sync().unwrap();
+
+        let mut dest_machine = (self.new_machine)();
+        // transfer snapshot from source machine to destination
+        let mut current_chunk = source_machine.read_snapshot_chunk(None).unwrap();
+        while let Some(next_request) = dest_machine
+            .write_snapshot_chunk(LogIndex(1), Term(2), &current_chunk)
+            .unwrap()
+        {
+            current_chunk = source_machine
+                .read_snapshot_chunk(Some(&next_request))
+                .unwrap();
+        }
+
+        dest_machine.sync().unwrap();
+        let info = dest_machine.snapshot_info().unwrap();
+        assert!(info.is_some());
+        let info = info.unwrap();
+        assert_eq!(info.index, LogIndex(1));
+        assert_eq!(info.term, Term(2));
+        assert_eq!(dest_machine.last_applied().unwrap(), LogIndex(1));
     }
 }

@@ -1,7 +1,7 @@
+use crate::persistent_log::{Log, LogEntry};
+use crate::state_machine::{SnapshotInfo, StateMachine};
+use crate::{LogIndex, Term};
 use bytes::Bytes;
-use raft_consensus::persistent_log::{Log, LogEntry, LogEntryData};
-use raft_consensus::state_machine::{SnapshotInfo, StateMachine};
-use raft_consensus::{LogIndex, Term};
 use std::hash::Hasher;
 
 use std::{collections::hash_map::DefaultHasher, fmt::Debug};
@@ -16,33 +16,44 @@ pub enum Error {
 }
 
 /// A state machine which hashes an incoming request with it's current state on apply.
-/// On query it hashes it's own state then adds the query above withtout modifying state itself
-/// Snapshot is a copy of a hash at the specific index split into 8 1-byte chunks with chunked flag
+/// Made for testing purposes and has a very simple API.
+/// It stores a hash for each proposal entry coming from log, skipping the config and .
+///
+/// The snapshot is all of the hashes XORed
+/// together, but it have to be made explicitly. The state is the same XORed value,
+/// but taken up to latest applied entry.
+///
+/// On non-empty query the machine hashes it's current state then joins the query to the hash without
+/// modifying state and returns the hashed value as the little-endian byte array.
+/// On empty query the machine returns the state without additions.
+///
+/// For testing reasons snapshot is split into 8 1-byte chunks with chunked flag
 /// of just a 8-byte arrays/vectors otherwise
 ///
 /// In chunked mode the simpliest scheme is used for chunk/request:
 /// chunk: first byte is the number of chunk being sent, second byte is the chunk value
 /// requess: single byte requesting the next chunk
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct HashMachine<L: Log> {
-    pub hash: u64,
+    log: L,
+
+    pub state: u64,
+
     pub current_snapshot: [u8; 8],
     pub pending_snapshot: [u8; 8],
-    hasher: DefaultHasher,
+    pub chunked: bool,
+
     pub index: LogIndex,
     pub term: Term,
     last_applied: LogIndex,
-    pub chunked: bool,
-    log: L,
 }
 
 impl<L: Log> HashMachine<L> {
     pub fn new(log: L, chunked: bool) -> Self {
         Self {
-            hash: 0,
+            state: 0,
             current_snapshot: [0u8; 8],
             pending_snapshot: [0u8; 8],
-            hasher: DefaultHasher::new(),
             index: LogIndex(0),
             term: Term(0),
             last_applied: LogIndex(0),
@@ -54,7 +65,7 @@ impl<L: Log> HashMachine<L> {
 
 impl<L: Log> Debug for HashMachine<L> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        Debug::fmt(&self.hash, f)
+        Debug::fmt(&self.state, f)
     }
 }
 
@@ -68,14 +79,15 @@ impl<L: Log> StateMachine for HashMachine<L> {
         self.log
             .read_entry(index, &mut entry)
             .map_err(|e| Error::LogError(Box::new(e)))?;
-        if let LogEntryData::Proposal(command, _) = entry.data {
+        if let Some(command) = entry.try_proposal_data() {
+            let mut hasher = DefaultHasher::new();
             for byte in command {
-                self.hasher.write_u8(byte);
+                hasher.write_u8(byte);
             }
 
-            self.hash = self.hasher.finish();
+            self.state = self.state ^ hasher.finish();
             if results_required {
-                Ok(Some(Bytes::copy_from_slice(&self.hash.to_le_bytes()[..])))
+                Ok(Some(Bytes::copy_from_slice(&self.state.to_le_bytes()[..])))
             } else {
                 Ok(Some(Bytes::new()))
             }
@@ -85,16 +97,21 @@ impl<L: Log> StateMachine for HashMachine<L> {
         }
     }
 
-    fn query(&self, query: Bytes) -> Result<Bytes, Error> {
-        let mut hasher = self.hasher.clone();
-        for byte in &query {
-            hasher.write_u8(*byte);
-        }
-        Ok(Bytes::copy_from_slice(&hasher.finish().to_le_bytes()[..]))
+    fn query(&mut self, query: Bytes) -> Result<Bytes, Error> {
+        let result = if query.len() > 0 {
+            let mut hasher = DefaultHasher::new();
+            for byte in &query {
+                hasher.write_u8(*byte);
+            }
+            self.state ^ hasher.finish()
+        } else {
+            self.state
+        };
+        Ok(Bytes::copy_from_slice(&result.to_le_bytes()[..]))
     }
 
     fn snapshot_info(&self) -> Result<Option<SnapshotInfo>, Self::Error> {
-        if self.current_snapshot == [0; 8] {
+        if self.last_applied == LogIndex(0) {
             Ok(None)
         } else {
             Ok(Some(SnapshotInfo {
@@ -108,7 +125,7 @@ impl<L: Log> StateMachine for HashMachine<L> {
     fn take_snapshot(&mut self, index: LogIndex, term: Term) -> Result<(), Self::Error> {
         self.index = index;
         self.term = term;
-        self.current_snapshot = self.hash.to_le_bytes();
+        self.current_snapshot = self.state.to_le_bytes();
         Ok(())
     }
 
@@ -135,6 +152,7 @@ impl<L: Log> StateMachine for HashMachine<L> {
     fn write_snapshot_chunk(
         &mut self,
         index: LogIndex,
+        term: Term,
         chunk_bytes: &[u8],
     ) -> Result<Option<Vec<u8>>, Self::Error> {
         // in this test implementation we consider all hash_machines initiated
@@ -145,15 +163,22 @@ impl<L: Log> StateMachine for HashMachine<L> {
             if chunk == 7 {
                 // 7th chunk is the last one
                 self.current_snapshot = self.pending_snapshot;
+                self.state = u64::from_le_bytes(self.current_snapshot);
+                self.index = index;
+                self.term = term;
+                self.last_applied = index;
                 Ok(None)
             } else {
                 Ok(Some(vec![chunk as u8 + 1u8]))
             }
         } else {
-            for i in 0..7 {
+            for i in 0..8 {
                 self.current_snapshot[i] = chunk_bytes[i];
             }
-            self.hash = u64::from_le_bytes(self.current_snapshot);
+            self.state = u64::from_le_bytes(self.current_snapshot);
+            self.index = index;
+            self.term = term;
+            self.last_applied = index;
             Ok(None)
         }
     }
@@ -168,5 +193,22 @@ impl<L: Log> StateMachine for HashMachine<L> {
 
     fn last_applied(&self) -> Result<LogIndex, Self::Error> {
         Ok(self.last_applied)
+    }
+}
+
+#[cfg(test)]
+mod test {
+
+    use super::*;
+    use crate::persistent_log::MemLog;
+    use crate::testing::*;
+
+    #[test]
+    fn test_hash_machine() {
+        let mut tester = MachineTester::new(|| {
+            let log = MemLog::new();
+            HashMachine::new(log, false)
+        });
+        tester.test_all();
     }
 }

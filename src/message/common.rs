@@ -1,15 +1,6 @@
 #[cfg(feature = "use_serde")]
 use serde::{Deserialize, Serialize};
 
-#[cfg(feature = "use_capnp")]
-use crate::error::Error;
-
-#[cfg(feature = "use_capnp")]
-use crate::messages_capnp::*;
-
-#[cfg(feature = "use_capnp")]
-use capnp::message::{Allocator, Builder, HeapAllocator, Reader, ReaderSegments};
-
 /// Module contains message types used in consensus
 /// Any network message have to be converted to theese enums to be processed
 use crate::ServerId;

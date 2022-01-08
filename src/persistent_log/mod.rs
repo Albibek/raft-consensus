@@ -32,20 +32,19 @@ use serde::{Deserialize, Serialize};
 
 use thiserror::Error as ThisError;
 
-/// A layer of persistence to store Raft log and state data.
-/// Should implement a log storage for appending raft log entries
-/// along with storing iseveral specific values, like voted_for, current cluster configuration.
+/// Log is a layer of persistence to store Raft entries in an ordered queue.
+/// Implementation sof this trait should handle a log-like storage for appending entries
+/// along with storing several specific values, like voted_for, current cluster configuration, etc.
 ///
-/// The implementor is responsible for keeping ordering and leaving no gaps in log.
-///
-/// For example when batching is used, the entries may not be persisted right away. In that case,
-/// latest_log_index should not forward to a new value until the corresponsing entries
-/// are synced to disk.
+/// The log is allowed have some entries pending to be persisted (for example not yet synced on disk)
+/// but the corresponding indexes must only point to the start and the end of already persisted part
+/// without gaps.
 ///
 /// The latter automatically means, that the tradeoff between cluster stability
 /// and probable performance benefits lays on the implementor.
+///
 /// Since Raft always counts on entries persisted to the log, it does not manage the
-/// indexes of the tail (i.e. just appended) entries. If implementation wants
+/// indexes of the tail (i.e. just appended, but not yet persisted) entries. If implementation wants
 /// to guarantee the persistence of these entries, it should not return from
 /// the function until the entries are synced properly, or should not shift its
 /// latest index towards entries being persisted yet. To avoid resending of these
@@ -53,120 +52,114 @@ use thiserror::Error as ThisError;
 /// will be sent to leader, and leader will try to put only entries following
 /// this index.
 ///
-/// *Important edge cases to consider*
-/// All of thefollowing MUST be implemented correctly. It is strongly
-/// recommended to unit-test the implementation using the testing::log::LogTester
-/// module (enabled by the "testing" feature).
+///  To maintain all log states correctly, the implementation should keep track of:
+///     * latest_log_index - the index of the last persisted entry
+///     * zero_log_index - the index of entry, preceding the first existing entry in the log
+///     * so called "zero term" - the term of the entry preceding the first existing entry in the log
 ///
-/// * Log indexes in Raft start with 1. LogIndex(0) is reserved as special and
-/// means the freshly initialized log with no entries (old or new). The entry
-/// data of a term of entry at LogIndex(0) will never be requested.
-/// * Due to snapshotting, the log may become containing no entries at all. This means the
-/// return values from first_index, last_index and term_of may become confusing due to
-/// the log entry itself not existing in log while its meta information is still required.
-/// So to clear things out the implementation is expected to return the following:
-///     * fisrt_index must return the index of last seen entry
-///     * latest_index must return the index of last seen entry
-///     * latest_volatile_index may return the higher index, than last_log
-///     * term_of must return the term of last seen entry; this is the ONLY case
-///   It is also expected from the implementation that these values are persisted between log
-///   restarts, that is when the empty log which had entries before is initialized again,
-///   the indexes have to remain as they were before the restart. In this case, the
-///   need of retransferring snapshot will be eliminated which may sava a potentially
-///   big amount of network traffic.
+/// With these two indexes and additional metadata it is possible to maintain any log state, including the empty one:
+/// * for non-empty log the latest_log_index always point to the index of last persisted entry
+/// * for empty log the latest_log_index points to zero_entry
+/// * zero_entry_index is always pointing to non existing(or marked so) entry
+/// * zero term must be kept separately
 ///
-///   This edge case is the only one where any metadata of non-existing entry is
-///   requested. The consensus gives guarantee to do all other function calls or arguments
-///   only on existing values. This means the implementation is free to return an error
-///   if it couldn't found the entry, which, in turn will mean either a bug or data corruption
-///   in the implementaion itself or a bug in the consensus implementation.
+/// Note, that this also fits into the original whitepapers's requirements
+/// on starting log indexes from LogIndex(1). In that case LogIndex(0) will be a zero entry
+/// with zero term equaling to Term(0).
+///
+/// The consensus gives guarantee to do all other function calls or arguments
+/// only on existing values. This means the implementation is free to return an error
+/// if it couldn't found the entry, which, in turn will mean either a bug or data corruption
+/// in the implementaion itself or a bug in the consensus implementation.
 pub trait Log {
     type Error: std::error::Error + Sized + 'static;
 
-    /// Should return the index of the latest log entry ever appended to log. To avoid data losses
-    /// this index should point the data that is guaranteed to be persisted.
-    /// Should return LogIndex(0) if the log is freshly created.
+    /// Should return the index of the latest log entry persisted to log, or,
+    /// the index of zero entry if log is empty.
     fn latest_index(&self) -> Result<LogIndex, Self::Error>;
 
-    /// May be overriden  to return the index that was lately received by the log, but may not be yet persisted.
-    /// Will be used as a tip only, to avoid resending excessive data to followers.
+    /// Should return the index of the entry that was lately received by the log, but may not be yet persisted.
+    /// By default this functions calls latest_index, but can be redefined by the implementation.
     fn latest_volatile_index(&self) -> Result<LogIndex, Self::Error> {
         self.latest_index()
     }
 
-    /// Should return the index of the first log entry (0 if the log is empty).
-    fn first_index(&self) -> Result<LogIndex, Self::Error>;
+    /// Should return the index preceding the first entry in the log.
+    fn zero_index(&self) -> Result<LogIndex, Self::Error>;
 
     /// Should return term corresponding to the entry at `index`.
     /// The consensus guarantees to always request a term of the existing
-    /// entry
-    ///
-    /// Just for the record, the term at LogIndex(0) should be Term(0), but
-    /// this is also promised to not be requested.
+    /// entry or the term of zero entry(aka zero term).
     fn term_of(&self, index: LogIndex) -> Result<Term, Self::Error>;
 
-    /// Delete or mark as invalid all entries since specified log index, inclusively.
-    /// Return the new index. It is allowed to return any index lower than requested.
-    fn discard_since(&mut self, index: LogIndex) -> Result<LogIndex, Self::Error>;
+    /// Should consider all entries up to and including the specified `index`
+    /// as discarded. It is up to the implementation to really delete these entries or
+    /// just mark them, but the new zero and last indexes must become consistent with `index`
+    /// at the moment when function returns.
+    ///
+    /// It is possible that the `index` will point beyond the log's latest_index or latest_volatile_index,
+    /// or, in some rare cases to index earlier than zero_index.
+    /// The implementation must support such behaviour by setting its indexes accordingly, emptying
+    /// the log and persisting the zero term as `term` (because there may be no knowlege
+    /// about this term in the log).
+    fn compact_until(&mut self, index: LogIndex, zero_term: Term) -> Result<(), Self::Error>;
 
-    /// The implementation may consider all entries until specified index inclusively
-    /// (i.e. discarding the entry at `index` too) as compacted into a snapshot.
-    /// Still, it is allowed to leave any number of entries before `index`.
-    fn discard_until(&mut self, index: LogIndex) -> Result<(), Self::Error>;
+    /// The implementation must consider all entries after and including the specified index
+    /// as discarded. It is up to the implementation to really delete these entries or
+    /// just mark them, but both latest indexes(persistent and volatile) must point to the
+    /// entry preceeding the entry at `start` (this includes zero entry) at the moment
+    /// when functon returns.
+    /// The implementation is allowed to discard more entries than requested, up to the earlier
+    /// index, updating the last indexes correspondingly.
+    fn discard_since(&mut self, start: LogIndex) -> Result<(), Self::Error>;
 
     /// Should read the entry at the provided log index into an entry provided by reference.
-    /// Consensus guarantees that no entries at indexes higher than latest_log_index will be read.
-    /// If index is too low, LogEntry should be set to LogEntryData::Empty
+    /// Consensus guarantees that only entries existing in the log wil be read, zero entry will
+    /// not.
     fn read_entry(&self, index: LogIndex, dest: &mut LogEntry) -> Result<(), Self::Error>;
 
-    /// Should return the metadata of the entry at the specified index. No indexes higher
-    /// than latest_log_index will be requested.
+    /// Should return the metadata of the entry at the specified index. Only existing
+    /// entries will be requested, zero entry will not.
     fn entry_meta_at(&self, index: LogIndex) -> Result<LogEntryMeta, Self::Error>;
 
-    /// Must append an entry to the log. The entries sync to disk and index shifting should be decided by implementation,
-    /// but the entries must be persisted with no gaps and incoming ordering.
-    /// In case of applying verlapping entries, all previous ones must be considered invalid and
-    /// have to be overwritten. The consensus guarantees that only existing entries (i.e. stored
-    /// at or after the first index) will be overwritten.
+    /// Must append an entry to the log. The moment of persisting entries should be decided by implementation,
+    /// but the indexes must change only after the entries are persisted leaving no gaps and keep incoming ordering.
+    /// The consensus guarantees that no overwrites of existing entries will be requested unless
+    /// the preliminary call to discard was made. Also, consensus guarantees there will be no
+    /// gaps between entries, i.e. `start` will always point to the latest_volatile_index + 1.
     ///
-    /// `start` is pointing at the index where the first entry should be placed at. Consensus
-    /// guarantees the absence of gaps with regards to `discard_since` function.
-    ///
-    /// Implementations are recommended to NOT rely on term being always increasing because
-    /// of possible overflows in future implementations of consensus.
-    ///
-    /// Configuration change entries should only be persisted, but not marked as latest
-    /// affecting further calls to `latest_config*` functions. Such marking will be done later,
-    /// when configuration is committed by calling set_latest_config function explicitly.
+    /// Implementations are recommended to NOT rely on any content of entries, including
+    /// entry's term and type. This means configuration change entries should only be persisted,
+    /// but not marked as latest affecting further calls to `latest_config*` functions. Such marking
+    /// will be done later, when configuration is committed by calling set_latest_config function explicitly.
     fn append_entries(&mut self, start: LogIndex, entries: &[LogEntry]) -> Result<(), Self::Error>;
 
-    /// Should return the latest known term.
-    /// For the empty log should be Term(0).
+    /// Should return the latest known term or Term(0) when initialized.
     fn current_term(&self) -> Result<Term, Self::Error>;
 
     /// Should set the current term to the provided value.
-    /// The implementations are recommended to NOT assume the term to be always greater
-    /// than or equal to the previous term, due to possible future overflows.
-    /// Recommended to be synchronous, delays in persisting term may break the
-    /// consensus.
+    /// The implementations is NOT recommended to rely on any term change patterns or regularity.
+    /// The function must be synchronous, delays or failures in persisting after returning
+    /// from this function may break the consensus.
     fn set_current_term(&mut self, term: Term) -> Result<(), Self::Error>;
 
-    /// Returns the id of the candidate node voted for in the current term, if any.
+    /// Returns the id of the candidate node voted for in the current term, if set.
     fn voted_for(&self) -> Result<Option<ServerId>, Self::Error>;
 
     /// Should save a provided candidate id the node voted for the current term.
-    /// None means voted_for should be unset(i.e. cleared)
+    /// server = None means voted_for should be unset(i.e. cleared)
+    ///
+    /// The function must be synchronous, delays or failures in persisting after returning
+    /// from this function may break the consensus.
     fn set_voted_for(&mut self, server: Option<ServerId>) -> Result<(), Self::Error>;
 
     /// Should persist the provided configuration and its index.
     ///
     /// The provided values should be persisted separately from the original config entry in the log,
     /// which may not exist there at the moment of calling (i.e. because of snapshotting).
-    /// Still, the consensus will guarantee that the configuration at the index is the
-    /// same as the one in the log.
     ///
-    /// Recommended to be synchronous, delays in persisting may break the
-    /// consensus.
+    /// The function must be synchronous, delays or failures in persisting after returning
+    /// from this function may break the consensus.
     fn set_latest_config(
         &mut self,
         config: &ConsensusConfig,
@@ -183,7 +176,7 @@ pub trait Log {
     ///
     /// Sync is not called by consensus and only used when log is tested. It also
     /// may be useful in other scenarios, calling it is not prohibited.
-    /// The default implementation always succeds.
+    /// The default implementation always succeeds.
     fn sync(&self) -> Result<(), Self::Error> {
         Ok(())
     }
@@ -228,6 +221,14 @@ impl LogEntry {
     pub fn try_proposal_data(&self) -> Option<Bytes> {
         if let LogEntryData::Proposal(ref data, _) = self.data {
             Some(data.clone())
+        } else {
+            None
+        }
+    }
+
+    pub fn try_config_data(&self) -> Option<ConsensusConfig> {
+        if let LogEntryData::Config(ref config) = self.data {
+            Some(config.clone())
         } else {
             None
         }
@@ -280,81 +281,6 @@ impl LogEntry {
         }
     }
 }
-
-///// The reference to a record to be added into log
-//#[derive(Debug, Clone, PartialEq, Eq)]
-//pub struct LogEntryRef<'a> {
-//pub term: Term,
-//pub data: LogEntryDataRef<'a>,
-//}
-
-///// Kinds of a log entry to be processed
-//#[derive(Debug, Clone, PartialEq, Eq)]
-//pub enum LogEntryDataRef<'a> {
-//Empty,
-//Proposal(&'a [u8], ClientId, ClientGuarantee),
-//Config(&'a ConsensusConfig, AdminId),
-//}
-
-//impl<'a> From<LogEntryRef<'a>> for LogEntry {
-//fn from(e: LogEntryRef<'a>) -> Self {
-//LogEntry {
-//term: e.term,
-//data: match e.data {
-//LogEntryDataRef::Empty => LogEntryData::Empty,
-//LogEntryDataRef::Proposal(proposal, client, guarantee) => {
-//LogEntryData::Proposal(proposal.to_vec(), client, guarantee)
-//}
-//LogEntryDataRef::Config(c, admin) => LogEntryData::Config(c.clone(), admin),
-//},
-//}
-//}
-//}
-
-//impl<'a> From<&'a LogEntryRef<'a>> for LogEntry {
-//fn from(e: &'a LogEntryRef<'a>) -> Self {
-//LogEntry {
-//term: e.term,
-//data: match e.data {
-//LogEntryDataRef::Empty => LogEntryData::Empty,
-//LogEntryDataRef::Proposal(proposal, client, guarantee) => {
-//LogEntryData::Proposal(proposal.to_vec(), client, guarantee)
-//}
-//LogEntryDataRef::Config(c, admin) => LogEntryData::Config(c.clone(), admin),
-//},
-//}
-//}
-//}
-
-//impl<'a> From<LogEntryRef<'a>> for Entry {
-//fn from(e: LogEntryRef<'a>) -> Self {
-//Entry {
-//term: e.term,
-//data: match e.data {
-//LogEntryDataRef::Empty => EntryData::Noop,
-//LogEntryDataRef::Proposal(proposal, client, guarantee) => {
-//EntryData::Proposal(proposal.to_vec(), client, guarantee)
-//}
-//LogEntryDataRef::Config(c, admin) => EntryData::Config(c.clone(), false, admin),
-//},
-//}
-//}
-//}
-
-//impl<'a> From<&'a LogEntryRef<'a>> for Entry {
-//fn from(e: &'a LogEntryRef<'a>) -> Self {
-//Entry {
-//term: e.term,
-//data: match e.data {
-//LogEntryDataRef::Empty => EntryData::Noop,
-//LogEntryDataRef::Proposal(proposal, client, guarantee) => {
-//EntryData::Proposal(proposal.to_vec(), client, guarantee)
-//}
-//LogEntryDataRef::Config(c, admin) => EntryData::Config(c.clone(), false, admin),
-//},
-//}
-//}
-//}
 
 /// A helper type for errors in persistent log. Contains typical errors, that could happen,
 /// but no code depends on it, so it only provided to make implementor's life easier.

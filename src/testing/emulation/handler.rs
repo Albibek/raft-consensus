@@ -1,12 +1,12 @@
+use std::collections::HashMap;
 use std::collections::VecDeque;
-use std::collections::{HashMap, HashSet};
 
-use raft_consensus::message::*;
-use raft_consensus::*;
+use crate::message::*;
+use crate::*;
 
-use raft_consensus::handler::{CollectHandler, Handler};
+use crate::handler::Handler;
 
-use log::{debug, info, trace};
+use tracing::trace;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
@@ -21,19 +21,20 @@ pub struct TestHandler {
     pub cur: ServerId,
 
     pub peer_network: HashMap<(ServerId, ServerId), VecDeque<PeerMessage>>,
-    // raft sends only client responses and only admin responses through handler
+    /// handler is used only to send responses, not the requests
+    /// so we don't emulate requests
     pub client_network: HashMap<(ServerId, ClientId), VecDeque<ClientMessage>>,
     pub admin_network: HashMap<(ServerId, AdminId), VecDeque<AdminMessage>>,
 
     pub election_timeouts: HashMap<ServerId, bool>,
     pub heartbeat_timeouts: HashMap<ServerId, Option<HashMap<ServerId, bool>>>,
+    pub client_timeouts: HashMap<ServerId, bool>,
 }
 
 impl Handler for TestHandler {
     /// Saves peer message to a vector
     fn send_peer_message(&mut self, id: ServerId, message: PeerMessage) {
         assert_ne!(self.cur, ServerId(u64::MAX));
-        trace!("peer message {:?} -> {:?}: {:?}", &self.cur, &id, &message);
         let q = self.peer_network.get_mut(&(self.cur, id)).unwrap();
         q.push_back(message);
     }
@@ -41,12 +42,6 @@ impl Handler for TestHandler {
     /// Saves client message to a vector
     fn send_client_message(&mut self, id: ClientId, message: ClientMessage) {
         assert_ne!(self.cur, ServerId(u64::MAX));
-        trace!(
-            "client message {:?} -> {:?}: {:?}",
-            &self.cur,
-            &id,
-            &message
-        );
         let q = self.client_network.get_mut(&(self.cur, id)).unwrap();
         q.push_back(message);
     }
@@ -80,7 +75,7 @@ impl Handler for TestHandler {
                 }
             }
             Timeout::Client => {
-                todo!("handle client timeouts")
+                self.client_timeouts.insert(self.cur, true); // previous id must exist
             }
         }
     }
@@ -105,7 +100,7 @@ impl Handler for TestHandler {
                 }
             }
             Timeout::Client => {
-                todo!("handle client timeouts")
+                self.client_timeouts.insert(self.cur, false);
             }
         }
     }
@@ -162,6 +157,7 @@ impl TestHandler {
 
             election_timeouts: HashMap::new(),
             heartbeat_timeouts: HashMap::new(),
+            client_timeouts: HashMap::new(),
         }
     }
 
