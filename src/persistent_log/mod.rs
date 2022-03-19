@@ -14,7 +14,7 @@
 //pub mod fs;
 pub mod mem;
 
-use crate::message::ClientGuarantee;
+use crate::message::Urgency;
 // FIXME:
 //pub use persistent_log::fs::FsLog;
 pub use crate::persistent_log::mem::MemLog;
@@ -24,7 +24,7 @@ use std::fmt::Debug;
 
 use crate::config::ConsensusConfig;
 use crate::message::peer::{Entry, EntryData};
-use crate::{LogIndex, ServerId, Term};
+use crate::{LogIndex, Peer, ServerId, Term};
 
 use bytes::Bytes;
 #[cfg(feature = "use_serde")]
@@ -74,18 +74,16 @@ use thiserror::Error as ThisError;
 pub trait Log {
     type Error: std::error::Error + Sized + 'static;
 
-    /// Should return the index of the latest log entry persisted to log, or,
-    /// the index of zero entry if log is empty.
-    fn latest_index(&self) -> Result<LogIndex, Self::Error>;
-
-    /// Should return the index of the entry that was lately received by the log, but may not be yet persisted.
-    /// By default this functions calls latest_index, but can be redefined by the implementation.
-    fn latest_volatile_index(&self) -> Result<LogIndex, Self::Error> {
-        self.latest_index()
-    }
-
-    /// Should return the index preceding the first entry in the log.
-    fn zero_index(&self) -> Result<LogIndex, Self::Error>;
+    /// Should return the actual log state in form of current indexes:
+    /// (
+    ///   zero_index - the index before the first persisted entry,
+    ///   latest_index - the index of last persisted entry,
+    ///   latest_volatile_index - the index of last appended, but not persisted entry
+    /// )
+    ///
+    /// In freshly created log all indexes must be LogIndex(0)
+    /// In the log, where nothing is persisted, latest_index must be equal to zero_index
+    fn current_view(&self) -> Result<(LogIndex, LogIndex, LogIndex), Self::Error>;
 
     /// Should return term corresponding to the entry at `index`.
     /// The consensus guarantees to always request a term of the existing
@@ -99,12 +97,13 @@ pub trait Log {
     ///
     /// It is possible that the `index` will point beyond the log's latest_index or latest_volatile_index,
     /// or, in some rare cases to index earlier than zero_index.
-    /// The implementation must support such behaviour by setting its indexes accordingly, emptying
-    /// the log and persisting the zero term as `term` (because there may be no knowlege
-    /// about this term in the log).
-    fn compact_until(&mut self, index: LogIndex, zero_term: Term) -> Result<(), Self::Error>;
+    /// The implementation must support these cases by discarding the whole log, persisting the
+    /// zero term as `term` (because there may be no knowlege about this term in the log) and
+    /// setting its indexes accordingly. That is zero_index and latest_index must be set to `index`,
+    /// while latest_volatile_index may or may not be moved to `index` as well.
+    fn discard_until(&mut self, index: LogIndex, zero_term: Term) -> Result<(), Self::Error>;
 
-    /// The implementation must consider all entries after and including the specified index
+    /// The implementation must consider all entries(including volatiles) after and including the specified index
     /// as discarded. It is up to the implementation to really delete these entries or
     /// just mark them, but both latest indexes(persistent and volatile) must point to the
     /// entry preceeding the entry at `start` (this includes zero entry) at the moment
@@ -114,18 +113,27 @@ pub trait Log {
     fn discard_since(&mut self, start: LogIndex) -> Result<(), Self::Error>;
 
     /// Should read the entry at the provided log index into an entry provided by reference.
-    /// Consensus guarantees that only entries existing in the log wil be read, zero entry will
-    /// not.
-    fn read_entry(&self, index: LogIndex, dest: &mut LogEntry) -> Result<(), Self::Error>;
+    /// Must return the success of entry being filled.
+    ///
+    /// Consensus guarantees that, given the indices returned by `current_view` no attempts to read
+    /// the following will be done:
+    /// * entries after volatile(!) index
+    /// * entries before or equal to zero entry
+    ///
+    /// The function MUST return true or an error if a persisted entry is requested,
+    /// i.e. the index range of (zero_entry..latest_index]
+    /// The function MAY return false and avoid reading the not-yet-persisted entry, i.e
+    /// the index range (latest_index, latest_volatile_index]
+    fn read_entry(&self, index: LogIndex, dest: &mut LogEntry) -> Result<bool, Self::Error>;
 
-    /// Should return the metadata of the entry at the specified index. Only existing
-    /// entries will be requested, zero entry will not.
+    /// Should return the metadata of the entry at the specified index.
+    /// The same guarantees as in `read_entry` apply.
     fn entry_meta_at(&self, index: LogIndex) -> Result<LogEntryMeta, Self::Error>;
 
-    /// Must append an entry to the log. The moment of persisting entries should be decided by implementation,
-    /// but the indexes must change only after the entries are persisted leaving no gaps and keep incoming ordering.
+    /// Must append an entry to the log. The moment of persisting entries may be decided by an implementation,
+    /// but the indexes must change only after the entries are persisted leaving no gaps and keeping the incoming ordering.
     /// The consensus guarantees that no overwrites of existing entries will be requested unless
-    /// the preliminary call to discard was made. Also, consensus guarantees there will be no
+    /// the preliminary call to discard is made. Also, consensus guarantees there will be no
     /// gaps between entries, i.e. `start` will always point to the latest_volatile_index + 1.
     ///
     /// Implementations are recommended to NOT rely on any content of entries, including
@@ -153,24 +161,23 @@ pub trait Log {
     /// from this function may break the consensus.
     fn set_voted_for(&mut self, server: Option<ServerId>) -> Result<(), Self::Error>;
 
-    /// Should persist the provided configuration and its index.
-    ///
-    /// The provided values should be persisted separately from the original config entry in the log,
-    /// which may not exist there at the moment of calling (i.e. because of snapshotting).
+    /// Should return the latest saved config indices, in the same order as they were set
+    /// by set_latest_config_view. With empty log or until set_latest_config_view is called,
+    /// should return `(LogIndex(0), LogIndex(0))`.
+    fn latest_config_view(&self) -> Result<(LogIndex, LogIndex), Self::Error>;
+
+    /// Should persist the provided data about config indices.
     ///
     /// The function must be synchronous, delays or failures in persisting after returning
     /// from this function may break the consensus.
-    fn set_latest_config(
+    fn set_latest_config_view(
         &mut self,
-        config: &ConsensusConfig,
-        index: LogIndex,
+        stable: LogIndex,
+        new: LogIndex,
     ) -> Result<(), Self::Error>;
 
-    /// Should return the latest saved config entry if any.
-    fn latest_config(&self) -> Result<Option<ConsensusConfig>, Self::Error>;
-
     /// Should return the index of latest saved config entry if any.
-    fn latest_config_index(&self) -> Result<Option<LogIndex>, Self::Error>;
+    // fn latest_config_index(&self) -> Result<Option<LogIndex>, Self::Error>;
 
     /// Expected to flush all the volatile entities on disk, if any.
     ///
@@ -195,8 +202,8 @@ pub struct LogEntry {
 #[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
 pub enum LogEntryMeta {
     Empty,
-    Proposal(ClientGuarantee),
-    Config(ConsensusConfig),
+    Proposal(Urgency),
+    Config(Vec<Peer>),
 }
 
 /// Kinds of a log entry to be processed
@@ -204,15 +211,15 @@ pub enum LogEntryMeta {
 #[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
 pub enum LogEntryData {
     Empty,
-    Proposal(Bytes, ClientGuarantee),
-    Config(ConsensusConfig),
+    Proposal(Bytes, Urgency),
+    Config(Vec<Peer>),
 }
 
 impl LogEntry {
     pub fn meta(&self) -> LogEntryMeta {
         match &self.data {
             LogEntryData::Empty => LogEntryMeta::Empty,
-            LogEntryData::Proposal(_, guarantee) => LogEntryMeta::Proposal(guarantee.clone()),
+            LogEntryData::Proposal(_, urgency) => LogEntryMeta::Proposal(urgency.clone()),
             LogEntryData::Config(config) => LogEntryMeta::Config(config.clone()),
         }
     }
@@ -226,7 +233,7 @@ impl LogEntry {
         }
     }
 
-    pub fn try_config_data(&self) -> Option<ConsensusConfig> {
+    pub fn try_config_data(&self) -> Option<Vec<Peer>> {
         if let LogEntryData::Config(ref config) = self.data {
             Some(config.clone())
         } else {
@@ -250,9 +257,7 @@ impl From<LogEntry> for Entry {
             term: e.term,
             data: match e.data {
                 LogEntryData::Empty => EntryData::Noop,
-                LogEntryData::Proposal(proposal, guarantee) => {
-                    EntryData::Proposal(proposal, guarantee)
-                }
+                LogEntryData::Proposal(proposal, urgency) => EntryData::Proposal(proposal, urgency),
                 LogEntryData::Config(c) => EntryData::Config(c, false),
             },
         }
@@ -260,21 +265,21 @@ impl From<LogEntry> for Entry {
 }
 
 impl LogEntry {
-    pub fn new_empty(term: Term, data: Vec<u8>) -> Self {
+    pub fn new_empty(term: Term) -> Self {
         Self {
             term,
             data: LogEntryData::Empty,
         }
     }
 
-    pub fn new_proposal(term: Term, data: Bytes, guarantee: ClientGuarantee) -> Self {
+    pub fn new_proposal(term: Term, data: Bytes, urgency: Urgency) -> Self {
         Self {
             term,
-            data: LogEntryData::Proposal(data, guarantee),
+            data: LogEntryData::Proposal(data, urgency),
         }
     }
 
-    pub fn new_config(term: Term, config: ConsensusConfig) -> Self {
+    pub fn new_config(term: Term, config: Vec<Peer>) -> Self {
         Self {
             term,
             data: LogEntryData::Config(config),

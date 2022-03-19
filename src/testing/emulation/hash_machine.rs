@@ -1,6 +1,6 @@
 use crate::persistent_log::{Log, LogEntry};
 use crate::state_machine::{SnapshotInfo, StateMachine};
-use crate::{LogIndex, Term};
+use crate::{LogIndex, Peer, Term};
 use bytes::Bytes;
 use std::hash::Hasher;
 
@@ -43,8 +43,7 @@ pub struct HashMachine<L: Log> {
     pub pending_snapshot: [u8; 8],
     pub chunked: bool,
 
-    pub index: LogIndex,
-    pub term: Term,
+    pub info: SnapshotInfo,
     last_applied: LogIndex,
 }
 
@@ -54,8 +53,7 @@ impl<L: Log> HashMachine<L> {
             state: 0,
             current_snapshot: [0u8; 8],
             pending_snapshot: [0u8; 8],
-            index: LogIndex(0),
-            term: Term(0),
+            info: SnapshotInfo::default(),
             last_applied: LogIndex(0),
             chunked,
             log,
@@ -114,23 +112,19 @@ impl<L: Log> StateMachine for HashMachine<L> {
         if self.last_applied == LogIndex(0) {
             Ok(None)
         } else {
-            Ok(Some(SnapshotInfo {
-                index: self.index,
-                term: self.term,
-                size: 64,
-            }))
+            Ok(Some(self.info.clone()))
         }
     }
 
     fn take_snapshot(&mut self, index: LogIndex, term: Term) -> Result<(), Self::Error> {
-        self.index = index;
-        self.term = term;
+        self.info.index = index;
+        self.info.term = term;
         self.current_snapshot = self.state.to_le_bytes();
         Ok(())
     }
 
     fn read_snapshot_chunk(&self, query: Option<&[u8]>) -> Result<Vec<u8>, Self::Error> {
-        if self.index == LogIndex(0) {
+        if self.info.index == LogIndex(0) {
             return Err(Error::HashMachineError("snapshot expected"));
         };
         if self.chunked {
@@ -153,6 +147,8 @@ impl<L: Log> StateMachine for HashMachine<L> {
         &mut self,
         index: LogIndex,
         term: Term,
+        config: Option<Vec<Peer>>,
+        force: bool,
         chunk_bytes: &[u8],
     ) -> Result<Option<Vec<u8>>, Self::Error> {
         // in this test implementation we consider all hash_machines initiated
@@ -164,8 +160,13 @@ impl<L: Log> StateMachine for HashMachine<L> {
                 // 7th chunk is the last one
                 self.current_snapshot = self.pending_snapshot;
                 self.state = u64::from_le_bytes(self.current_snapshot);
-                self.index = index;
-                self.term = term;
+                self.info.index = index;
+                self.info.term = term;
+                self.info.config = if let Some(config) = config {
+                    config
+                } else {
+                    return Err(Error::HashMachineError("last chunk must contain config"));
+                };
                 self.last_applied = index;
                 Ok(None)
             } else {
@@ -176,8 +177,13 @@ impl<L: Log> StateMachine for HashMachine<L> {
                 self.current_snapshot[i] = chunk_bytes[i];
             }
             self.state = u64::from_le_bytes(self.current_snapshot);
-            self.index = index;
-            self.term = term;
+            self.info.index = index;
+            self.info.term = term;
+            self.info.config = if let Some(config) = config {
+                config
+            } else {
+                return Err(Error::HashMachineError("last chunk must contain config"));
+            };
             self.last_applied = index;
             Ok(None)
         }

@@ -18,10 +18,13 @@ pub type TestState = Raft<TestMachine, TestHandler>;
 /// An emulation of cluster of N nodes in consensus.
 /// The network is emulated using handler::TestHandler.
 /// The log in in memory, the state machine is XOR-hasher from hash_machine::HashMachine.
+/// For simplicity, TestCluster will panic on any error.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TestCluster {
     pub nodes: HashMap<ServerId, TestState>,
     pub handler: TestHandler,
+    pub chunked_machine: bool,
+    pub max_apply_cycles: usize,
     bootstrap_config: ConsensusConfig,
 }
 
@@ -29,7 +32,7 @@ impl TestCluster {
     // TODO: make a builder, move chunking and tracing level inside
     /// Create a new cluster with n nodes. HashMachine supports snapshot streaming
     /// so there is a choice to do it.
-    pub fn new(size: usize, chunked_machine: bool) -> Self {
+    pub fn new(size: usize) -> Self {
         tracing_subscriber::fmt()
             .without_time()
             .with_max_level(tracing::Level::TRACE)
@@ -46,30 +49,45 @@ impl TestCluster {
             .collect();
         let mut cluster = Self {
             nodes: HashMap::new(),
-            handler: TestHandler::new(size),
+            handler: TestHandler::new(),
+            chunked_machine: false,
+            max_apply_cycles: 16,
             bootstrap_config: ConsensusConfig::new(peers.iter().cloned()),
         };
 
         for peer in &peers {
             tracing::trace_span!("node", id = ?peer.id);
-            cluster.add_node(peer.id, chunked_machine);
+            cluster.add_node(peer.id);
         }
         cluster
     }
 
-    /// Add or replace a freshly created cluster node with empty log.
+    /// Add or replace a freshly created cluster node with empty log and start it.
+    /// The bootstrap config of the node will be the same as the cluster
+    /// was created with, i.e. will not include the node itself.
+    ///
     /// This function only adds the node without changing cluster configutation
-    /// on existing nodes or givning commands to them.
-    pub fn add_node(&mut self, id: ServerId, chunked_machine: bool) {
+    /// on existing nodes or giving commands to them.
+    pub fn add_node(&mut self, id: ServerId) {
         let store = MemLog::new();
-        let machine = HashMachine::new(store, chunked_machine);
+        let machine = HashMachine::new(store, self.chunked_machine);
 
         let mut builder = RaftBuilder::new(id, machine);
         builder.with_bootstrap_config(self.bootstrap_config.clone());
 
+        self.handler.add_node(id);
+
         self.handler.cur = id;
         let consensus = builder.start(&mut self.handler).unwrap();
         self.nodes.insert(id, consensus);
+    }
+
+    pub fn add_client(&mut self, id: ClientId) {
+        self.handler.add_client(id)
+    }
+
+    pub fn add_admin(&mut self, id: AdminId) {
+        self.handler.add_admin(id)
     }
 
     /// start the consensus and  make everyone elect a leader
@@ -146,6 +164,7 @@ impl TestCluster {
     /// receivers. Repeat until there is no packets left.
     pub fn apply_peer_packets(&mut self) {
         trace!(n = self.handler.peer_net_len(), "applying packets");
+        let mut cycles_left = self.max_apply_cycles;
         while self.handler.peer_net_len() > 0 {
             let mut actions = Vec::new();
             for ((from, to), queue) in &mut self.handler.peer_network {
@@ -155,6 +174,11 @@ impl TestCluster {
             }
             while let Some(action) = actions.pop() {
                 self.apply_action(action)
+            }
+            cycles_left -= 1;
+            if cycles_left == 0 {
+                trace!("possible cycle detected, stopping");
+                break;
             }
         }
     }
@@ -175,6 +199,14 @@ impl TestCluster {
         while let Some(action) = actions.pop() {
             self.apply_action(action)
         }
+    }
+
+    pub fn apply_client_request(&mut self, from: ClientId, to: ServerId, request: ClientMessage) {
+        self.apply_action(Action::Client(from, to, request))
+    }
+
+    pub fn apply_admin_request(&mut self, from: AdminId, to: ServerId, request: AdminMessage) {
+        self.apply_action(Action::Admin(from, to, request))
     }
 
     /// Call the compaction procedure on the specified nodes
@@ -222,11 +254,11 @@ impl TestCluster {
     pub fn assert_log_condition(&mut self) {
         for (id, node) in &mut self.nodes {
             let log = node.log().unwrap();
-            let latest = log.latest_index().unwrap();
+            let latest = log.current_view().unwrap().1;
             trace!("id={} log latest {}", id, latest);
             for index in 1..(latest.as_u64() + 1) {
                 let mut log_entry =
-                    LogEntry::new_proposal(Term(0), Bytes::new(), ClientGuarantee::default());
+                    LogEntry::new_proposal(Term(0), Bytes::new(), Urgency::default());
                 log.read_entry(LogIndex(index), &mut log_entry).unwrap();
                 trace!("id={} entry {:?}", id, log_entry);
             }

@@ -1,12 +1,12 @@
 use std::cmp;
 use std::marker::PhantomData;
 
-use crate::error::*;
+use crate::{debug_where, error::*, ConsensusConfig};
 use tracing::{debug, info, trace, warn};
 
 use crate::handler::Handler;
 use crate::message::*;
-use crate::persistent_log::{Log, LogEntryMeta};
+use crate::persistent_log::{Log, LogEntry, LogEntryData, LogEntryMeta};
 use crate::raft::CurrentState;
 use crate::state::State;
 use crate::state_impl::StateImpl;
@@ -157,18 +157,13 @@ where
             return Ok((PeerMessage::InstallSnapshotResponse(message), self.into()));
         }
 
-        if let Some(ref last_config) = request.last_config {
-            self.log_mut()
-                .set_latest_config(last_config, request.snapshot_index)
-                .map_err(|e| Error::Critical(CriticalError::PersistentLogWrite(Box::new(e))))?;
-            self.config = last_config.clone();
-        }
-
         let next_chunk_request = self
             .state_machine
             .write_snapshot_chunk(
                 request.snapshot_index,
                 request.snapshot_term,
+                request.last_config,
+                request.force_reset,
                 &request.chunk_data,
             )
             .map_err(|e| Error::Critical(CriticalError::StateMachine(Box::new(e))))?;
@@ -177,20 +172,105 @@ where
             // the follower has finished writing the last chunk of a snapshot
             // we don't need old records in log now
             self.log_mut()
-                .compact_until(request.snapshot_index, request.snapshot_term)
+                .discard_until(request.snapshot_index, request.snapshot_term)
                 .map_err(|e| Error::Critical(CriticalError::PersistentLogWrite(Box::new(e))))?;
-            // we also do not need a new ones, if there are any, including the one
-            // in the snapshot
-            if self.latest_log_index()? > request.snapshot_index {
-                self.log_mut()
-                    .discard_since(request.snapshot_index + 1)
-                    .map_err(|e| Error::Critical(CriticalError::PersistentLogWrite(Box::new(e))))?;
+
+            if request.force_reset {
+                // if leader requested us to make a full reset (for example, leader sees us as a bad
+                // follower) we also have to discard all new entries too, if there are any
+                if self.latest_log_index > request.snapshot_index {
+                    self.log_mut()
+                        .discard_since(request.snapshot_index + 1)
+                        .map_err(|e| {
+                            Error::Critical(CriticalError::PersistentLogWrite(Box::new(e)))
+                        })?;
+                }
+                if let Some(last_config) = request.last_config {
+                    // on reset apply config from snapshot without any checks
+                    self.config = ConsensusConfig::new(last_config.into_iter());
+                    self.log_mut()
+                        .set_latest_config_view(request.snapshot_index, LogIndex(0))
+                        .map_err(|e| {
+                            Error::Critical(CriticalError::PersistentLogWrite(Box::new(e)))
+                        })?;
+                }
+                self.latest_config_index = LogIndex(0);
+            } else {
+                // We've received tha last chunk of snapshot, and leader doesn't want us to reset it.
+                //
+                // State machine is allowed to not accept a snapshot if reset was not required,
+                // which means we need to update the snapshot status first
+                let info = self
+                    .state_machine
+                    .snapshot_info()
+                    .map_err(|e| Error::Critical(CriticalError::StateMachine(Box::new(e))))?;
+                let (committed_config_index, pending_config_index) = self
+                    .log()
+                    .latest_config_view()
+                    .map_err(|e| Error::PersistentLogRead(Box::new(e)))?;
+                let current_config_index = self.latest_config_index;
+                let (new_committed_config_index, new_pending_config_index) = if let Some(info) =
+                    info
+                {
+                    // if there is any snapshot available, check if current config
+                    // indices were replaced by the latest write
+                    if committed_config_index != LogIndex(0) {
+                        // check our own config indices after log cutting
+
+                        // all our configs are deprecated by snapshot
+                        if committed_config_index < info.index && pending_config_index < info.index
+                        {
+                            (info.index, info.index)
+                        } else if committed_config_index < info.index {
+                            // only committed config is replaced by snapshot
+                            (info.index, pending_config_index)
+                        } else {
+                            // nothing is replaced by snapshot
+                            (committed_config_index, pending_config_index)
+                        }
+                    } else {
+                        // we had no config index set, but we may have a pending one
+                        if committed_config_index != pending_config_index {
+                            (info.index, pending_config_index)
+                        } else {
+                            // none of config indices was wet
+                            (info.index, info.index)
+                        }
+                    }
+                } else {
+                    // without config in snapshot leave everything as is
+                    (committed_config_index, pending_config_index)
+                };
+                if new_pending_config_index <= self.latest_log_index {
+                    self.latest_config_index = new_pending_config_index;
+                } else {
+                    self.latest_config_index = new_committed_config_index;
+                }
+
+                if committed_config_index != new_committed_config_index
+                    || pending_config_index != new_pending_config_index
+                {
+                    // save new indices to log if snapshot have changed them
+                    self.log_mut()
+                        .set_latest_config_view(
+                            new_committed_config_index,
+                            new_pending_config_index,
+                        )
+                        .map_err(|e| {
+                            Error::Critical(CriticalError::PersistentLogWrite(Box::new(e)))
+                        })?;
+                }
+
+                if current_config_index != self.latest_config_index {
+                    self.update_latest_config(info.as_ref().map(|info| info.config.as_slice()))?;
+                }
             }
+
             debug!(
                 snapshot_index = %request.snapshot_index,
                 snapshot_term = %request.snapshot_term,
-                zero_log_index = %self.zero_log_index()?,
-                latest_log_index = %self.latest_log_index()?,
+                zero_log_index = %self.zero_log_index,
+                latest_log_index = %self.latest_log_index,
                 "follower finished receiving snapshot"
             );
         }
@@ -359,6 +439,26 @@ where
     fn client_timeout(&mut self, _handler: &mut H) -> Result<(), Error> {
         Ok(())
     }
+
+    fn on_any_event(&mut self) -> Result<(), Error> {
+        self.common_on_any_event()?;
+        //if self.latest_log_index < self.commit_index {
+        // this is a rare, but possible situation:
+        // we are catching up, our commit index was taken from leader, when
+        // leader sent some entries.
+        // At the time of this function call some or all of these entries
+        // have been persisted in background.
+        // This may mean that we have some persistent entries, ready to be applied, but
+        // not applied yet. Without this check they will only be applied
+        // after receiving a packet from the leader. But if we have an external tick,
+        // we may do it earlier, making load a bit more distributed
+        // (This is commented, because the current tick(heartbeat timer) is almost the same interval
+        // as leader's ping. Furthermore, somebody may prefer a batched state machine applies
+        // because this may be faster in some cases)
+        //self.apply_follower_commits()?;
+        //}
+        Ok(())
+    }
 }
 
 impl<M, H> State<M, H, Follower>
@@ -366,6 +466,79 @@ where
     M: StateMachine,
     H: Handler,
 {
+    pub(crate) fn initialize(mut self, handler: &mut H) -> Result<CurrentState<M, H>, Error> {
+        self.update_log_view()?;
+
+        let (latest_config_index, pending_config_index) = self
+            .log()
+            .latest_config_view()
+            .map_err(|e| Error::PersistentLogRead(Box::new(e)))?;
+
+        // Pending config may still be in view, even after restart.
+        // Though our active config must be persisted
+        let actual_config_index = if pending_config_index != LogIndex(0)
+            && pending_config_index <= self.latest_log_index
+        {
+            pending_config_index
+        } else if latest_config_index != LogIndex(0) {
+            self.latest_config_index = latest_config_index;
+            latest_config_index
+        } else {
+            LogIndex(0)
+        };
+
+        if actual_config_index != LogIndex(0) {
+            let mut config_entry = LogEntry::default();
+            if
+            // try reading log from index that is probably volatile
+            !self
+                .log()
+                .read_entry(actual_config_index, &mut config_entry)
+                .map_err(|e| Error::PersistentLogRead(Box::new(e)))?
+            {
+                // reading volatile may not give success, in that case, try reading the
+                // entry that must be persistent
+                if !self
+                    .log()
+                    .read_entry(latest_config_index, &mut config_entry)
+                    .map_err(|e| Error::PersistentLogRead(Box::new(e)))?
+                {
+                    return Err(Error::Critical(CriticalError::FollowerLogBroken(
+                        latest_config_index,
+                        "log refused to read persisted config entry",
+                    )));
+                }
+            }
+
+            if let LogEntryData::Config(peers) = config_entry.data {
+                self.config = ConsensusConfig::new(peers.into_iter());
+            } else {
+                return Err(Error::Critical(CriticalError::LogInconsistentEntry(
+                    actual_config_index,
+                )));
+            }
+        } // else -> use bootstrap config which is already in self.config
+
+        // out voting status is determined by the presence of our id in
+        // active config
+        self.state_data.can_vote =
+            self.config.has_peer(self.id) || self.config.has_pending_peer(self.id);
+
+        if self.state_data.can_vote {
+            handler.set_timeout(Timeout::Election);
+        }
+
+        let info = self
+            .state_machine
+            .snapshot_info()
+            .map_err(|e| Error::Critical(CriticalError::StateMachine(Box::new(e))))?;
+        if let Some(info) = info {
+            self.min_index = info.index;
+        }
+
+        Ok(self.into_consensus_state())
+    }
+
     pub(crate) fn append_entries(
         &mut self,
         request: AppendEntriesRequest,
@@ -373,6 +546,7 @@ where
     ) -> Result<AppendEntriesResponse, Error> {
         let leader_term = request.term;
         if current_term < leader_term {
+            // always set the current term from the leader
             self.log_mut()
                 .set_current_term(leader_term)
                 .map_err(|e| Error::Critical(CriticalError::PersistentLogWrite(Box::new(e))))?;
@@ -382,23 +556,21 @@ where
         let leader_prev_log_term = request.prev_log_term;
         let current_term = self.current_term()?;
 
-        let latest_log_index = self.latest_log_index()?;
-        let latest_volatile_log_index = self.latest_volatile_log_index()?;
-        let zero_log_index = self.zero_log_index()?;
-
         // Check for gaps and possibility to find the corresponding entry in term
-        if latest_log_index < leader_prev_log_index || leader_prev_log_index < zero_log_index {
+        if self.latest_log_index < leader_prev_log_index
+            || leader_prev_log_index < self.zero_log_index
+        {
             trace!(
                 leader_prev_log_index = %leader_prev_log_index,
-                zero_log_index = %zero_log_index,
-                latest_log_index = %latest_log_index,
+                zero_log_index = %self.zero_log_index,
+                latest_log_index = %self.latest_log_index,
                 "leader sent prev_entry not in follower's log",
             );
             // If the previous entries index was not the same we would leave a gap.
             return Ok(AppendEntriesResponse::InconsistentPrevEntry(
                 current_term,
-                latest_log_index,
-                latest_volatile_log_index,
+                self.latest_log_index,
+                self.latest_volatile_log_index,
             ));
         }
 
@@ -414,8 +586,9 @@ where
         if existing_term != leader_prev_log_term {
             // An existing entry conflicts with a new one (same index but different terms):
             // we have to delete the existing entries after AND INCLUDING the zero entry
-            // LogIndex(0) is not possible here because term will always be 0
-            if leader_prev_log_index == zero_log_index && leader_prev_log_term != existing_term {
+            // LogIndex(0) is not possible here because term will always match (equal to Term(0))
+            if leader_prev_log_index == self.zero_log_index && leader_prev_log_term != existing_term
+            {
                 // something really bad happened: most probably local snapshot was broken
                 // why: because in good scenario the same indexes must match the terms on
                 // leader and follower
@@ -427,16 +600,16 @@ where
                     .snapshot_info()
                     .map_err(|e| Error::Critical(CriticalError::StateMachine(Box::new(e))))?;
                 if let Some(info) = info {
-                    if info.index != zero_log_index || info.term != existing_term {
+                    if info.index != self.zero_log_index || info.term != existing_term {
                         // just not matching ths snapshot witht the index is fixable by resetting the log
                         warn!(
-                            local_zero_index = %zero_log_index,
+                            local_zero_index = %self.zero_log_index,
                             local_zero_term = %existing_term,
                             snapshot_index = %info.index,
                             snapshot_term = %info.term,
                             "follower snapshot is out of sync with state machine");
                         self.log_mut()
-                            .compact_until(info.index, info.term)
+                            .discard_until(info.index, info.term)
                             .map_err(|e| {
                                 Error::Critical(CriticalError::PersistentLogWrite(Box::new(e)))
                             })?;
@@ -446,7 +619,7 @@ where
                         // earlier entries
                         // TODO maybe ask for snapshot explicitly
                         warn!(
-                            local_zero_index = %zero_log_index,
+                            local_zero_index = %self.zero_log_index,
                             local_zero_term = %existing_term,
                             leadev_prev_index = %leader_prev_log_index,
                             leader_prev_term = %leader_prev_log_term,
@@ -459,7 +632,7 @@ where
                     }
                 } else {
                     trace!(
-                            local_zero_index = %zero_log_index,
+                            local_zero_index = %self.zero_log_index,
                             local_zero_term = %existing_term,
                             "follower snapshot is absent");
                     // we are at index != LogIndex(0), but there is no snapshot:
@@ -468,24 +641,29 @@ where
                 }
             }
 
-            trace!(%existing_term, %leader_prev_log_term);
-            if leader_prev_log_index == zero_log_index && latest_log_index != zero_log_index {
+            trace!(?existing_term, ?leader_prev_log_term);
+            if leader_prev_log_index == self.zero_log_index
+                && self.latest_log_index != self.zero_log_index
+            {
                 // if log needs to be completely discarded and contains any entries after zero entry
                 self.log_mut()
                     .discard_since(leader_prev_log_index + 1)
                     .map_err(|e| Error::Critical(CriticalError::PersistentLogWrite(Box::new(e))))?;
-            } else if latest_log_index != zero_log_index {
-
+            } else if self.latest_log_index != self.zero_log_index {
+                todo!("partial discard of follower log");
                 // if log needs to be discarded, but not completely,
             };
 
-            let new_latest_log_index = self.latest_log_index()?;
+            let (_, new_latest_log_index, new_latest_volatile_log_index) = self
+                .log()
+                .current_view()
+                .map_err(|e| Error::PersistentLogRead(Box::new(e)))?;
             // since the entry at prev_log_index was not sent, we cannot work with
             // all other entries without gap, this is bad, but this is life :(
             return Ok(AppendEntriesResponse::InconsistentPrevEntry(
                 current_term,
                 new_latest_log_index,
-                latest_volatile_log_index,
+                new_latest_volatile_log_index,
             ));
         }
 
@@ -510,20 +688,23 @@ where
         let append_index = leader_prev_log_index + 1;
 
         // for a heartbeat request appending entries may be skipped,
-        // but all other check and actions MUST be performed
+        // but all other check and actions laying afterwards still has be performed
         // because due to Raft's nature the follower's state machine(not log though) is always 1 commit behind the leader
         // until it receives the next AppendEntries message, be it heartbeat or whatever else
+        let mut updated_config_index = None;
         if entries.len() > 0 {
             let mut log_entries = Vec::with_capacity(entries.len());
+            let mut entry_index = append_index;
             for entry in entries.into_iter() {
                 // with each send, leader marks config entries as active if they really take place
                 // as current cluster configuration, this way the follower can skip using previous
                 // inactive entries as actual ones and will not connect to some old nodes
                 if let EntryData::Config(config, is_active) = &entry.data {
                     if *is_active {
-                        self.config = config.clone();
+                        updated_config_index = Some(entry_index);
                     }
                 }
+                entry_index = entry_index + 1;
 
                 log_entries.push(entry.into());
             }
@@ -532,25 +713,41 @@ where
             self.log_mut()
                 .append_entries(append_index, &log_entries)
                 .map_err(|e| Error::Critical(CriticalError::PersistentLogWrite(Box::new(e))))?;
-            self.min_index = new_latest_log_index;
+            self.update_log_view()?;
+            self.min_index = self.latest_log_index;
         }
 
-        // We are matching the leader's log up to and including `new_latest_log_index`.
-        self.commit_index = cmp::min(request.leader_commit, new_latest_log_index);
+        // We are matching the leader's log up to and including self.latest_log_index, which
+        // may have been moved forward after appending
+        self.commit_index = cmp::min(request.leader_commit, self.latest_log_index);
         self.apply_follower_commits()?;
 
-        // re-read latest_log_index to consider some those that may be applied after
-        // the last append
-        let latest_log_index = self.latest_log_index()?;
-        let latest_volatile_log_index = self
-            .log()
-            .latest_volatile_index()
-            .map_err(|e| Error::PersistentLogRead(Box::new(e)))?;
+        // we should only work with configs after we've moved our commit index
+        // because our current config may have become committed at this point
+        if let Some(updated_config_index) = updated_config_index {
+            // persist new index as latest, make previous index become previous
+            if self.latest_config_index > self.commit_index {
+                // self.latest_config_index MUST be committed at this point
+                // otherwise this is an error: new config cannot come until
+                // the previous one is committed
+                return Err(Error::unreachable(debug_where!()));
+            }
+            self.log_mut()
+                .set_latest_config_view(self.latest_config_index, updated_config_index)
+                .map_err(|e| Error::Critical(CriticalError::PersistentLogWrite(Box::new(e))))?;
+
+            self.latest_config_index = updated_config_index;
+
+            // Now, there is a case where the new config comes into view already,
+            // for example if append_entries was synchronous.
+            // This will be checked on the next event and does not affect
+            // us because we only should answer to the same leader we received AppendEntries from
+        }
 
         Ok(AppendEntriesResponse::Success(
             current_term,
-            latest_log_index,
-            latest_volatile_log_index,
+            self.latest_log_index,
+            self.latest_volatile_log_index,
         ))
     }
 
@@ -580,10 +777,6 @@ where
                 .log()
                 .entry_meta_at(entry_index)
                 .map_err(|e| Error::PersistentLogRead(Box::new(e)))?;
-            //     let mut entry = LogEntry::default();
-            //self.log
-            //.read_entry(self.last_applied, &mut entry)
-            //         .map_err(|e| Error::PersistentLogRead(Box::new(e)))?;
 
             match entry_kind {
                 LogEntryMeta::Empty => {
@@ -600,13 +793,25 @@ where
                     self.state_machine
                         .apply(entry_index, false)
                         .map_err(|e| Error::Critical(CriticalError::StateMachine(Box::new(e))))?;
-                    // we only saved configuration to log(an an entry) and memory, but has not persisted it yet
-                    // this is what we have to do now
-                    self.log_mut()
-                        .set_latest_config(&config, entry_index)
-                        .map_err(|e| {
-                            Error::Critical(CriticalError::PersistentLogWrite(Box::new(e)))
-                        })?;
+
+                    // applying a config entry means the config probably was a pending one
+                    // we detect this by checking current indices
+                    if entry_index == self.latest_config_index {
+                        // this entry was a pending config, so we:
+                        // make our in-memory config non-pending
+                        self.config.commit_pending();
+
+                        // commit updated indices to log, setting both of them to the index
+                        // of current entry
+                        self.log_mut()
+                            .set_latest_config_view(
+                                self.latest_config_index,
+                                self.latest_config_index,
+                            )
+                            .map_err(|e| {
+                                Error::Critical(CriticalError::PersistentLogWrite(Box::new(e)))
+                            })?;
+                    }
                 }
             }
         }
@@ -619,7 +824,7 @@ where
         handler: &mut H,
         voluntary: bool,
     ) -> Result<State<M, H, Candidate>, Error> {
-        trace!("id={} transitioning to candidate", self.id);
+        trace!("transitioning to candidate");
         let state_data = Candidate::new();
         let mut candidate = State {
             id: self.id,
@@ -630,6 +835,10 @@ where
             _h: PhantomData,
             state_data,
             options: self.options,
+            zero_log_index: self.zero_log_index,
+            latest_log_index: self.latest_log_index,
+            latest_volatile_log_index: self.latest_volatile_log_index,
+            latest_config_index: self.latest_config_index,
         };
 
         handler.state_changed(ConsensusState::Follower, ConsensusState::Candidate);
@@ -653,11 +862,11 @@ pub struct Follower {
 
 impl Follower {
     /// Returns a new `FollowerState`.
-    pub(crate) fn new(can_vote: bool) -> Follower {
+    pub(crate) fn new() -> Follower {
         Follower {
             leader: None,
             delayed_vote_request: None,
-            can_vote,
+            can_vote: false,
         }
     }
 

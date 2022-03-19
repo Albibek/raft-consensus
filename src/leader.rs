@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 
 use crate::debug_where;
 use crate::error::*;
@@ -20,7 +20,10 @@ use crate::state_machine::StateMachine;
 use bytes::Bytes;
 use tracing::{debug, info, trace};
 
-static MAX_ROUNDS: u32 = 10;
+const MAX_ROUNDS: u32 = 10;
+const MAX_TOTAL_TIMEOUTS: u32 = 20;
+const MAX_SNAPSHOT_TIMEOUTS: u32 = 10;
+const MAX_ENTRIES_TIMEOUTS: u32 = 10;
 
 impl<M, H> StateImpl<M, H> for State<M, H, Leader>
 where
@@ -65,7 +68,11 @@ where
         response: AppendEntriesResponse,
     ) -> Result<(Option<PeerMessage>, CurrentState<M, H>), Error> {
         let current_term = self.current_term()?;
-        let local_latest_log_index = self.latest_log_index()?;
+        let local_latest_log_index = self.latest_log_index;
+
+        // peer successfully received last AppendEntries, consider it alive and running
+        // within current election timeout
+        self.state_data.mark_alive(from);
 
         // First, check if the response is from the correct term
         // and is not some error
@@ -107,16 +114,13 @@ where
                 follower_last_index,
                 follower_volatile_index,
             ) => {
-                self.state_data.set_match_index(from, follower_last_index);
-                self.state_data
-                    .set_next_index(from, follower_volatile_index + 1)?;
                 let message = self.next_entries_or_snapshot(
                     handler,
                     from,
+                    follower_last_index,
+                    follower_volatile_index,
                     current_term,
-                    local_latest_log_index,
                 )?;
-                trace!("follower behind: {:?}", message);
                 Ok((message, self.into()))
             }
             AppendEntriesResponse::Success(
@@ -124,15 +128,12 @@ where
                 follower_latest_log_index,
                 follower_latest_volatile_log_index,
             ) => {
-                // peer successfully received last AppendEntries, consider it alive and running
-                // within current election timeout
-                self.state_data.peers_alive.insert(from);
                 trace!(
                     follower_latest_log_index = %follower_latest_log_index,
                     local_latest_log_index = %local_latest_log_index,
                     "follower responded success, checking next entry"
                 );
-                if follower_latest_log_index > local_latest_log_index {
+                if follower_latest_volatile_log_index > self.latest_volatile_log_index {
                     // some follower has too high index in it's log
                     // it can only happen by mistake or incorrect log on a follower
                     // we only can report such follower and let the caller process the error
@@ -142,50 +143,101 @@ where
                     return Err(Error::BadFollowerIndex);
                 }
 
-                // catching up node will be handled inside the function
-                self.state_data
-                    .set_match_index(from, follower_latest_log_index);
-                self.state_data
-                    .set_next_index(from, follower_latest_volatile_log_index + 1)?;
+                // now we need the following things considering follower status
 
-                if self.state_data.has_follower(&from) {
-                    // advance commit only if response was from follower
-                    let (step_down_required, instant_commit) =
-                        self.try_advance_commit_index(handler)?;
+                // for everyone:
+                //  * update their indices in the state
+                //  * decide what message should be next for the follower
 
-                    if instant_commit {
-                        // client requested the data to be committed on all the followers
-                        // as soon as possible, so we need to send them either a
-                        // ping message or the next entries without waiting for the heartbeat timeout
-                        //
-                        // if we send the next entries, the commit may become delayed
-                        // because of follower will start trying to write them into the log
-                        // so we should prefer the ping message
-                        //
-                        // after the ping the leader will receive the responses
-                        // so the next entries will anyways be sent shortly after one
-                        // network round-robin
-                        // TODO: decide if the appendEntries or some special packet (like
-                        // LeaderCommit) should be sent here, because it does
-                        // not request replying and only needs follower to
-                        // try moving it's commit index
+                // regardless of the follower type: update the indices metadata
+                // in the leader state
+                let new_commit_index = self.update_follower_indices(
+                    from,
+                    follower_latest_volatile_log_index + 1,
+                    follower_latest_log_index,
+                );
 
-                        for id in &self.state_data.peers_alive {
-                            let heartbeat = self.new_heartbeat_request(&id)?;
-                            handler.send_peer_message(
-                                *id,
-                                PeerMessage::AppendEntriesRequest(heartbeat),
-                            );
+                // we match to make sure we process all possible follower states
+                match self.state_data.follower_status_kind(from) {
+                    FollowerStatusKind::Voter => {
+                        // having None in new_commit_index is unreachable because of check
+                        // of follower existence in follower_status_kind
+                        let new_commit_index =
+                            new_commit_index.ok_or(Error::unreachable(debug_where!()))?;
+                        if new_commit_index != self.commit_index {
+                            // if commit index has changed: let the persistence layer know
+                            // that the range can be applied
+                            let (instant_commit, step_down_required) = self.apply_commits(
+                                self.commit_index,
+                                new_commit_index,
+                                &mut handler,
+                            )?;
+                            self.commit_index = new_commit_index;
+                            // At this point no commits is guaranteed because state machine may be
+                            // async. BUT: we count majority considering all the followers, not
+                            // only the leader, so the commit on leader's local state machine is
+                            // not required to be persisted for majority of the cluster to proceed.
+
+                            if instant_commit {
+                                // client requested the data to be committed on all the followers
+                                // as soon as possible, so we need to send them either a
+                                // ping message or the next entries without waiting for the heartbeat timeout
+                                //
+                                // if we send the next entries, the commit may become delayed
+                                // because of delays on reading the log on leader along with
+                                // the follower, which will try to write them into the log before
+                                // sending the confirmation so we should prefer the ping message
+                                //
+                                // after the ping the leader will receive the responses
+                                // so the next entries will anyways be sent shortly after one
+                                // network round-robin
+                                // TODO: in future the appendEntries may be replaced with some special packet (like
+                                // LeaderCommit) which may be shorter since it does
+                                // not require replying and only intended for follower to
+                                // try moving its commit index
+
+                                for id in self.state_data.iter_alive() {
+                                    let heartbeat = self.new_heartbeat_request(&id)?;
+                                    handler.send_peer_message(
+                                        id,
+                                        PeerMessage::AppendEntriesRequest(heartbeat),
+                                    );
+                                }
+                            }
+                            if step_down_required {
+                                trace!(
+                                    "latest configuration change required the leader to step down"
+                                );
+                                // become follower that will instantly become candidate on timeout
+                                let new_state = self.leader_into_follower(handler, current_term)?;
+                                Ok((None, new_state.timeout_now(handler)?))
+                            } else {
+                                let message =
+                                    self.next_entries_or_snapshot(handler, from, current_term)?;
+                                Ok((message, self.into()))
+                            }
+                        } else {
+                            // commit index did not change
+                            let message =
+                                self.next_entries_or_snapshot(handler, from, current_term)?;
+                            Ok((message, self.into()))
                         }
                     }
 
-                    if step_down_required {
-                        trace!("latest configuration change required the leader to step down");
-                        // become follower that will instantly become candidate on timeout
-                        let new_state = self.leader_into_follower(handler, current_term)?;
-                        Ok((None, new_state.timeout_now(handler)?))
-                    } else {
-                        let message = self.next_entries_or_snapshot(
+                    FollowerStatusKind::CatchingUp => {
+                        // for any catching up state: update the rounds and see if
+                        // the follower is the one that caught up now
+                        // if it is:
+                        // * for voting followers: initiate the configuration change
+                        // * for non-voting followers: update follower state to NonVoter
+
+                        trace!(
+                            "follower is catching up: {:?}",
+                            self.state_data.config_change
+                        );
+                        // For the catching up node, receiving a number of entries means it
+                        // has made some progress,
+                        let message = self.check_catch_up_status(
                             handler,
                             from,
                             current_term,
@@ -193,18 +245,26 @@ where
                         )?;
                         Ok((message, self.into()))
                     }
-                } else if self.state_data.is_catching_up(from) {
-                    // For the catching up node, receiving a number of entries means it
-                    // has made some progress,
-                    let message = self.check_catch_up_status(
-                        handler,
-                        from,
-                        current_term,
-                        local_latest_log_index,
-                    )?;
-                    Ok((message, self.into()))
-                } else {
-                    Err(Error::UnknownPeer(from.clone()))
+                    FollowerStatusKind::NonVoter => {
+                        // for non-voting followers nothing is required except the next packet
+                        let message = self.next_entries_or_snapshot(handler, from, current_term)?;
+                        Ok((message, self.into()))
+                    }
+                    FollowerStatusKind::Unknown => {
+                        trace!(
+                            id = ?from,
+                            "ignored success response from unknown peer"
+                        );
+                        Ok((None, self.into()))
+                        // TODO: think if we should return error here
+                        // since it's recoverable there is only a small difference between
+                        // giving a debug message ourselves or let the caller know the
+                        // peer is "strange"
+                        // Since the peer is not always invalid (may be a delayed package for example)
+                        // the caller may be confused with the error and break consensus just
+                        // by not processing the return value properly
+                        //Err(Error::UnknownPeer(from.clone()))
+                    }
                 }
             }
         }
@@ -315,7 +375,7 @@ where
         response: InstallSnapshotResponse,
     ) -> Result<(Option<PeerMessage>, CurrentState<M, H>), Error> {
         let current_term = self.current_term()?;
-        let local_latest_log_index = self.latest_log_index()?;
+        let local_latest_log_index = self.latest_log_index;
 
         // we receive this when some node had received InstallSnapshotRequest
         match response {
@@ -351,7 +411,7 @@ where
                 next_chunk_request,
             ) => {
                 // don't waste state machine resources on unknown peers
-                if !self.state_data.has_follower(&from) && !self.state_data.is_catching_up(from) {
+                if !self.state_data.has_any_follower(from) {
                     return Err(Error::UnknownPeer(from));
                 }
 
@@ -375,8 +435,8 @@ where
                         Ok((message, _info)) => {
                             // this behaviour is same for catching-up and follower nodes
                             // and means there are more snapshots to send
-                            if self.state_data.is_catching_up(from) {
-                                self.state_data.update_rounds()?;
+                            if self.state_data.is_catching_up(from)? {
+                                self.state_data.update_rounds(from)?;
                             }
                             return Ok((
                                 Some(PeerMessage::InstallSnapshotRequest(message)),
@@ -389,39 +449,27 @@ where
                     }
                 }
 
-                // Receiving None  from the follower OR from the read_next_chunk
-                // means the follower is done with the snapshot and log entries can be sent now.
-                // So we clean the snapshot status and set the follower's index,
-                // which should be after the snapshot
-                //
-                // the next_entries_or_snapshot will now be able to correctly
-                // determine, if another snapshot or AppendEntriesRequest should be sent
-                self.state_data.pending_snapshots.remove(&from);
+                // Receiving None from the follower OR from the read_next_chunk
+                // means the follower has received the last chunk of the snapshot.
+                // Even if the snapshot is not applied on the follower, we clear the status
+                // because the leader is using this flag only for its own local snapshot "soft-locking".
+                self.state_data.clear_pending_snapshot(&from);
 
-                // This will update data for the state on both follower types - regular and cathing
-                // up
-                self.state_data
-                    .set_next_index(from, follower_snapshot_index + 1)?;
-                if self.state_data.has_follower(&from) {
-                    // Snapshots are only taken using commit index,
-                    // so advancing an index on a single follower cannot change
-                    // majority and advance index on the whole consensus.
-                    // This means we don't need to call try_advance_commit_index,
-                    // but we need to save the follower status to the state
-                    self.state_data
-                        .set_match_index(from, follower_snapshot_index);
-
-                    Ok((
-                        self.next_entries_or_snapshot(
-                            handler,
-                            from,
-                            current_term,
-                            local_latest_log_index,
-                        )?,
-                        self.into(),
-                    ))
-                } else if self.state_data.is_catching_up(from) {
-                    // this function includes checking the snapshot state
+                // If snapshot was done at some other index, we expect the follower
+                // to re-read them from the state machine and put in the response
+                // This will mean we have the actual values we can update locally
+                // Since snapshots are only taken using commit index or lower,
+                // advancing an index on a single follower cannot advance index of the
+                // consensus. This means there is no need to call try_advance_commit_index,
+                // but the follower matching status has to be saved.
+                self.state_data.update_follower_indices(
+                    from,
+                    follower_snapshot_index + 1,
+                    follower_snapshot_index,
+                )?;
+                // Now, if the follower was a catching-up future voter,
+                // check and update its state first
+                if self.state_data.is_catching_up(from)? {
                     let message = self.check_catch_up_status(
                         handler,
                         from,
@@ -430,7 +478,10 @@ where
                     )?;
                     Ok((message, self.into()))
                 } else {
-                    Err(Error::unreachable(module_path!()))
+                    Ok((
+                        self.next_entries_or_snapshot(handler, from, current_term)?,
+                        self.into(),
+                    ))
                 }
             }
         }
@@ -439,7 +490,8 @@ where
     // Timeout handling
     fn heartbeat_timeout(&mut self, peer: ServerId) -> Result<AppendEntriesRequest, Error> {
         debug!("heartbeat timeout for peer: {}", peer);
-        self.state_data.peers_alive.remove(&peer);
+        self.state_data.forget_alive(peer);
+        self.state_data.decrease_timeout(peer);
         self.new_heartbeat_request(&peer)
     }
 
@@ -454,7 +506,9 @@ where
                 self.state_data.reset_config_change(handler);
             }
         }
-        if self.state_data.peers_alive.len() < self.config.majority(self.id) {
+        // for solitary consensus the count(=1) will be equal to majority(=1), so
+        // the step down will not be performed
+        if self.state_data.alive_voters_count() < self.config.majority() {
             debug!("leader did not receive enough responses from followers, stepping down to avoid stale leadership");
             let term = self.current_term()?;
             Ok(CurrentState::Follower(
@@ -480,13 +534,13 @@ where
 
         // with pending snapshots, but without forcing - do not request it, hoping
         // slow followers will catch up
-        if !force && !self.state_data.pending_snapshots.is_empty() {
+        if !force && self.state_data.have_pending_snapshots() {
             trace!("not taking snapshot because leader has snapshots pending and snapshot was not forced");
             return Ok(false);
         }
 
-        // without pending snapshots there is not problem: just do it regardless of forcing
-        if !self.state_data.pending_snapshots.is_empty() {
+        // without pending snapshots there is no problem: just do the snapshot regardless of forcing
+        if self.state_data.have_pending_snapshots() {
             return self.common_check_compaction(force);
         }
 
@@ -497,7 +551,7 @@ where
     }
 
     /// Applies a client proposal to the consensus state machine. May be applied with the delay
-    /// depending on guarantee
+    /// depending on urgency
     fn client_proposal_request(
         &mut self,
         handler: &mut H,
@@ -506,12 +560,12 @@ where
     ) -> Result<ClientResponse, Error> {
         // write the request to log anyways
 
-        match request.guarantee {
-            ClientGuarantee::Fast => {
+        match request.urgency {
+            Urgency::Fast => {
                 // append an entry to the log and send the message right away
                 let mut message = AppendEntriesRequest::new(1);
                 let log_index = self.add_new_entry(
-                    LogEntryData::Proposal(request.data, request.guarantee),
+                    LogEntryData::Proposal(request.data, request.urgency),
                     Some(&mut message),
                 )?;
                 debug!(
@@ -525,11 +579,9 @@ where
                 Ok(ClientResponse::Queued(log_index))
             }
 
-            ClientGuarantee::Log => {
-                let log_index = self.add_new_entry(
-                    LogEntryData::Proposal(request.data, request.guarantee),
-                    None,
-                )?;
+            Urgency::Log => {
+                let log_index = self
+                    .add_new_entry(LogEntryData::Proposal(request.data, request.urgency), None)?;
                 debug!(
                     "proposal request from client {} assigned idx {}",
                     from, log_index
@@ -539,11 +591,10 @@ where
                 // write to log, but don't send append_entries_request right away
                 Ok(ClientResponse::Queued(log_index))
             }
-            ClientGuarantee::Batch => {
-                self.state_data.client_batch.push((
-                    from,
-                    LogEntryData::Proposal(request.data, request.guarantee),
-                ));
+            Urgency::Batch => {
+                self.state_data
+                    .client_batch
+                    .push((from, LogEntryData::Proposal(request.data, request.urgency)));
                 if self.state_data.client_batch.len() == 1 {
                     handler.set_timeout(Timeout::Client);
                 }
@@ -553,7 +604,7 @@ where
         }
     }
 
-    /// Applies client query to the state machine, guarantee is ignored
+    /// Applies client query to the state machine, urgency is ignored
     fn client_query_request(
         &mut self,
         from: ClientId,
@@ -579,9 +630,12 @@ where
         from: AdminId,
         request: AddServerRequest,
     ) -> Result<ConfigurationChangeResponse, Error> {
+        debug!(
+            requested_id = %request.id,
+            requested_info = ?request.info,
+            "add server requested");
         // check if first empty entry has been committed by consensus, do not allow config change until it has
-        let latest_log_index = self.latest_log_index()?;
-        let latest_log_term = self.latest_log_term(Some(latest_log_index))?;
+        let latest_log_term = self.latest_log_term()?;
         let current_term = self.current_term()?;
         if latest_log_term < current_term {
             return Ok(ConfigurationChangeResponse::LeaderJustChanged);
@@ -596,7 +650,7 @@ where
                 .map_err(|e| Error::Critical(CriticalError::StateMachine(Box::new(e))))?;
             let snapshot_index = if let Some(SnapshotInfo { index, .. }) = info {
                 index
-            } else if self.zero_log_index()? != LogIndex(0) {
+            } else if self.zero_log_index != LogIndex(0) {
                 // state machine may be broken, storing no snapshot
                 // when it is expected
                 return Err(Error::Critical(CriticalError::SnapshotExpected));
@@ -655,20 +709,14 @@ where
         } else {
             // when request does not specify the node to give up leader to,
             // choose the node, where leader is more likely to be elected,
-            // ie. the one which log is ths closest to the leader
-            let mut sid = self.id;
+            // i.e. the one whichsi alive and whose log is the most far forward
             let mut max_index = LogIndex(0);
-            for (id, index) in &self.state_data.match_index {
-                if *index > max_index {
-                    sid = *id;
-                    max_index = *index;
-                }
-            }
-            if sid == self.id {
-                Err(Error::unreachable(module_path!()))
-            } else {
-                handler.send_peer_message(sid, PeerMessage::TimeoutNow);
+            let best_follower = self.state_data.farthest_alive_voter(self.id);
+            if let Some(id) = best_follower {
+                handler.send_peer_message(id, PeerMessage::TimeoutNow);
                 Ok(ConfigurationChangeResponse::Started)
+            } else {
+                Ok(ConfigurationChangeResponse::NoAliveFollowers)
             }
         }
     }
@@ -679,26 +727,21 @@ where
         // from any server, because they may be a new ones which current server doesn't know
         // about yet
 
-        let new_peer = !self.config.has_peer(peer) && !self.state_data.is_catching_up(peer);
-        if new_peer {
+        if !self.state_data.has_any_follower(peer) {
             // This may still be correct peer, but it is was not added using AddServer API or was
             // removed already
             // the peer still can be the one that is going to catch up, so we skip this
             // check for a leader state
             // By this reason we do not panic here nor return an error
-            debug!("New peer connected, but not found in consensus: {:?}", peer);
+            debug!(
+                "New peer connected, but not found in configuration: {:?}",
+                peer
+            );
             return Ok(());
         }
 
-        // send a ping to a peer to get back into request-responce cycle
-        let latest_log_index = self.latest_log_index()?;
-        let message = AppendEntriesRequest {
-            term: self.current_term()?,
-            prev_log_index: latest_log_index,
-            prev_log_term: self.latest_log_term(Some(latest_log_index))?,
-            leader_commit: self.commit_index,
-            entries: Vec::new(),
-        };
+        // send a ping to a peer to get into request-responce cycle faster
+        let message = self.new_heartbeat_request(&peer)?;
 
         // For stateless/lossy connections we cannot be sure if peer has received
         // our entries, so we call set_next_index only after response, which
@@ -719,7 +762,7 @@ where
         }
 
         let term = self.current_term()?;
-        let prev_log_index = self.latest_log_index()?;
+        let prev_log_index = self.latest_log_index;
 
         let log_index = prev_log_index + 1;
 
@@ -729,12 +772,23 @@ where
             self.state_data.proposals.push_front(client_id);
         }
 
-        trace!("leader appending to log at {}: {:?}", log_index, &entries);
+        trace!(index = %log_index, ?entries, "appending batched clients proposals to log");
         self.log_mut()
             .append_entries(log_index, &entries)
             .map_err(|e| Error::Critical(CriticalError::PersistentLogWrite(Box::new(e))))?;
 
         handler.clear_timeout(Timeout::Client);
+        Ok(())
+    }
+
+    fn on_any_event(&mut self) -> Result<(), Error> {
+        self.common_on_any_event()?;
+        // at this point we know some new information about our log
+        // which may have moved forward
+        // so we need to save this information as we were follower (paper chapter 10) so
+        // our match index was counted
+        self.state_data
+            .set_own_match_index(self.id, self.latest_log_index);
         Ok(())
     }
 }
@@ -753,57 +807,39 @@ where
         self.into_follower(handler, ConsensusState::Leader, leader_term)
     }
 
+    // Updates the information about follower's last known indices
+    // return the updated commit index if follower match index changed
+    //
+    // Returns None only if follower did not exist
+    fn update_follower_indices(
+        &mut self,
+        follower_id: ServerId,
+        next_index: LogIndex,
+        match_index: LogIndex,
+    ) -> Option<LogIndex> {
+        let majority = self.config.majority();
+        self.state_data.update_follower_indices_state(
+            follower_id,
+            next_index,
+            match_index,
+            self.commit_index,
+            majority as u64,
+        )
+    }
+
     // while advancing index, the step down may be required, if one of the committed entries
     // contains the configuration change, which removes the current node
-    // the return value is the flag showing if stepping down have to happen
-    fn try_advance_commit_index(&mut self, handler: &mut H) -> Result<(bool, bool), Error> {
-        // Here we try to move commit index to one that the majority of peers in cluster already have
-        let latest_log_index = self.latest_log_index()?;
-
-        // find a new commit index to advance to
-        let mut new_commit_index = self.commit_index;
-        let majority = self.config.majority(self.id);
-
-        while new_commit_index < latest_log_index {
-            if self.state_data.count_match_indexes(new_commit_index) < majority {
-                break;
-            } else {
-                new_commit_index = new_commit_index + 1;
-            }
-        }
-
-        /*while new_commit_index < latest_log_index*/
-        /*&& self.state_data.count_match_indexes(new_commit_index) >= majority*/
-        /*{*/
-        /*new_commit_index = new_commit_index + 1;*/
-        /*}*/
-
-        if new_commit_index == self.commit_index {
-            trace!(index = %self.commit_index, "commit index not advanced");
-            // an index of majority did not change, so there is nothing to commit
-            return Ok((false, false));
-        } else {
-            trace!(
-                from = %self.commit_index,
-                to = %new_commit_index,
-                latest_log_index = %latest_log_index,
-                "commit index advanced"
-            );
-            self.commit_index = new_commit_index;
-        }
-
-        let mut step_down_required = false;
-        let mut instant_commit = false;
-
-        // Being here means the commit index has advanced and we can confirm clients
-        // that their proposals are committed
-        let mut entry_index = self
-            .state_machine
-            .last_applied()
-            .map_err(|e| Error::Critical(CriticalError::StateMachine(Box::new(e))))?;
-
-        while entry_index < self.commit_index {
-            entry_index = entry_index + 1;
+    // the return value is the flags in order `(step_down_required, instant_commit)`
+    // showing if stepping down have to happen and if instant commit is required for
+    // the updated commit index
+    fn apply_commits(
+        &mut self,
+        first_index: LogIndex,
+        last_index: LogIndex,
+        handler: &mut H,
+    ) -> Result<(bool, bool), Error> {
+        let mut entry_index = first_index;
+        while entry_index <= last_index {
             // so we read all committed entries and check if any of them have to be
             // replied to clients
             let entry_kind = self
@@ -823,13 +859,13 @@ where
                         .apply(entry_index, false)
                         .map_err(|e| Error::Critical(CriticalError::StateMachine(Box::new(e))))?;
                 }
-                LogEntryMeta::Proposal(guarantee) => {
+                LogEntryMeta::Proposal(urgency) => {
                     let result = self
                         .state_machine
                         .apply(entry_index, true)
                         .map_err(|e| Error::Critical(CriticalError::StateMachine(Box::new(e))))?;
 
-                    if guarantee == ClientGuarantee::Fast {
+                    if urgency == Urgency::Fast {
                         // if any of the entries was requested with fast guarantee,
                         // ping the followers without waiting for the timeouts
                         // to make the entry committed as fast as possible
@@ -844,7 +880,7 @@ where
 
                     let client_id = match self.state_data.proposals.pop_back() {
                         Some(id) => id,
-                        None => return Err(Error::unreachable(module_path!())),
+                        None => return Err(Error::unreachable(debug_where!())),
                     };
                     if let Some(response) = result {
                         trace!(
@@ -860,22 +896,15 @@ where
                             )),
                         );
                     } else {
-                        return Err(Error::unreachable(module_path!()));
+                        return Err(Error::unreachable(debug_where!()));
                     }
                 }
                 LogEntryMeta::Config(config) => {
                     self.state_machine
                         .apply(entry_index, false)
                         .map_err(|e| Error::Critical(CriticalError::StateMachine(Box::new(e))))?;
-                    // we only saved configuration to log and memory, but has not persisted it yet
-                    // this is what we have to do now
-                    self.log_mut()
-                        .set_latest_config(&config, entry_index)
-                        .map_err(|e| {
-                            Error::Critical(CriticalError::PersistentLogWrite(Box::new(e)))
-                        })?;
 
-                    if !config.peers.iter().any(|peer| peer.id == self.id) {
+                    if self.config.has_pending_peer(self.id) && self.config.has_pending_removal() {
                         step_down_required = true;
                     } else {
                         // when applying multiple configuration entries (shoult not happen actually, but just in
@@ -883,112 +912,135 @@ where
                         // following entry
                         step_down_required = false;
                     }
+
+                    // applying a config entry means the config probably was a pending one
+                    // we detect this by checking current indices
+                    if entry_index == self.latest_config_index {
+                        // this entry was a pending config, so we:
+                        // make our in-memory config non-pending
+                        self.config.commit_pending();
+
+                        // commit updated indices to log, setting both of them to the index
+                        // of current entry
+                        self.log_mut()
+                            .set_latest_config_view(
+                                self.latest_config_index,
+                                self.latest_config_index,
+                            )
+                            .map_err(|e| {
+                                Error::Critical(CriticalError::PersistentLogWrite(Box::new(e)))
+                            })?;
+                    }
                 }
             }
+
+            entry_index = entry_index + 1;
         }
 
         Ok((step_down_required, instant_commit))
     }
 
-    // having all the required information about the follower,
-    // decide if we should send it new entries or snapshot
+    /// based on follower indices, decide if we should send the follower
+    /// new entries or snapshot
+    /// also, update the corresponding indices in follower state
     fn next_entries_or_snapshot(
         &mut self,
         handler: &mut H,
         from: ServerId,
+        follower_last_index: LogIndex,
+        follower_last_volatile_index: LogIndex,
         current_term: Term,
-        local_latest_log_index: LogIndex,
     ) -> Result<Option<PeerMessage>, Error> {
-        let follower_last_index = if let Some(index) = self.state_data.match_index.get(&from) {
-            *index
-        } else {
-            return Err(Error::unreachable(debug_where!()));
-        };
-
-        if follower_last_index < local_latest_log_index {
-            let zero_log_index = self.zero_log_index()?;
-            if follower_last_index < zero_log_index {
-                trace!(
-                    peer_match_index = %follower_last_index,
-                    local_latest_log_index = %local_latest_log_index,
-                    "peer is behind leader and requires snapshot because it is out of log index range"
-                );
-                //if self.state_data.pending_snapshots.contains(&from) {
-                // We were already sending snapshot to follower, but received ApendEntries from
-                // it with lower index than we have.
-                // Possible reasons and solutions:
-                // 1. AppendEntriesResponse was delayed and we already sending a snapshot to
-                //    this follower
-                // 2. Follower received the last chunk, but our log went too far from the last snapshot
-                // we've sent and we already took a new snapshot
-                //
-                // In both these cases it is ok to send a first chunk of the current snapshot.
-                // For case (1) this can be handled by the state machine metadata mechanism
-                // For case (2) it is just natural and the snapshot is really required
-
-                // So, if no case is missed in the reasoning above, it's always the same action
-                // regardless of the follower state
-                //}
-                self.state_data.pending_snapshots.insert(from);
-                match self.new_install_snapshot(None, local_latest_log_index) {
-                    Ok((message, _info)) => Ok(Some(PeerMessage::InstallSnapshotRequest(message))),
-                    Err(e @ Error::SnapshotExpected) => {
-                        // missing a snapshot for any reason at this point means something wrong with the state
-                        // machine, because the followers being at wrong index can only happen if
-                        // snapshots existed before
-
-                        Err(e)
-                    }
-                    Err(e) => return Err(e),
-                }
-            } else {
-                // We are not getting here if our log is empty, because of follower_last_index <
-                // local_latest_log_index check above
-                //
-                // The peer is in log index range, but behind: send it entries to catch up.
-                trace!(
-                    "peer is missing at least {} log entries, sending them",
-                    local_latest_log_index - follower_last_index
-                );
-
-                // getting here means follower already has an entry at `follower_last_index`,
-                // so the message's prev_* entries have to contain information about this
-                // index
-                let prev_log_index = follower_last_index;
-                let prev_log_term = self
-                    .state_machine
-                    .log()
-                    .term_of(prev_log_index)
-                    .map_err(|e| Error::PersistentLogRead(Box::new(e)))?;
-
-                let mut message = AppendEntriesRequest {
-                    term: current_term,
-                    prev_log_index,
-                    prev_log_term,
-                    leader_commit: self.commit_index,
-                    entries: Vec::new(),
-                };
-
-                self.fill_entries(
-                    &mut message.entries,
-                    follower_last_index + 1,
-                    local_latest_log_index + 1,
-                )?;
-
-                self.state_data
-                    .set_next_index(from, local_latest_log_index + 1)?;
-
-                Ok(Some(PeerMessage::AppendEntriesRequest(message)))
-            }
-        } else {
-            // peer is in sync with leader, only catching up peers require action
-            if self.state_data.is_catching_up(from) {
-                return Err(Error::unreachable(module_path!()));
+        if follower_last_index == self.latest_log_index {
+            // peer is in sync with leader, only catching up peers require atention
+            if self.state_data.is_catching_up(from)? {
+                return Err(Error::unreachable(debug_where!()));
             }
 
             // since the peer has caught up, set a heartbeat timeout.
             handler.set_timeout(Timeout::Heartbeat(from));
             Ok(None)
+        } else if follower_last_volatile_index < self.zero_log_index {
+            // follower is behind out snapshot, so we cannot send it any data
+            // except for the snapshot because we don't have data before zero_log_index
+            trace!(
+                peer_match_index = %follower_last_index,
+                local_latest_log_index = %self.latest_log_index,
+                "peer is behind leader and requires snapshot because it is out of log index range"
+            );
+            //if self.state_data.get_pending_snapshot(&from) {
+            // We may already have a snapshot being sent to follower, but received ApendEntries from
+            // it with lower index than we have.
+            // Possible reasons and solutions:
+            // 1. AppendEntriesResponse was delayed and we already sending a snapshot to
+            //    this follower
+            // 2. Follower received the last chunk, but our log went too far from the last snapshot
+            // we've sent and we already took a new snapshot
+            //
+            // In both these cases it leads to the same action: send a first chunk of the current snapshot.
+            // For case (1) this can be handled by the state machine metadata mechanism
+            // For case (2) it is just natural and the snapshot is really required
+
+            // So, if no case is missed in the reasoning above, it's always the same action
+            // regardless of the follower state, meanin gwe don't need the condition
+            //}
+            self.state_data.set_pending_snapshot(&from);
+            match self.new_install_snapshot(None, self.latest_log_index) {
+                Ok((message, _info)) => Ok(Some(PeerMessage::InstallSnapshotRequest(message))),
+                Err(e @ Error::SnapshotExpected) => {
+                    // missing a snapshot for any reason at this point means something wrong with the state
+                    // machine, because the followers being at wrong index can only happen if
+                    // snapshots existed before
+
+                    Err(e)
+                }
+                Err(e) => return Err(e),
+            }
+        } else {
+            // follower index is behind leader's index, meaning we have entries
+            // to send
+
+            // since follower already has an entry at `follower_last_volatile_index`,
+            // we put this index as prev_log_index
+            let prev_log_index = follower_last_volatile_index;
+            let prev_log_term = self
+                .state_machine
+                .log()
+                .term_of(prev_log_index)
+                .map_err(|e| Error::PersistentLogRead(Box::new(e)))?;
+
+            let mut entries = Vec::new();
+            self.fill_entries(&mut entries, follower_last_volatile_index + 1)?;
+            trace!(
+                num_entries = ?{entries.len()},
+                "follower is missing log entries, sending them",
+            );
+
+            self.state_data.update_follower_indices(
+                from,
+                // save follower's next index considering a number of entries put
+                follower_last_volatile_index + (entries.len() as u64) + 1,
+                follower_last_index,
+            );
+            if entries.is_empty() {
+                // depending on settings and log's state, fill_entries may return zero entries,
+                // i.e. if log has only volatile entries, that cannot be read
+                Ok(None)
+            } else {
+                // there is no need to update follower next index because it is
+                // always set to self.latest_log_index + 1
+                // TODO: in some future, if we limit the max number of entries or
+                // kind of that, the index will have to be calculated in other way
+                let message = AppendEntriesRequest {
+                    term: current_term,
+                    prev_log_index,
+                    prev_log_term,
+                    leader_commit: self.commit_index,
+                    entries,
+                };
+
+                Ok(Some(PeerMessage::AppendEntriesRequest(message)))
+            }
         }
     }
 
@@ -1011,10 +1063,10 @@ where
             .map_err(|e| Error::Critical(CriticalError::StateMachine(Box::new(e))))?;
 
         let term = self.current_term()?;
-        let last_log_term = self.latest_log_term(Some(latest_log_index))?;
+        let last_log_term = self.latest_log_term()?;
 
         let last_config = if chunk_request.is_some() {
-            Some(self.config.clone())
+            Some(self.config.peers.clone())
         } else {
             None
         };
@@ -1024,28 +1076,29 @@ where
             last_config,
             snapshot_index: info.index,
             snapshot_term: info.term,
+            force_reset: false,
             chunk_data,
         };
         Ok((message, info))
     }
 
     fn new_heartbeat_request(&self, peer: &ServerId) -> Result<AppendEntriesRequest, Error> {
-        let follower_last_known_index = self.state_data.next_index(peer)? - 1; // next_index is never LogIndex(0) by implementation
+        // next_index is never LogIndex(0) by algorithm definition
+        // (state_data is initialized by self.latest_log_index + 1)
+        let follower_last_known_index = self.state_data.next_index(peer)? - 1;
 
-        let latest_log_index = self.latest_log_index()?;
-        let zero_log_index = self.zero_log_index()?;
-        let (prev_log_index, prev_log_term) = if follower_last_known_index < zero_log_index {
+        let (prev_log_index, prev_log_term) = if follower_last_known_index < self.zero_log_index {
             // follower's index is behind the snapshot
             // so we can only send our zero index and its term
             (
-                zero_log_index,
+                self.zero_log_index,
                 self.log()
-                    .term_of(zero_log_index)
+                    .term_of(self.zero_log_index)
                     .map_err(|e| Error::PersistentLogRead(Box::new(e)))?,
             )
-        } else if follower_last_known_index > latest_log_index {
-            // this should notbe possible because of the checks done
-            // before calling set_next_index
+        } else if follower_last_known_index > self.latest_log_index {
+            // this should not be possible because of the checks done
+            // before calling update_follower_indices
             return Err(Error::unreachable(debug_where!()));
         } else {
             (
@@ -1064,6 +1117,7 @@ where
             entries: Vec::new(),
         })
     }
+
     fn check_catch_up_status(
         &mut self,
         handler: &mut H,
@@ -1076,18 +1130,13 @@ where
         // the exception here is the very first "ping"
         // request, it will go to Some(false) because
         // last round check was not set to true intentionally
-        match self.state_data.update_rounds()? {
+        match self.state_data.update_catch_up_status(from)? {
             CatchUpStatus::CaughtUp => {
                 // switch to new stage
                 let admin_id = self
                     .state_data
                     .begin_config_change(local_latest_log_index + 1, &mut self.config)?;
 
-                // TODO
-                // too bad, we cannot borrow config from self at the same time with
-                // running something on self.state_data
-                // let's hope borrowing rules change someday (2021 edition promises it!)
-                // until that time it's not very bad to clone a config
                 let config = self.config.clone();
 
                 // the config is already modified, just add it as an entry
@@ -1105,13 +1154,9 @@ where
                     "catching up node did not catch this round, continuing the catching up process"
                 );
 
+                let message = self.next_entries_or_snapshot(handler, from, current_term)?;
+
                 // We need to maintain correct states here. Possible cases:
-                let message = self.next_entries_or_snapshot(
-                    handler,
-                    from,
-                    current_term,
-                    local_latest_log_index,
-                )?;
                 match &message {
                     Some(PeerMessage::InstallSnapshotRequest(req)) => {
                         // Node is going to receive InstallSnapshotRequest message. Not depending on which chunk or
@@ -1121,7 +1166,7 @@ where
                             config_change.transition_to_snapshotting(req.snapshot_index)?;
                             Ok(message)
                         } else {
-                            Err(Error::unreachable(module_path!()))
+                            Err(Error::unreachable(debug_where!()))
                         }
                     }
                     Some(PeerMessage::AppendEntriesRequest(_)) => {
@@ -1130,10 +1175,10 @@ where
                             config_change.transition_to_catching_up()?;
                             Ok(message)
                         } else {
-                            Err(Error::unreachable(module_path!()))
+                            Err(Error::unreachable(debug_where!()))
                         }
                     }
-                    _ => Err(Error::unreachable(module_path!())),
+                    _ => Err(Error::unreachable(debug_where!())),
                 }
             }
             CatchUpStatus::TooSlow => {
@@ -1146,30 +1191,34 @@ where
         }
     }
 
-    // fetch required entries from the log and push them to provided vector
-    fn fill_entries(
-        &self,
-        entries: &mut Vec<Entry>,
-        from: LogIndex,
-        until: LogIndex,
-    ) -> Result<(), Error> {
+    /// fetch the required number entries from the log and push them to provided vector
+    fn fill_entries(&self, entries: &mut Vec<Entry>, from: LogIndex) -> Result<(), Error> {
+        // TODO: limit entry bytes or something
         // as of now we push all the entries, regardless of amount
         // this may be kind of dangerous sometimes because of amount being too big
         // but most probably snapshotting would solve it
+        let until = self.latest_volatile_log_index;
+
         for index in from.as_u64()..until.as_u64() {
-            let mut log_entry =
-                LogEntry::new_proposal(Term(0), Bytes::new(), ClientGuarantee::default());
-            self.log()
-                .read_entry(LogIndex(index), &mut log_entry)
-                .map_err(|e| Error::PersistentLogRead(Box::new(e)))?;
-            let mut entry: Entry = log_entry.into();
-            if self
+            let mut log_entry = LogEntry::new_proposal(Term(0), Bytes::new(), Urgency::default());
+
+            // read until log lets us read volatile entries
+            if !self
                 .log()
-                .latest_config_index()
+                .read_entry(LogIndex(index), &mut log_entry)
                 .map_err(|e| Error::PersistentLogRead(Box::new(e)))?
-                .map(|idx| idx.as_u64() == index)
-                .unwrap_or(false)
             {
+                if index > self.latest_log_index.as_u64() {
+                    break;
+                } else {
+                    return Err(Error::Critical(CriticalError::FollowerLogBroken(
+                        LogIndex(index),
+                        "log refused to read persisted entry",
+                    )));
+                }
+            }
+            let mut entry: Entry = log_entry.into();
+            if self.latest_config_index.as_u64() == index {
                 entry.set_config_active(true);
             }
 
@@ -1181,43 +1230,53 @@ where
     /// Appends a single entry to a leader's log obeying all the Raft rules (log indexing etc).
     /// Optionally, fills a message making it ready to be sent to followers. When request is None,
     /// the entry is still written to log, but will be send to the followers using the heartbeat mechanism.
+    ///
+    /// Returns the log index of appended entry (if append was synchronous)
     pub(crate) fn add_new_entry(
         &mut self,
         entry_data: LogEntryData,
         request: Option<&mut AppendEntriesRequest>,
     ) -> Result<LogIndex, Error> {
-        let latest_log_index = self.latest_log_index()?;
         let term = self.current_term()?;
 
-        let next_log_index = latest_log_index + 1;
+        let entry_log_index = self.latest_log_index + 1;
         let leader_commit = self.commit_index;
 
         let log_entry = LogEntry {
             term,
             data: entry_data,
         };
-        trace!(
-            "leader appending to log at {}: {:?}",
-            next_log_index,
-            &log_entry
-        );
+
+        let prev_log_term = self.latest_log_term()?;
+
+        trace!(at = %entry_log_index, entry = ?log_entry, "appending single entry to log");
         self.log_mut()
-            .append_entries(next_log_index, &[log_entry.clone()])
+            .append_entries(entry_log_index, &[log_entry.clone()])
             .map_err(|e| Error::Critical(CriticalError::PersistentLogWrite(Box::new(e))))?;
 
         let mut entry: Entry = log_entry.into();
         // the entry is the new addition, so if it's a configuration change, than it is definitely a new active configuration
         entry.set_config_active(true);
 
+        // even if the entry did not land in our log, we still can send it to the follower
+        // setting the correct indices
+        // To do this, we must NOT update our latest_log_index after appending even into_follower
+        // the append realy happened
         if let Some(mut request) = request {
-            let prev_log_term = self.latest_log_term(Some(latest_log_index))?;
             request.term = term;
-            request.prev_log_index = latest_log_index;
+            request.prev_log_index = entry_log_index - 1;
             request.prev_log_term = prev_log_term;
             request.leader_commit = leader_commit;
             request.entries.push(entry);
         };
-        Ok(next_log_index)
+
+        // in case entries are appended synchronously, re-read the log updating the indices
+        // and remember the new match index for self
+        self.update_log_view()?;
+        self.state_data
+            .set_match_index(self.id, self.latest_log_index);
+
+        Ok(entry_log_index)
     }
 
     fn send_append_entries_request(
@@ -1249,7 +1308,8 @@ where
             }
         }
 
-        if self.config.majority(self.id) == 1 {
+        todo!("deal with solitary consensus the other way");
+        if self.config.majority() == 1 {
             // for a solitary consensus or a 2-peer cluster current node aready has a majority,
             // (because of it's own log commit)
             // so there is a reason to advance the index in case the proposal queue is empty
@@ -1259,7 +1319,7 @@ where
             // instant commit is (obviously) not required
             let (step_down_required, _) = self.try_advance_commit_index(handler)?;
             if step_down_required {
-                return Err(Error::unreachable(module_path!()));
+                return Err(Error::unreachable(debug_where!()));
             }
         }
         Ok(())
@@ -1269,10 +1329,9 @@ where
 /// The state associated with a Raft consensus module in the `Leader` state.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Leader {
-    next_index: HashMap<ServerId, LogIndex>,
-    match_index: HashMap<ServerId, LogIndex>,
-    pub(crate) peers_alive: HashSet<ServerId>,
-    pending_snapshots: HashSet<ServerId>,
+    followers: BTreeMap<ServerId, FollowerInfo>,
+    // optimization for updating commit index
+    max_follower_index: LogIndex,
 
     client_batch: Vec<(ClientId, LogEntryData)>,
     proposals: VecDeque<ClientId>,
@@ -1292,24 +1351,19 @@ impl Leader {
     /// * `latest_log_index` - The index of the leader's most recent log entry at the
     ///                        time of election.
     /// * `peers` - The set of peer cluster members.
-    pub(crate) fn new(
-        latest_log_index: LogIndex,
-        config: &ConsensusConfig,
-        own_id: &ServerId,
-    ) -> Leader {
-        let mut next_index = HashMap::new();
-        let mut match_index = HashMap::new();
-        config.with_remote_peers(own_id, |id| {
-            next_index.insert(*id, latest_log_index + 1);
-            match_index.insert(*id, LogIndex::from(0));
+    pub(crate) fn new(latest_log_index: LogIndex, config: &ConsensusConfig) -> Leader {
+        let mut followers = BTreeMap::new();
+
+        config.with_all_peers(|id| {
+            // at the moment config only contains voting peers
+            // TODO: persist non-voters to config as well
+            followers.insert(*id, FollowerInfo::new(latest_log_index + 1, true));
             Ok(())
         });
 
         Leader {
-            next_index,
-            match_index,
-            peers_alive: HashSet::new(),
-            pending_snapshots: HashSet::new(),
+            followers,
+            max_follower_index: LogIndex(0),
             client_batch: Vec::new(),
             proposals: VecDeque::new(),
             read_index: None,
@@ -1317,180 +1371,440 @@ impl Leader {
         }
     }
 
-    fn has_follower(&mut self, follower: &ServerId) -> bool {
-        self.match_index.contains_key(follower)
+    fn has_any_follower(&mut self, id: ServerId) -> bool {
+        self.followers.contains_key(&id)
     }
 
-    fn is_catching_up(&self, node: ServerId) -> bool {
-        if let Some(catching_up) = &self.config_change {
-            node == catching_up.peer.id
+    fn has_voting_follower(&mut self, id: ServerId) -> bool {
+        if let Some(info) = self.followers.get(&id) {
+            match info.status {
+                FollowerStatus::Voter { .. } => true,
+                FollowerStatus::CatchingUpSnapshot { .. } => false,
+                FollowerStatus::CatchingUpEntries { .. } => false,
+                FollowerStatus::NonVoter => false,
+            }
         } else {
             false
         }
     }
 
-    /// Returns the next log entry index of the follower or a catching up peer.
-    /// Used only in AppendEntries context
-    fn next_index(&self, follower: &ServerId) -> Result<LogIndex, Error> {
-        if let Some(index) = self.next_index.get(follower) {
-            return Ok(*index);
+    fn is_catching_up(&self, id: ServerId) -> Result<bool, Error> {
+        if let Some(info) = self.followers.get(&id) {
+            Ok(match info.status {
+                FollowerStatus::Voter { .. } => false,
+                FollowerStatus::CatchingUpSnapshot { .. } => true,
+                FollowerStatus::CatchingUpEntries { .. } => true,
+                FollowerStatus::NonVoter => false,
+            })
+        } else {
+            Err(Error::unreachable(debug_where!()))
         }
-
-        match &self.config_change {
-            Some(ConfigChange {
-                peer,
-                stage: ConfigChangeStage::CatchingUp { index, .. },
-                ..
-            }) => {
-                if &peer.id == follower {
-                    // the index is requested for a catching up peer
-                    return Ok(*index);
-                }
-            }
-            Some(_) => {
-                return Err(Error::unreachable(module_path!()));
-            }
-            _ => (),
-        }
-
-        Err(Error::UnknownPeer(follower.clone()))
     }
 
-    /// Sets the next log entry index of the follower or a catching up peer.
-    fn set_next_index(&mut self, follower: ServerId, index: LogIndex) -> Result<(), Error> {
-        trace!(id = %follower, index = %index, "moved next index for follower");
-        if let Some(stored_index) = self.next_index.get_mut(&follower) {
-            *stored_index = index;
-            return Ok(());
+    /*
+     *    fn next_index(&self, follower: &ServerId) -> Result<LogIndex, Error> {
+     *        if let Some(index) = self.next_index.get(follower) {
+     *            return Ok(*index);
+     *        }
+     *
+     *        match &self.config_change {
+     *            Some(ConfigChange {
+     *                peer,
+     *                stage: ConfigChangeStage::Snapshotting { .. },
+     *                ..
+     *            }) => {
+     *                if &peer.id == follower {
+     *                    // the snapshotting follower has no index set up yet
+     *                    return Ok(LogIndex(0));
+     *                }
+     *            }
+     *            Some(ConfigChange {
+     *                peer,
+     *                stage: ConfigChangeStage::CatchingUp { index, .. },
+     *                ..
+     *            }) => {
+     *                if &peer.id == follower {
+     *                    // the index is requested for a catching up peer
+     *                    return Ok(*index);
+     *                }
+     *            }
+     *            Some(ConfigChange {
+     *                peer,
+     *                stage: ConfigChangeStage::Committing(_, index),
+     *                ..
+     *            }) => {
+     *                if &peer.id == follower {
+     *                    // peer has caught up and waiting for config to be
+     *                    // committed by the followers
+     *                    return Ok(*index);
+     *                }
+     *            }
+     *            [>Some(_) => {<]
+     *            [>trace!(?self.config_change);<]
+     *            [>return Err(Error::unreachable(debug_where!()));<]
+     *            [>}<]
+     *            //_ => (),
+     *            None => {
+     *                return Err(Error::unreachable(debug_where!()));
+     *            }
+     *        }
+     *
+     *        Err(Error::UnknownPeer(follower.clone()))
+     *    }
+     */
+
+    // Updates the information about follower's last known indices
+    // return the updated commit index if follower match index changed
+    //
+    // Returns None only if follower did not exist
+    fn update_follower_indices_state(
+        &mut self,
+        follower_id: ServerId,
+        next_index: LogIndex,
+        match_index: LogIndex,
+        prev_commit_index: LogIndex,
+        majority: u64,
+    ) -> Option<LogIndex> {
+        let mut update_required = false;
+        if let Some(info) = self.followers.get_mut(&follower_id) {
+            info.next_index = next_index;
+            if let FollowerStatus::Voter {
+                match_index: prev_match_index,
+            } = info.status
+            {
+                if match_index != prev_match_index {
+                    prev_match_index = match_index;
+                    if match_index > self.max_follower_index {
+                        self.max_follower_index = match_index
+                    }
+                    update_required = true;
+                }
+            }
+        } else {
+            return None;
         }
-        if let Some(config_change) = &mut self.config_change {
-            match config_change {
-                ConfigChange {
-                    peer,
-                    stage:
-                        ConfigChangeStage::Snapshotting {
-                            index: cf_index, ..
-                        },
-                    ..
-                } => {
-                    // setting index while node is snapshotting means node
-                    // finished a snapshot and can migrate to catching up
-                    if peer.id == follower {
-                        if cf_index == &index {
-                            config_change.transition_to_catching_up()?;
-                            return Ok(());
+
+        if update_required {
+            // This cool algorithm allows finding a majority using the least possible amount of iterations
+            // by checking each follower's index instead of doing minus 1 each pass
+            let mut current_checked_index = self.max_follower_index;
+            let mut step = self.max_follower_index - prev_commit_index;
+            let mut count = 0;
+            loop {
+                // TODO unit test this shit
+                for info in self.followers.values() {
+                    if let FollowerStatus::Voter { match_index } = info.status {
+                        if match_index >= current_checked_index {
+                            count += 1;
+                        }
+                        if match_index < current_checked_index
+                            && step > current_checked_index - match_index
+                        {
+                            step = current_checked_index - match_index
                         }
                     }
-                }
-                ConfigChange {
-                    peer,
-                    stage:
-                        ConfigChangeStage::CatchingUp {
-                            index: cf_index, ..
-                        },
-                    ..
-                } => {
-                    if peer.id == follower {
-                        *cf_index = index;
-                        return Ok(());
-                    }
-                }
-
-                ConfigChange { peer, .. } => {
-                    if peer.id == follower {
-                        return Err(Error::unreachable(module_path!()));
+                    if count >= majority {
+                        return Some(current_checked_index);
+                    } else if prev_commit_index + step > current_checked_index {
+                        // no valid indices left
+                        return Some(prev_commit_index);
+                    } else {
+                        current_checked_index = current_checked_index - step;
+                        step = current_checked_index - prev_commit_index;
                     }
                 }
             }
+        } else {
+            Some(prev_commit_index)
         }
-
-        Err(Error::UnknownPeer(follower))
     }
 
-    /// Sets the index of the highest log entry known to be replicated on the
-    /// follower.
-    fn set_match_index(&mut self, follower: ServerId, index: LogIndex) {
-        self.match_index.insert(follower, index);
+    fn follower_status_kind(&self, follower_id: ServerId) -> FollowerStatusKind {
+        self.followers
+            .get(&follower_id)
+            .map(|info| info.status)
+            .into()
     }
+    /*
+     *    // Sets the next log entry index of the follower or a catching up peer.
+     *    fn set_next_index(&mut self, follower: ServerId, index: LogIndex) -> Result<(), Error> {
+     *        if let Some(stored_index) = self.next_index.get_mut(&follower) {
+     *            trace!(id = %follower, index = %index, "moved next index for follower");
+     *            *stored_index = index;
+     *            return Ok(());
+     *        }
+     *
+     *        // Node is not in follower list, check node's catching up state
+     *        if let Some(config_change) = &mut self.config_change {
+     *            match config_change {
+     *                ConfigChange {
+     *                    peer,
+     *                    stage:
+     *                        ConfigChangeStage::Snapshotting {
+     *                            index: cf_index, ..
+     *                        },
+     *                    ..
+     *                } => {
+     *                    // setting index while node is snapshotting means node
+     *                    // finished a snapshot and can migrate to catching up
+     *                    if peer.id == follower {
+     *                        if cf_index == &index {
+     *                            config_change.transition_to_catching_up()?;
+     *                            return Ok(());
+     *                        } else {
+     *                            trace!(id = %follower, index = %index, "moved next index for catching up node");
+     *                            *cf_index = index;
+     *                            return Ok(());
+     *                        }
+     *                    } else {
+     *                        return Err(Error::unreachable(debug_where!()));
+     *                    }
+     *                }
+     *                ConfigChange {
+     *                    peer,
+     *                    stage:
+     *                        ConfigChangeStage::CatchingUp {
+     *                            index: cf_index, ..
+     *                        },
+     *                    ..
+     *                } => {
+     *                    if peer.id == follower {
+     *                        *cf_index = index;
+     *                        return Ok(());
+     *                    }
+     *                }
+     *
+     *                ConfigChange {
+     *                    peer,
+     *                    stage: ConfigChangeStage::Committing(_, cf_index),
+     *                    ..
+     *                } => {
+     *                    if peer.id == follower {
+     *                        *cf_index = index
+     *                        //return Err(Error::unreachable(debug_where!()));
+     *                    }
+     *                }
+     *            }
+     *        }
+     *
+     *        Err(Error::UnknownPeer(follower))
+     *    }
+     *
+     */
+
+    fn set_own_match_index(&mut self, own_id: ServerId, index: LogIndex) -> Result<(), Error> {
+        if let Some(info) = self.followers.get_mut(&own_id) {
+            if let FollowerStatus::Voter { match_index } = info.status {
+                match_index = match_index;
+                Ok(())
+            } else {
+                Err(Error::unreachable(debug_where!()))
+            }
+        } else {
+            Err(Error::unreachable(debug_where!()))
+        }
+    }
+
+    ///// Sets the index of the highest log entry known to be replicated on the
+    ///// follower.
+    //fn set_match_index(&mut self, node: ServerId, index: LogIndex) {
+    //if let Some(stored_index) = self.match_index.get_mut(&node) {
+    //trace!(id = %node, index = %index, "moved match index for node");
+    //*stored_index = index;
+    //} else {
+    //// match indexes are used in log commitment counting,
+    //// so only followers should participate there
+    //trace!("not setting up match index for catching up node");
+    //}
+    //}
 
     fn reset_config_change<H: Handler>(&mut self, handler: &mut H) {
-        match self.config_change.take() {
-            Some(ConfigChange {
-                peer,
-                stage: ConfigChangeStage::Snapshotting { .. },
-                ..
-            })
-            | Some(ConfigChange {
-                peer,
-                stage: ConfigChangeStage::CatchingUp { .. },
-                ..
-            }) => {
-                debug!(
-                    "config change has been canceled for catching-up node {}",
-                    peer.id
-                );
-                handler.clear_timeout(Timeout::Heartbeat(peer.id));
-            }
-            Some(ConfigChange {
-                stage: ConfigChangeStage::Committing { .. },
-                ..
-            }) => {}
-            None => {}
+        todo!();
+        /*
+         *match self.config_change.take() {
+         *    Some(ConfigChange {
+         *        peer,
+         *        stage: ConfigChangeStage::Snapshotting { .. },
+         *        ..
+         *    })
+         *    | Some(ConfigChange {
+         *        peer,
+         *        stage: ConfigChangeStage::CatchingUp { .. },
+         *        ..
+         *    }) => {
+         *        debug!(
+         *            "config change has been canceled for catching-up node {}",
+         *            peer.id
+         *        );
+         *        handler.clear_timeout(Timeout::Heartbeat(peer.id));
+         *    }
+         *    Some(ConfigChange {
+         *        stage: ConfigChangeStage::Committing { .. },
+         *        ..
+         *    }) => {}
+         *    None => {}
+         *}
+         */
+    }
+
+    fn have_pending_snapshots(&self) -> bool {
+        self.followers
+            .values()
+            .any(|info| info.has_pending_snapshot)
+    }
+
+    fn set_pending_snapshot(&mut self, id: &ServerId) -> Result<(), Error> {
+        if let Some(info) = self.followers.get_mut(id) {
+            info.has_pending_snapshot = true;
+            Ok(())
+        } else {
+            Err(Error::unreachable(debug_where!()))
         }
     }
 
-    fn update_rounds(&mut self) -> Result<CatchUpStatus, Error> {
-        match &mut self.config_change {
-            Some(ConfigChange {
-                stage:
-                    ConfigChangeStage::Snapshotting {
-                        response_this_timeout,
-                        timeouts,
-                        ..
-                    },
-                max_snapshot_timeouts,
-                ..
-            }) => {
-                *response_this_timeout = true;
-                *timeouts = *max_snapshot_timeouts;
+    fn clear_pending_snapshot(&mut self, id: &ServerId) -> Result<(), Error> {
+        if let Some(info) = self.followers.get_mut(id) {
+            info.has_pending_snapshot = false;
+            Ok(())
+        } else {
+            Err(Error::unreachable(debug_where!()))
+        }
+    }
 
-                // node receiving snapshots is never ready for the config change, because it needs
-                // a log entries
-                Ok(CatchUpStatus::NotYet)
+    fn mark_alive(&mut self, id: ServerId) {
+        if let Some(info) = self.followers.get_mut(&id) {
+            info.response_this_timeout = true;
+        }
+        // we don't care if we received a message from some unaccounted peer
+    }
+
+    fn forget_alive(&mut self, id: ServerId) {
+        if let Some(info) = self.followers.get_mut(&id) {
+            info.response_this_timeout = false;
+        }
+    }
+
+    fn iter_alive<'a>(&'a self) -> impl Iterator<Item = ServerId> + 'a {
+        self.followers
+            .iter()
+            .filter(|(id, info)| info.response_this_timeout)
+            .map(|(id, info)| *id)
+    }
+
+    fn decrease_timeout(&mut self, id: ServerId) {
+        let mut remove = false;
+        if let Some(info) = self.followers.get_mut(&id) {
+            if info.status.decrease_timeout() {
+                // peer was lost
+                remove = info.become_lost();
             }
+        }
+        if remove {
+            trace!(peer = %id, "catching up peer has timed out, removing");
+            self.followers.remove(&id);
+        }
+    }
 
-            Some(ConfigChange {
-                stage:
-                    ConfigChangeStage::CatchingUp {
-                        rounds,
-                        response_this_timeout,
-                        timeouts,
-                        ..
-                    },
-                max_log_timeouts,
-                ..
-            }) => {
-                if *rounds == 0 {
-                    Ok(CatchUpStatus::TooSlow)
-                } else {
-                    *rounds -= 1;
-                    if *response_this_timeout {
-                        // node has caught up because we already had response within this timeout
-                        Ok(CatchUpStatus::CaughtUp)
-                    } else {
-                        *response_this_timeout = true;
-                        *timeouts = *max_log_timeouts;
-                        Ok(CatchUpStatus::NotYet)
+    fn farthest_alive_voter<'a>(&self, leader_id: ServerId) -> Option<ServerId> {
+        let mut last_follower = None;
+        let mut max_index = LogIndex(0);
+        for (id, info) in &self.followers {
+            if info.response_this_timeout && *id != leader_id {
+                if let FollowerStatus::Voter { match_index } = info.status {
+                    if match_index > max_index {
+                        last_follower = Some(*id);
+                        max_index = match_index;
                     }
                 }
             }
-            Some(_) => Err(Error::unreachable(module_path!())),
-            None => {
-                //panic!("IMPLEMENTATION BUG: update_rounds called during wrong stage")
-                Err(Error::unreachable(module_path!()))
+        }
+        last_follower
+    }
+
+    fn alive_voters_count(&self) -> usize {
+        self.followers
+            .values()
+            .filter(|info| {
+                if let FollowerStatus::Voter { .. } = info.status {
+                    info.response_this_timeout
+                } else {
+                    false
+                }
+            })
+            .count()
+    }
+
+    fn update_catch_up_status(&mut self, id: ServerId) -> Result<CatchUpStatus, Error> {
+        if let Some(info) = self.followers.get_mut(&id) {
+            match info.status {
+                FollowerStatus::Voter { .. } | FollowerStatus::NonVoter => {
+                    Err(Error::unreachable(debug_where!()))
+                }
+                FollowerStatus::CatchingUpSnapshot { timeouts_left } => todo!(),
+                FollowerStatus::CatchingUpEntries {
+                    rounds_left,
+                    timeouts_left,
+                } => todo!(),
             }
+        } else {
+            Err(Error::unreachable(debug_where!()))
         }
     }
+
+    /*
+     *    fn update_rounds_old(&mut self) -> Result<CatchUpStatus, Error> {
+     *        match &mut self.config_change {
+     *            Some(ConfigChange {
+     *                stage:
+     *                    ConfigChangeStage::Snapshotting {
+     *                        response_this_timeout,
+     *                        timeouts,
+     *                        ..
+     *                    },
+     *                max_snapshot_timeouts,
+     *                ..
+     *            }) => {
+     *                *response_this_timeout = true;
+     *                *timeouts = *max_snapshot_timeouts;
+     *
+     *                // node receiving snapshots is never ready for the config change, because it needs
+     *                // a log entries
+     *                Ok(CatchUpStatus::NotYet)
+     *            }
+     *
+     *            Some(ConfigChange {
+     *                stage:
+     *                    ConfigChangeStage::CatchingUp {
+     *                        rounds,
+     *                        response_this_timeout,
+     *                        timeouts,
+     *                        ..
+     *                    },
+     *                max_log_timeouts,
+     *                ..
+     *            }) => {
+     *                if *rounds == 0 {
+     *                    Ok(CatchUpStatus::TooSlow)
+     *                } else {
+     *                    *rounds -= 1;
+     *                    if *response_this_timeout {
+     *                        // node has caught up because we already had response within this timeout
+     *                        Ok(CatchUpStatus::CaughtUp)
+     *                    } else {
+     *                        *response_this_timeout = true;
+     *                        *timeouts = *max_log_timeouts;
+     *                        Ok(CatchUpStatus::NotYet)
+     *                    }
+     *                }
+     *            }
+     *            Some(_) => Err(Error::unreachable(debug_where!())),
+     *            None => {
+     *                //panic!("IMPLEMENTATION BUG: update_rounds called during wrong stage")
+     *                Err(Error::unreachable(debug_where!()))
+     *            }
+     *        }
+     *    }
+     */
 
     /// Migrates configuration change state to begin committing a modification of config after
     /// cathching up node was ready
@@ -1513,12 +1827,12 @@ impl Leader {
             } else {
                 // peer existed - this cannot happen because the function is only called
                 // when catching up node being added is caught up
-                return Err(Error::Critical(CriticalError::Unreachable(module_path!())));
+                return Err(Error::Critical(CriticalError::Unreachable(debug_where!())));
             }
             *stage = ConfigChangeStage::Committing(current_config.clone(), config_index);
             Ok(admin_id.clone())
         } else {
-            Err(Error::Critical(CriticalError::Unreachable(module_path!())))
+            Err(Error::Critical(CriticalError::Unreachable(debug_where!())))
         }
     }
 
@@ -1532,7 +1846,7 @@ impl Leader {
                         timeouts,
                         ..
                     },
-                total_timeouts,
+                total_timeouts_left: total_timeouts,
                 ..
             }) => {
                 *response_this_timeout = false;
@@ -1556,7 +1870,7 @@ impl Leader {
                         timeouts,
                         ..
                     },
-                total_timeouts,
+                total_timeouts_left: total_timeouts,
                 ..
             }) => {
                 *response_this_timeout = false;
@@ -1573,119 +1887,315 @@ impl Leader {
                     Ok(false)
                 }
             }
-            _ => Err(Error::Critical(CriticalError::Unreachable(module_path!()))),
+            _ => Err(Error::Critical(CriticalError::Unreachable(debug_where!()))),
         }
     }
 
-    /// Counts the number of followers containing the given log index.
-    fn count_match_indexes(&self, index: LogIndex) -> usize {
-        // +1 is for self
-        self.match_index.values().filter(|&&i| i >= index).count() + 1
+    /*
+     * // Counts the number of followers containing the given log index.
+     *fn count_match_indexes(&self, index: LogIndex) -> usize {
+     *    // +1 is for self
+     *    //self.match_index.values().filter(|&&i| i >= index).count() + 1
+     *    self.match_index.values().filter(|&&i| i >= index).count()
+     *}
+     */
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FollowerInfo {
+    next_index: LogIndex,
+    response_this_timeout: bool,
+    has_pending_snapshot: bool,
+    status: FollowerStatus,
+}
+
+impl FollowerInfo {
+    fn new_saved_voter(next_index: LogIndex) -> Self {
+        Self {
+            next_index,
+            response_this_timeout: true,
+            has_pending_snapshot: false,
+            status: FollowerStatus::new_saved_voter(),
+        }
+    }
+
+    fn new_candidate_voter() -> Self {
+        Self {
+            next_index: LogIndex(0),
+            response_this_timeout: true,
+            has_pending_snapshot: false,
+            status: FollowerStatus::new_candidate_voter(),
+        }
+    }
+
+    fn new_non_voter() -> Self {
+        Self {
+            next_index: LogIndex(0),
+            response_this_timeout: true,
+            has_pending_snapshot: false,
+            status: FollowerStatus::new_non_voter(),
+        }
+    }
+
+    fn become_lost(&mut self) -> bool {
+        let remove;
+        (self.status, remove) = match self.status {
+            FollowerStatus::Voter { .. } => (FollowerStatus::LostVoter, false),
+            FollowerStatus::NonVoter { .. } => (FollowerStatus::LostVoter, false),
+            FollowerStatus::CatchingUpEntries { .. }
+            | FollowerStatus::CatchingUpSnapshot { .. } => (self.status.clone(), false),
+            // you can never become more lost than now
+            FollowerStatus::LostVoter => (FollowerStatus::LostVoter, false),
+            FollowerStatus::LostNonVoter => (FollowerStatus::LostNonVoter, false),
+        };
+        remove
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum FollowerStatus {
+    // A valid voter allowed to vote
+    Voter {
+        match_index: LogIndex,
+    },
+    // A future voter at the stage of receiving
+    // an initial snapshot
+    CatchingUpSnapshot {
+        total_timeouts_left: u32,
+        timeouts_left: u32,
+    },
+    // A future voter at the stage of capturing the entries
+    // after the snapshot is installed
+    CatchingUpEntries {
+        rounds_left: u32,
+        timeouts_left: u32,
+        total_timeouts_left: u32,
+    },
+    // A valid follower, which is not expected to vote, meaning the leader does not care
+    // about its timeouts or caught-up status
+    NonVoter,
+    LostVoter,
+    LostNonVoter,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum FollowerStatusKind {
+    Voter,
+    CatchingUp,
+    NonVoter,
+    Unknown,
+    LostVoter,
+    LostNonVoter,
+}
+
+impl From<Option<FollowerStatus>> for FollowerStatusKind {
+    fn from(status: Option<FollowerStatus>) -> Self {
+        match status {
+            Some(FollowerStatus::Voter { .. }) => FollowerStatusKind::Voter,
+            Some(FollowerStatus::CatchingUpSnapshot { .. }) => FollowerStatusKind::CatchingUp,
+            Some(FollowerStatus::CatchingUpEntries { .. }) => FollowerStatusKind::CatchingUp,
+            Some(FollowerStatus::NonVoter) => FollowerStatusKind::NonVoter,
+            Some(FollowerStatus::LostVoter) => FollowerStatusKind::LostVoter,
+            Some(FollowerStatus::LostNonVoter) => FollowerStatusKind::LostNonVoter,
+            None => FollowerStatusKind::Unknown,
+        }
+    }
+}
+
+impl FollowerStatus {
+    fn new_saved_voter() -> Self {
+        FollowerStatus::Voter {
+            match_index: LogIndex(0),
+        }
+    }
+
+    fn new_candidate_voter() -> Self {
+        FollowerStatus::CatchingUpSnapshot {
+            total_timeouts_left: MAX_TOTAL_TIMEOUTS,
+            timeouts_left: MAX_SNAPSHOT_TIMEOUTS,
+        }
+    }
+
+    fn new_non_voter() -> Self {
+        FollowerStatus::NonVoter
+    }
+
+    fn update_rounds(&mut self) -> Result<(), Error> {
+        if let FollowerStatus::CatchingUpEntries { rounds_left, .. } = self {
+            todo!()
+            //if *rounds_left > 0 {
+            //}
+        } else {
+            Err(Error::unreachable(debug_where!()))
+        }
+    }
+
+    // Counts a number of election timeouts left for the follower
+    // and returns true if follower has exceeded this number, which
+    // will mean it was lost
+    fn decrease_timeout(&mut self) -> bool {
+        match self {
+            FollowerStatus::CatchingUpSnapshot {
+                total_timeouts_left,
+                timeouts_left,
+            } => {
+                if *total_timeouts_left > 0 && *timeouts_left > 0 {
+                    *total_timeouts_left -= 1;
+                    *timeouts_left -= 1;
+                    false
+                } else {
+                    true
+                }
+            }
+            FollowerStatus::CatchingUpEntries {
+                total_timeouts_left,
+                timeouts_left,
+                ..
+            } => {
+                if *total_timeouts_left > 0 && *timeouts_left > 0 {
+                    *total_timeouts_left -= 1;
+                    *timeouts_left -= 1;
+                    false
+                } else {
+                    true
+                }
+            }
+            _ => false,
+        }
+    }
+
+    fn to_catching_up(self) -> Result<Self, Error> {
+        if let FollowerStatus::CatchingUpSnapshot {
+            total_timeouts_left,
+            timeouts_left,
+        } = self
+        {
+            Ok(FollowerStatus::CatchingUpEntries {
+                total_timeouts_left,
+                rounds_left: MAX_ROUNDS,
+                timeouts_left: MAX_ENTRIES_TIMEOUTS,
+            })
+        } else {
+            Err(Error::unreachable(debug_where!()))
+        }
+    }
+
+    fn to_voter(self) -> Result<Self, Error> {
+        if let FollowerStatus::CatchingUpEntries { .. } = self {
+            Ok(FollowerStatus::new_saved_voter())
+        } else {
+            Err(Error::unreachable(debug_where!()))
+        }
     }
 }
 
 pub(crate) enum CatchUpStatus {
     TooSlow,
-    NotYet,
+    NotYet(Option<FollowerStatus>),
     CaughtUp,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum ConfigChangeStage {
-    Snapshotting {
-        index: LogIndex,
-        timeouts: u32,
-        response_this_timeout: bool,
-    },
-    CatchingUp {
-        index: LogIndex,
-        rounds: u32,
-        timeouts: u32,
-        response_this_timeout: bool, // flag to measure round time
-    },
-    Committing(ConsensusConfig, LogIndex), // previous config
-}
-
-// TODO: we could adjust the amount of timeouts automatically, based on measurements
-// done for snapshotting active followers
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ConfigChange {
-    pub(crate) peer: Peer,
-    pub(crate) stage: ConfigChangeStage,
-    admin_id: AdminId,
-    total_timeouts: u32,
-    max_snapshot_timeouts: u32,
-    max_log_timeouts: u32,
-}
-
-impl ConfigChange {
-    pub(crate) fn new(
-        new_peer: ServerId,
-        admin_id: AdminId,
-        index: LogIndex,
-        metadata: Vec<u8>,
-        timeouts: SlowNodeTimeouts,
-    ) -> Self {
-        let SlowNodeTimeouts {
-            max_snapshot_timeouts,
-            max_log_timeouts,
-            max_total_timeouts,
-        } = timeouts;
-        Self {
-            peer: Peer {
-                id: new_peer,
-                metadata,
-            },
-            stage: ConfigChangeStage::Snapshotting {
-                index,
-                timeouts: max_snapshot_timeouts,
-                response_this_timeout: false,
-            },
-            admin_id,
-            total_timeouts: max_total_timeouts,
-
-            max_log_timeouts,
-            max_snapshot_timeouts,
-        }
-    }
-
-    fn transition_to_catching_up(&mut self) -> Result<(), Error> {
-        let new_stage = match self.stage {
-            ConfigChangeStage::CatchingUp { .. } => {
-                return Ok(());
-            }
-            ConfigChangeStage::Snapshotting {
-                index,
-                response_this_timeout,
-                ..
-            } => ConfigChangeStage::CatchingUp {
-                index,
-                rounds: MAX_ROUNDS,
-                timeouts: self.max_log_timeouts,
-                response_this_timeout,
-            },
-            _ => return Err(Error::unreachable(module_path!())),
-        };
-        self.stage = new_stage;
-        Ok(())
-    }
-
-    fn transition_to_snapshotting(&mut self, index: LogIndex) -> Result<(), Error> {
-        let new_stage = match self.stage {
-            ConfigChangeStage::Snapshotting { .. } => {
-                return Ok(());
-            }
-            ConfigChangeStage::CatchingUp {
-                response_this_timeout,
-                ..
-            } => ConfigChangeStage::Snapshotting {
-                index,
-                timeouts: self.max_snapshot_timeouts,
-                response_this_timeout,
-            },
-            _ => return Err(Error::unreachable(module_path!())),
-        };
-        self.stage = new_stage;
-        Ok(())
-    }
-}
+/*
+ *#[derive(Clone, Debug, PartialEq, Eq)]
+ *pub(crate) enum ConfigChangeStage {
+ *    Snapshotting {
+ *        index: LogIndex,
+ *        timeouts: u32,
+ *        response_this_timeout: bool,
+ *    },
+ *    CatchingUp {
+ *        index: LogIndex,
+ *        rounds: u32,
+ *        timeouts: u32,
+ *        response_this_timeout: bool, // flag to measure round time
+ *    },
+ *    Committing(ConsensusConfig, LogIndex), // previous config
+ *}
+ *
+ * // TODO: we could adjust the amount of timeouts automatically, based on measurements
+ * // done for snapshotting active followers
+ *#[derive(Clone, Debug, PartialEq, Eq)]
+ *pub(crate) struct ConfigChange {
+ *    pub(crate) peer: Peer,
+ *    pub(crate) stage: ConfigChangeStage,
+ *    admin_id: AdminId,
+ *    total_timeouts_left: u32,
+ *
+ *    // TODO: these are kinda options, we must move them somewhere
+ *    // into non-replicated consensus config
+ *    max_snapshot_timeouts: u32,
+ *    max_log_timeouts: u32,
+ *}
+ *
+ *impl ConfigChange {
+ *    pub(crate) fn new(
+ *        new_peer: ServerId,
+ *        admin_id: AdminId,
+ *        index: LogIndex,
+ *        metadata: Vec<u8>,
+ *        timeouts: SlowNodeTimeouts,
+ *    ) -> Self {
+ *        let SlowNodeTimeouts {
+ *            max_snapshot_timeouts,
+ *            max_log_timeouts,
+ *            max_total_timeouts,
+ *        } = timeouts;
+ *        Self {
+ *            peer: Peer {
+ *                id: new_peer,
+ *                metadata,
+ *            },
+ *            stage: ConfigChangeStage::Snapshotting {
+ *                index,
+ *                timeouts: max_snapshot_timeouts,
+ *                response_this_timeout: false,
+ *            },
+ *            admin_id,
+ *            total_timeouts_left: max_total_timeouts,
+ *
+ *            max_log_timeouts,
+ *            max_snapshot_timeouts,
+ *        }
+ *    }
+ *
+ *    fn transition_to_catching_up(&mut self) -> Result<(), Error> {
+ *        let new_stage = match self.stage {
+ *            ConfigChangeStage::CatchingUp { .. } => {
+ *                return Ok(());
+ *            }
+ *            ConfigChangeStage::Snapshotting {
+ *                index,
+ *                response_this_timeout,
+ *                ..
+ *            } => ConfigChangeStage::CatchingUp {
+ *                index,
+ *                rounds: MAX_ROUNDS,
+ *                timeouts: self.max_log_timeouts,
+ *                response_this_timeout,
+ *            },
+ *            _ => return Err(Error::unreachable(debug_where!())),
+ *        };
+ *        self.stage = new_stage;
+ *        Ok(())
+ *    }
+ *
+ *    fn transition_to_snapshotting(&mut self, index: LogIndex) -> Result<(), Error> {
+ *        let new_stage = match self.stage {
+ *            ConfigChangeStage::Snapshotting { .. } => {
+ *                return Ok(());
+ *            }
+ *            ConfigChangeStage::CatchingUp {
+ *                response_this_timeout,
+ *                ..
+ *            } => ConfigChangeStage::Snapshotting {
+ *                index,
+ *                timeouts: self.max_snapshot_timeouts,
+ *                response_this_timeout,
+ *            },
+ *            _ => return Err(Error::unreachable(debug_where!())),
+ *        };
+ *        self.stage = new_stage;
+ *        Ok(())
+ *    }
+ *}
+ */

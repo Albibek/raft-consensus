@@ -15,7 +15,7 @@ use crate::persistent_log::{LogEntry, LogEntryData};
 #[cfg(feature = "use_capnp")]
 use capnp::message::{Allocator, Builder, HeapAllocator, Reader, ReaderSegments};
 
-use crate::{config::ConsensusConfig, message::client::ClientGuarantee};
+use crate::{config::ConsensusConfig, message::client::Urgency};
 
 use crate::{LogIndex, Peer, ServerId, Term};
 
@@ -200,9 +200,9 @@ pub enum EntryData {
     /// An empty entry, which is added to every node's log at the beginning of each term
     Noop,
     /// A client proposal that should be provided to the state machine
-    Proposal(Bytes, ClientGuarantee),
+    Proposal(Bytes, Urgency),
     /// A configuration change with an flag showing if the change is active now
-    Config(ConsensusConfig, bool),
+    Config(Vec<Peer>, bool),
 }
 
 impl From<Entry> for LogEntry {
@@ -211,28 +211,12 @@ impl From<Entry> for LogEntry {
             term: e.term,
             data: match e.data {
                 EntryData::Noop => LogEntryData::Empty,
-                EntryData::Proposal(proposal, guarantee) => {
-                    LogEntryData::Proposal(proposal, guarantee)
-                }
+                EntryData::Proposal(proposal, urgency) => LogEntryData::Proposal(proposal, urgency),
                 EntryData::Config(c, _) => LogEntryData::Config(c),
             },
         }
     }
 }
-//impl Entry {
-//pub fn as_entry_ref<'a>(&'a self) -> LogEntryRef<'a> {
-//LogEntryRef {
-//term: self.term,
-//data: match self.data {
-//EntryData::Noop => LogEntryDataRef::Empty,
-//EntryData::Proposal(ref v, client, guarantee) => {
-//LogEntryDataRef::Proposal(v.as_slice(), client, guarantee)
-//}
-//EntryData::Config(ref c, _, admin) => LogEntryDataRef::Config(c, admin),
-//},
-//}
-//}
-//}
 
 #[cfg(feature = "use_capnp")]
 impl Entry {
@@ -475,14 +459,17 @@ pub struct InstallSnapshotRequest {
     /// The leader's term.
     pub term: Term,
 
-    /// For the first chunk: current cluster config
-    pub last_config: Option<ConsensusConfig>,
-
     /// Index of the last entry included in the snapshot
     pub snapshot_index: LogIndex,
 
     /// Term of the last entry included in the snapshot
     pub snapshot_term: Term,
+
+    /// For the last chunk: current cluster config
+    pub last_config: Option<Vec<Peer>>,
+
+    /// Bad follower must reset all its log
+    pub force_reset: bool,
 
     /// Snapshot bytes to pass into consensus state machine
     pub chunk_data: Vec<u8>,

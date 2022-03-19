@@ -2,8 +2,8 @@ use bytes::Bytes;
 use thiserror::Error as ThisError;
 
 use crate::persistent_log::Log;
-use crate::Term;
 use crate::{state_machine::StateMachine, LogIndex};
+use crate::{Peer, Term};
 
 use super::SnapshotInfo;
 
@@ -13,6 +13,7 @@ use super::SnapshotInfo;
 pub struct NullStateMachine<L: Log> {
     index: LogIndex,
     term: Term,
+    config: Vec<Peer>,
     state: Bytes,
     log: L,
 }
@@ -28,6 +29,7 @@ impl<L: Log> NullStateMachine<L> {
         Self {
             index: LogIndex(0),
             term: Term(0),
+            config: Vec::new(),
             state: Bytes::new(),
             log,
         }
@@ -64,6 +66,7 @@ impl<L: Log> StateMachine for NullStateMachine<L> {
             Ok(Some(SnapshotInfo {
                 index: self.index,
                 term: self.term,
+                config: self.config.clone(),
                 size: 0,
             }))
         } else {
@@ -85,10 +88,15 @@ impl<L: Log> StateMachine for NullStateMachine<L> {
         &mut self,
         index: LogIndex,
         term: Term,
+        config: Option<Vec<Peer>>,
+        _force: bool,
         _chunk_bytes: &[u8],
     ) -> Result<Option<Vec<u8>>, Error> {
         self.index = index;
         self.term = term;
+        if let Some(config) = config {
+            self.config = config;
+        }
         Ok(None)
     }
 }

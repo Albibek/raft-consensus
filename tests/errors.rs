@@ -10,12 +10,15 @@ use raft_consensus::*;
 fn test_leader_transfer_error() {
     // Test the very first stage of init: election of a leader
     // after all nodes have started as followers
-    let mut cluster = TestCluster::new(3, false);
+    let mut cluster = TestCluster::new(3);
     for node in cluster.nodes.values() {
         assert_eq!(node.kind(), ConsensusState::Follower);
     }
     cluster.kickstart();
+
     let admin_id = AdminId(uuid::Uuid::from_slice(&[0u8; 16]).unwrap());
+    cluster.add_admin(admin_id);
+
     cluster.apply_action(Action::Admin(
         admin_id,
         ServerId(0),

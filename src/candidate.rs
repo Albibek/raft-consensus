@@ -90,11 +90,9 @@ where
         from: ServerId,
         response: RequestVoteResponse,
     ) -> Result<CurrentState<M, H>, Error> {
-        debug!("RequestVoteResponse from peer {}", from);
-
         let local_term = self.current_term()?;
         let voter_term = response.voter_term();
-        let majority = self.config.majority(self.id);
+        let majority = self.config.majority();
         if local_term < voter_term {
             // Responder has a higher term number. The election is compromised; abandon it and
             // revert to follower state with the updated term number. Any further responses we
@@ -103,9 +101,8 @@ where
             // The responder is not necessarily the leader, but it is somewhat likely, so we will
             // use it as the leader hint.
             info!(
-                "received RequestVoteResponse from Consensus {{ id: {}, term: {} }} \
-                with newer term; transitioning to Follower",
-                from, voter_term
+                remote_term = %voter_term,
+                "received RequestVoteResponse from Consensus, with newer term, transitioning to follower"
             );
             let follower = self.into_follower(handler, ConsensusState::Candidate, voter_term)?;
             Ok(follower.into())
@@ -134,7 +131,7 @@ where
     }
 
     fn timeout_now(self, _handler: &mut H) -> Result<CurrentState<M, H>, Error> {
-        info!("TimeoutNow on candidate ignored");
+        info!("timeout_now on candidate ignored");
         Ok(self.into())
     }
 
@@ -274,6 +271,10 @@ where
     fn client_timeout(&mut self, _handler: &mut H) -> Result<(), Error> {
         Ok(())
     }
+
+    fn on_any_event(&mut self) -> Result<(), Error> {
+        self.common_on_any_event()
+    }
 }
 
 impl<M, H> State<M, H, Candidate>
@@ -323,18 +324,23 @@ where
 
     pub(crate) fn start_election(&mut self, handler: &mut H, voluntary: bool) -> Result<(), Error> {
         self.inc_current_term()?;
-        self.state_data.reset_votes(self.id);
+        self.state_data.reset_votes();
+        if self
+            .config
+            .peer_votes_for_self(self.latest_log_index, self.id)
+        {
+            self.state_data.record_vote(self.id)
+        }
         let id = self.id;
         self.state_machine
             .log_mut()
             .set_voted_for(Some(id))
             .map_err(|e| Error::Critical(CriticalError::PersistentLogWrite(Box::new(e))))?;
-        let latest_log_index = self.latest_log_index()?;
-        let last_log_term = self.latest_log_term(Some(latest_log_index))?;
+        let last_log_term = self.latest_log_term()?;
 
         let message = RequestVoteRequest {
             term: self.current_term()?,
-            last_log_index: latest_log_index,
+            last_log_index: self.latest_log_index,
             last_log_term,
             is_voluntary_step_down: voluntary,
         };
@@ -350,14 +356,13 @@ where
 
     // Only candidates can transition to leader
     pub(crate) fn into_leader(self, handler: &mut H) -> Result<State<M, H, Leader>, Error> {
-        trace!("id={} transitioning to leader", self.id);
-        let latest_log_index = self.latest_log_index()?;
+        trace!("transitioning to leader");
         let commit_index = self.commit_index;
 
         handler.state_changed(ConsensusState::Candidate, ConsensusState::Leader);
 
         // transition to new state
-        let state = Leader::new(latest_log_index, &self.config, &self.id);
+        let state = Leader::new(self.latest_log_index, &self.config);
         let mut leader = State {
             id: self.id,
             config: self.config,
@@ -367,6 +372,10 @@ where
             _h: PhantomData,
             state_data: state,
             options: self.options,
+            zero_log_index: self.zero_log_index,
+            latest_log_index: self.latest_log_index,
+            latest_volatile_log_index: self.latest_volatile_log_index,
+            latest_config_index: self.latest_config_index,
         };
 
         let mut message = AppendEntriesRequest::new(1);
@@ -410,9 +419,9 @@ impl Candidate {
         self.granted_votes.len()
     }
 
-    /// Reset previous votes and vote for self
-    pub fn reset_votes(&mut self, this: ServerId) {
+    /// Reset previous votes and vote for self, but only
+    /// if self is a part of current configuration
+    pub fn reset_votes(&mut self) {
         self.granted_votes.clear();
-        self.granted_votes.insert(this);
     }
 }

@@ -1,4 +1,3 @@
-use crate::config::ConsensusConfig;
 use crate::persistent_log::{Log, LogEntry, LogEntryMeta};
 use crate::{LogIndex, ServerId, Term};
 
@@ -11,7 +10,7 @@ pub struct MemLog {
     current_term: Term,
     voted_for: Option<ServerId>,
     entries: Vec<LogEntry>,
-    latest_config: Option<(ConsensusConfig, LogIndex)>,
+    latest_config_view: (LogIndex, LogIndex),
     zero_index: u64,
     zero_term: Term,
 }
@@ -22,7 +21,7 @@ impl MemLog {
             current_term: Term(0),
             voted_for: None,
             entries: Vec::new(),
-            latest_config: None,
+            latest_config_view: (LogIndex(0), LogIndex(0)),
             zero_index: 0,
             zero_term: Term(0),
         }
@@ -33,22 +32,23 @@ impl MemLog {
         let entry_index = index - self.zero_index - 1;
         self.entries.get(entry_index as usize)
     }
+
+    fn latest_index(&self) -> LogIndex {
+        if self.entries.len() == 0 {
+            // edge case: entry does not exist, but index must be there
+            self.zero_index.into()
+        } else {
+            LogIndex(self.zero_index + self.entries.len() as u64)
+        }
+    }
 }
 
 impl Log for MemLog {
     type Error = MemLogError;
 
-    fn latest_index(&self) -> Result<LogIndex, Self::Error> {
-        if self.entries.len() == 0 {
-            // edge case: entry does not exist, but index must be there
-            Ok(self.zero_index.into())
-        } else {
-            Ok(LogIndex(self.zero_index + self.entries.len() as u64))
-        }
-    }
-
-    fn zero_index(&self) -> Result<LogIndex, Self::Error> {
-        Ok(LogIndex(self.zero_index))
+    fn current_view(&self) -> Result<(LogIndex, LogIndex, LogIndex), Self::Error> {
+        let latest_index = self.latest_index();
+        Ok((LogIndex(self.zero_index), latest_index, latest_index))
     }
 
     fn term_of(&self, index: LogIndex) -> Result<Term, MemLogError> {
@@ -57,7 +57,7 @@ impl Log for MemLog {
             return Ok(self.zero_term);
         }
 
-        if index < self.zero_index || index > self.latest_index().unwrap().as_u64() {
+        if index < self.zero_index || index > self.latest_index().as_u64() {
             return Err(MemLogError::ConsensusGuarantee(
                 "consensus should not request a term for non-existent entry except zero entry"
                     .into(),
@@ -71,8 +71,25 @@ impl Log for MemLog {
             ))
     }
 
+    fn discard_until(&mut self, index: LogIndex, zero_term: Term) -> Result<(), MemLogError> {
+        let index = index.as_u64();
+        if index > self.zero_index && index <= self.latest_index().as_u64() {
+            let until = (index - self.zero_index) as usize;
+            self.entries.drain(..until);
+            self.zero_index += until as u64;
+        } else {
+            // index is beyond log indices: discard the whole log
+            // and save zero index and term
+            self.entries.clear();
+            self.zero_index = index;
+            self.zero_term = zero_term;
+        }
+
+        Ok(())
+    }
+
     fn discard_since(&mut self, index: LogIndex) -> Result<(), Self::Error> {
-        if index > self.latest_index()? {
+        if index > self.latest_index() {
             return Ok(());
         } else if index.as_u64() <= self.zero_index {
             return Err(MemLogError::ConsensusGuarantee(format!(
@@ -90,24 +107,7 @@ impl Log for MemLog {
         Ok(())
     }
 
-    fn compact_until(&mut self, index: LogIndex, zero_term: Term) -> Result<(), MemLogError> {
-        let index = index.as_u64();
-        if index > self.zero_index && index <= self.latest_index()?.as_u64() {
-            let until = (index - self.zero_index) as usize;
-            self.entries.drain(..until);
-            self.zero_index += until as u64;
-        } else {
-            // index is beyond log indices: discard the whole log
-            // and save zero index and term
-            self.entries.clear();
-            self.zero_index = index;
-            self.zero_term = zero_term;
-        }
-
-        Ok(())
-    }
-
-    fn read_entry(&self, index: LogIndex, dest: &mut LogEntry) -> Result<(), Self::Error> {
+    fn read_entry(&self, index: LogIndex, dest: &mut LogEntry) -> Result<bool, Self::Error> {
         let index: u64 = index.as_u64();
 
         if index <= self.zero_index {
@@ -118,7 +118,8 @@ impl Log for MemLog {
         }
         self.entry_at(LogIndex(index))
             .map(|entry| *dest = entry.clone())
-            .ok_or(MemLogError::BadIndex(index.into()))
+            .ok_or(MemLogError::BadIndex(index.into()))?;
+        Ok(true)
     }
 
     fn entry_meta_at(&self, index: LogIndex) -> Result<LogEntryMeta, Self::Error> {
@@ -145,7 +146,7 @@ impl Log for MemLog {
             )));
         }
 
-        let latest_index = self.latest_index()?.as_u64();
+        let latest_index = self.latest_index().as_u64();
 
         if start.as_u64() > latest_index + 1 {
             // while we can easily overcome rewriting, consensus
@@ -181,21 +182,13 @@ impl Log for MemLog {
         Ok(())
     }
 
-    fn set_latest_config(
-        &mut self,
-        config: &ConsensusConfig,
-        index: LogIndex,
-    ) -> Result<(), Self::Error> {
-        self.latest_config = Some((config.clone(), index));
+    fn set_latest_config_view(&mut self, prev: LogIndex, new: LogIndex) -> Result<(), Self::Error> {
+        self.latest_config_view = (prev, new);
         Ok(())
     }
 
-    fn latest_config(&self) -> Result<Option<ConsensusConfig>, Self::Error> {
-        Ok(self.latest_config.as_ref().map(|(c, _)| c.clone()))
-    }
-
-    fn latest_config_index(&self) -> Result<Option<LogIndex>, Self::Error> {
-        Ok(self.latest_config.as_ref().map(|(_, i)| i.clone()))
+    fn latest_config_view(&self) -> Result<(LogIndex, LogIndex), MemLogError> {
+        Ok(self.latest_config_view)
     }
 }
 

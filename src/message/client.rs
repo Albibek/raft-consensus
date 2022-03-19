@@ -58,7 +58,7 @@ impl ClientMessage {
 /// Response to client command
 pub struct ClientRequest {
     pub data: Bytes,
-    pub guarantee: ClientGuarantee,
+    pub urgency: Urgency,
 }
 
 /// Client can choose a tradeoff between network load and a lag of the request being committed by the majority.
@@ -67,7 +67,7 @@ pub struct ClientRequest {
 /// i.e. filesystem syncs or other actions
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
-pub enum ClientGuarantee {
+pub enum Urgency {
     /// Fast replication, highest network load: each client proposal is replicated ASAP.
     /// The best replicaiton time will be around the network round robin time.
     Fast,
@@ -82,9 +82,9 @@ pub enum ClientGuarantee {
     Batch,
 }
 
-impl Default for ClientGuarantee {
+impl Default for Urgency {
     fn default() -> Self {
-        ClientGuarantee::Log
+        Urgency::Log
     }
 }
 

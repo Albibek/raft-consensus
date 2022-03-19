@@ -15,8 +15,6 @@ use crate::candidate::Candidate;
 use crate::config::{ConsensusConfig, ConsensusOptions};
 use crate::follower::Follower;
 use crate::leader::Leader;
-use crate::persistent_log::Log;
-use crate::persistent_log::{LogEntry, LogEntryData};
 use crate::state_machine::StateMachine;
 use crate::{AdminId, ClientId, LogIndex, Peer, ServerId};
 
@@ -41,12 +39,13 @@ where
         Self {
             id,
             state_machine,
-            bootstrap_config: ConsensusConfig {
-                peers: vec![Peer {
-                    id: ServerId(0),
+            bootstrap_config: ConsensusConfig::new(
+                vec![Peer {
+                    id,
                     metadata: Vec::new(),
-                }],
-            },
+                }]
+                .into_iter(),
+            ),
             force_bootstrap: false,
             can_vote: None,
             state_options: ConsensusOptions::default(),
@@ -95,53 +94,24 @@ where
             state_options,
         } = self;
 
-        let config = if let Some(index) = state_machine
-            .log()
-            .latest_config_index()
-            .map_err(|e| Error::PersistentLogRead(Box::new(e)))?
-        {
-            if index == LogIndex(0) || force_bootstrap {
-                bootstrap_config
-            } else {
-                let mut entry = LogEntry::default();
-                state_machine
-                    .log()
-                    .read_entry(index, &mut entry)
-                    .map_err(|e| Error::PersistentLogRead(Box::new(e)))?;
-                if let LogEntryData::Config(config) = entry.data {
-                    config
-                } else {
-                    return Err(Error::unreachable(module_path!()));
-                }
-            }
-        } else {
-            bootstrap_config
-        };
-
-        let can_vote = if let Some(can_vote) = can_vote {
-            can_vote
-        } else {
-            config.has_peer(id)
-        };
-
-        if can_vote {
-            handler.set_timeout(Timeout::Election);
-        }
-
-        let state = State {
+        let mut state = State {
             id,
-            config,
+            config: bootstrap_config,
             state_machine,
             commit_index: LogIndex(0),
-            // TODO: after snapshots min_index should be the index from snapshot
             min_index: LogIndex(0),
-            state_data: Follower::new(can_vote),
+            state_data: Follower::new(),
             options: state_options,
+            zero_log_index: LogIndex(0),
+            latest_log_index: LogIndex(0),
+            latest_volatile_log_index: LogIndex(0),
+            latest_config_index: LogIndex(0),
             _h: PhantomData,
         };
-        trace!("new consensus id={} initialized", id);
+
+        trace!(?id, "new consensus initialized");
         Ok(Raft {
-            state: state.into(),
+            state: state.initialize(handler)?,
             _h: PhantomData,
         })
     }

@@ -1,6 +1,6 @@
 use bytes::Bytes;
 
-use crate::message::ClientGuarantee;
+use crate::message::Urgency;
 use crate::persistent_log::{LogEntry, LogEntryData};
 use crate::{ConsensusConfig, Log, LogIndex, Peer, StateMachine, Term};
 
@@ -46,30 +46,34 @@ where
         };
         let proposal_entry = LogEntry {
             term: Term(0),
-            data: LogEntryData::Proposal(Bytes::from("hi"), ClientGuarantee::Fast),
+            data: LogEntryData::Proposal(Bytes::from("hi"), Urgency::Fast),
         };
-        let config = ConsensusConfig {
-            peers: vec![Peer::new(42.into()), Peer::new(69.into())],
-        };
-        let config_entry = LogEntry {
-            term: Term(1),
-            data: LogEntryData::Config(config.clone()),
-        };
-        log.append_entries(
-            LogIndex(1),
-            &[
-                empty_entry.clone(),
-                proposal_entry.clone(),
-                config_entry.clone(),
-            ],
-        )
-        .unwrap();
-        log.sync().unwrap();
-        machine.apply(LogIndex(1), false).unwrap();
-        machine.apply(LogIndex(2), false).unwrap();
-        machine.apply(LogIndex(3), false).unwrap();
-        machine.sync().unwrap();
-        assert_eq!(machine.last_applied().unwrap(), LogIndex(3));
+
+        let config =
+            ConsensusConfig::new(vec![Peer::new(42.into()), Peer::new(69.into())].into_iter());
+        todo!("fix machine tests");
+        /*
+         *
+         *        let config_entry = LogEntry {
+         *            term: Term(1),
+         *            data: LogEntryData::Config(config.clone()),
+         *        };
+         *        log.append_entries(
+         *            LogIndex(1),
+         *            &[
+         *                empty_entry.clone(),
+         *                proposal_entry.clone(),
+         *                config_entry.clone(),
+         *            ],
+         *        )
+         *        .unwrap();
+         *        log.sync().unwrap();
+         *        machine.apply(LogIndex(1), false).unwrap();
+         *        machine.apply(LogIndex(2), false).unwrap();
+         *        machine.apply(LogIndex(3), false).unwrap();
+         *        machine.sync().unwrap();
+         *        assert_eq!(machine.last_applied().unwrap(), LogIndex(3));
+         */
     }
 
     pub fn test_snapshot_index_and_term_correct(&mut self) {
@@ -79,7 +83,7 @@ where
         for i in 1..9 {
             entries.push(LogEntry {
                 term: Term(i),
-                data: LogEntryData::Proposal(Bytes::from(format!("{}", i)), ClientGuarantee::Log),
+                data: LogEntryData::Proposal(Bytes::from(format!("{}", i)), Urgency::Log),
             });
         }
         log.append_entries(LogIndex(1), &entries).unwrap();
@@ -106,7 +110,7 @@ where
         let source_log = source_machine.log_mut();
         let proposal_entry = LogEntry {
             term: Term(2),
-            data: LogEntryData::Proposal(Bytes::from("hi"), ClientGuarantee::Fast),
+            data: LogEntryData::Proposal(Bytes::from("hi"), Urgency::Fast),
         };
 
         source_log
@@ -137,5 +141,7 @@ where
         assert_eq!(info.index, LogIndex(1));
         assert_eq!(info.term, Term(2));
         assert_eq!(dest_machine.last_applied().unwrap(), LogIndex(1));
+
+        todo!("last chunk must contain Some(config)");
     }
 }

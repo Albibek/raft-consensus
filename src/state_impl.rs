@@ -10,7 +10,7 @@ use crate::raft::CurrentState;
 
 /// Applies a peer message to the consensus in state specified by S
 pub(crate) fn apply_peer_message<M, S: StateImpl<M, H>, H: Handler>(
-    s: S,
+    mut s: S,
     handler: &mut H,
     from: ServerId,
     message: PeerMessage,
@@ -19,6 +19,7 @@ where
     M: StateMachine,
     H: Handler,
 {
+    s.on_any_event()?;
     match message {
         PeerMessage::AppendEntriesRequest(request) => {
             // request produces response and optionally - new state
@@ -79,6 +80,7 @@ where
     M: StateMachine,
     H: Handler,
 {
+    s.on_any_event()?;
     match timeout {
         Timeout::Election => s.election_timeout(handler),
         Timeout::Heartbeat(id) => {
@@ -105,6 +107,7 @@ where
     M: StateMachine,
     H: Handler,
 {
+    s.on_any_event()?;
     match message {
         ClientMessage::ClientProposalRequest(req) => {
             let response = s.client_proposal_request(handler, from, req)?;
@@ -139,6 +142,7 @@ where
     M: StateMachine,
     H: Handler,
 {
+    s.on_any_event()?;
     match message {
         AdminMessage::AddServerRequest(request) => {
             let message = s.add_server_request(handler, from, request)?;
@@ -298,6 +302,7 @@ where
     ) -> Result<ConfigurationChangeResponse, Error>;
 
     // Utility messages and actions
+    fn on_any_event(&mut self) -> Result<(), Error>;
     fn peer_connected(&mut self, handler: &mut H, peer: ServerId) -> Result<(), Error>;
 
     fn into_consensus_state(self) -> CurrentState<M, H>;

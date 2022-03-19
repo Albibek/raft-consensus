@@ -21,7 +21,7 @@ use raft_consensus::*;
 
 #[test]
 fn test_local_compaction() {
-    let mut cluster = TestCluster::new(3, false);
+    let mut cluster = TestCluster::new(3);
     for node in cluster.nodes.values() {
         assert_eq!(node.kind(), ConsensusState::Follower);
     }
@@ -30,6 +30,7 @@ fn test_local_compaction() {
     let client_id = ClientId(uuid::Uuid::from_slice(&[0u8; 16]).unwrap());
     let leader_id = ServerId(0);
 
+    cluster.add_client(client_id);
     // client proposal will be inserted at LogIndex = 2
     let query = Bytes::from((&[0, 0, 0, 42]).as_slice());
     cluster.apply_action(Action::Client(
@@ -37,7 +38,7 @@ fn test_local_compaction() {
         leader_id,
         ClientMessage::ClientProposalRequest(ClientRequest {
             data: query.clone(),
-            guarantee: ClientGuarantee::Fast,
+            urgency: Urgency::Fast,
         }),
     ));
 
@@ -64,7 +65,7 @@ fn test_local_compaction() {
 
 #[test]
 fn test_snapshot_transfer_on_follower_failure() {
-    let mut cluster = TestCluster::new(3, false);
+    let mut cluster = TestCluster::new(3);
     for node in cluster.nodes.values() {
         assert_eq!(node.kind(), ConsensusState::Follower);
     }
@@ -72,6 +73,7 @@ fn test_snapshot_transfer_on_follower_failure() {
     // LogIndex = 1 because of empty entry after voting)
     let client_id = ClientId(uuid::Uuid::from_slice(&[0u8; 16]).unwrap());
     let leader_id = ServerId(0);
+    cluster.add_client(client_id);
 
     // client proposal will be inserted at LogIndex = 2
     let query = Bytes::from((&[0, 0, 0, 42]).as_slice());
@@ -80,7 +82,7 @@ fn test_snapshot_transfer_on_follower_failure() {
         leader_id,
         ClientMessage::ClientProposalRequest(ClientRequest {
             data: query.clone(),
-            guarantee: ClientGuarantee::Fast,
+            urgency: Urgency::Fast,
         }),
     ));
 
@@ -100,7 +102,7 @@ fn test_snapshot_transfer_on_follower_failure() {
 
     // emulate follower fail by recreating the one from scratch
     // false is the same as at the beginning: disables chunking at state machine
-    cluster.add_node(ServerId(2), false);
+    cluster.add_node(ServerId(2));
 
     // now apply the timeouts and make sure leader will send the snapshot to ServerId(2)
     cluster.apply_heartbeats();
@@ -117,7 +119,8 @@ fn test_snapshot_transfer_on_follower_failure() {
 }
 #[test]
 fn test_snapshot_transfer_chunked() {
-    let mut cluster = TestCluster::new(3, true);
+    let mut cluster = TestCluster::new(3);
+    cluster.chunked_machine = true;
     for node in cluster.nodes.values() {
         assert_eq!(node.kind(), ConsensusState::Follower);
     }
@@ -125,6 +128,7 @@ fn test_snapshot_transfer_chunked() {
     // LogIndex = 1 because of empty entry after voting)
     let client_id = ClientId(uuid::Uuid::from_slice(&[0u8; 16]).unwrap());
     let leader_id = ServerId(0);
+    cluster.add_client(client_id);
 
     // client proposal will be inserted at LogIndex = 2
     let query = Bytes::from((&[0, 0, 0, 42]).as_slice());
@@ -133,7 +137,7 @@ fn test_snapshot_transfer_chunked() {
         leader_id,
         ClientMessage::ClientProposalRequest(ClientRequest {
             data: query.clone(),
-            guarantee: ClientGuarantee::Log,
+            urgency: Urgency::Log,
         }),
     ));
 

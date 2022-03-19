@@ -124,10 +124,10 @@ struct ClientMessage {
 
     struct ClientRequest {
         data @0 :Data;
-        guarantee @1 :ClientGuarantee;
+        urgency @1 :ClientUrgency;
     }
 
-    struct ClientGuarantee {
+    struct ClientUrgency {
         union {
             instant @0 :Void;
             fast @1 :Void;

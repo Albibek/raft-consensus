@@ -5,7 +5,7 @@ use std::iter::FromIterator;
 use crate::error::Error;
 use crate::message::Timeout;
 
-use crate::{Peer, ServerId};
+use crate::{debug_where, LogIndex, Peer, ServerId};
 
 pub use crate::handler::Handler;
 pub use crate::persistent_log::Log;
@@ -13,65 +13,195 @@ pub use crate::state_machine::StateMachine;
 
 /// Full cluster config replicated using Raft mechanism. Always stores all
 /// nodes, including self.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-#[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+//#[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
 pub struct ConsensusConfig {
     pub peers: Vec<Peer>,
+    pending: PendingChange,
 }
 
 impl ConsensusConfig {
-    pub fn new<I: Iterator<Item = Peer>>(peers: I) -> Self {
+    pub fn uninitialized() -> Self {
         Self {
-            peers: Vec::from_iter(peers),
+            peers: Vec::new(),
+            pending: PendingChange::default(),
         }
     }
 
+    pub fn new<I: Iterator<Item = Peer>>(peers: I) -> Self {
+        Self {
+            peers: Vec::from_iter(peers),
+            pending: PendingChange::default(),
+        }
+    }
+
+    /// Creates a pending config from self and the one provided
+    pub(crate) fn update_from_new(&mut self, new_peers: &[Peer]) -> Result<(), Error> {
+        if self.pending != PendingChange::Nothing {
+            return Err(Error::ConfigChangeExists);
+        }
+
+        if new_peers.is_empty() {
+            return Err(Error::LastNodeRemoval);
+        }
+        if (new_peers.len() as isize - self.peers.len() as isize).abs() > 1 {
+            // We also support changing meta, i.e. when
+            // no peer ids get changed.
+            // This will require pushing and commiting the config entry
+            // in the same way it is done when peers change.
+            return Err(Error::ConfigChangeTooBig);
+        }
+
+        for peer in self.peers {
+            if !new_peers.iter().any(|new_peer| new_peer.id == peer.id) {
+                if self.pending != PendingChange::Nothing {
+                    return Err(Error::ConfigChangeTooBig);
+                } else {
+                    self.pending = PendingChange::Remove(peer.clone());
+                }
+            }
+        }
+        for new_peer in new_peers {
+            if !self.has_peer(new_peer.id) {
+                if self.pending != PendingChange::Nothing {
+                    return Err(Error::ConfigChangeTooBig);
+                } else {
+                    self.pending = PendingChange::Add(new_peer.clone());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[inline]
+    pub(crate) fn is_initialized(&self) -> bool {
+        !self.peers.is_empty()
+    }
+
+    #[inline]
     pub(crate) fn is_solitary(&self, this: ServerId) -> bool {
         self.peers.len() == 1 && self.peers[0].id == this
     }
 
+    #[inline]
+    pub(crate) fn has_pending_removal(&self) -> bool {
+        if let PendingChange::Remove(_) = self.pending {
+            true
+        } else {
+            false
+        }
+    }
+
+    #[inline]
+    pub(crate) fn has_pending_removal_for(&self, id: ServerId) -> bool {
+        if let PendingChange::Remove(peer) = self.pending {
+            id == peer.id
+        } else {
+            false
+        }
+    }
+
+    #[inline]
     pub(crate) fn has_peer(&self, peer: ServerId) -> bool {
         self.peers.iter().any(|p| p.id == peer)
     }
 
-    // Smart configuration change: adds peer if it was not in the list of peers
-    // removes peer it it was there.
-    // Returns true, if adding was done, false if removing was done
-    pub(crate) fn add_or_remove_peer(&mut self, peer: Peer) -> Result<bool, Error> {
-        if let Some(pos) = self
-            .peers
-            .iter()
-            .position(|self_peer| self_peer.id == peer.id)
-        {
-            // peer esxisted - remove it
-            if self.peers.len() == 1 {
-                return Err(Error::LastNodeRemoval);
-            }
-            self.peers.swap_remove(pos);
-
-            Ok(false)
-        } else {
-            // peer is not in list, adding a new one
-            self.peers.push(peer);
-            Ok(true)
+    pub(crate) fn has_pending_peer(&self, id: ServerId) -> bool {
+        match self.pending {
+            PendingChange::Nothing => false,
+            PendingChange::Add(peer) => peer.id == id,
+            PendingChange::Remove(peer) => peer.id == id,
         }
     }
 
+    pub(crate) fn has_changes(&self) -> bool {
+        self.pending != PendingChange::Nothing
+    }
+
+    // Moves pending change into the main configuration
+    pub(crate) fn commit_pending(&mut self) {
+        let pending = PendingChange::Nothing;
+        std::mem::swap(&mut pending, &mut self.pending);
+        match pending {
+            PendingChange::Nothing => {}
+            PendingChange::Add(peer) => self.peers.push(peer),
+            PendingChange::Remove(peer) => {
+                if let Some(pos) = self.peers.iter().position(|p| p.id == peer.id) {
+                    self.peers.swap_remove(pos);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn cancel_pending(&mut self) {
+        self.pending = PendingChange::Nothing;
+    }
+
     // Get the cluster quorum majority size.
-    pub(crate) fn majority(&self, this: ServerId) -> usize {
+    // Assumes config is already persisted.
+    pub(crate) fn majority(&self) -> usize {
         let peers = self.peers.len();
-        // paper 4.2.2: node shoult not include itself to majority if it is
-        // not a cluster member, but still have to start voting
-        if self.has_peer(this) {
-            (peers >> 1) + 1
+        if peers == 1 {
+            return 1;
+        }
+        let peers = match &self.pending {
+            // there is no problem when no config changes happen
+            PendingChange::Nothing => peers,
+
+            // if new peer is being added, it must be counted, but only
+            // if it is not added by mistake (which may be unreachable,
+            // but we can handle it so why not)
+            PendingChange::Add(added) => {
+                if !self.has_peer(added.id) {
+                    // only if the added peer
+                    // was not in previous config
+                    peers + 1
+                } else {
+                    peers
+                }
+            }
+
+            // if the peer is being removed, it should not be included in the majority, but
+            // only if it existed in previous configuration
+            PendingChange::Remove(removed) => {
+                if self.has_peer(removed.id) {
+                    // only when config is already persisted as entry
+                    // and if node existed in previous configuration
+                    // we should not count it as majority
+                    // it conforms 4.2.2 as well
+                    peers - 1
+                } else {
+                    peers
+                }
+            }
+        };
+        peers >> 1
+    }
+
+    pub(crate) fn peer_votes_for_self(&self, latest_index: LogIndex, id: ServerId) -> bool {
+        // 4.2.2 a server that is not part of its own latest configuration should still start
+        // new elections, as it might still be needed until the Cnew entry is committed (as in Figure 4.6). It does
+        // not count its own vote in elections unless it is part of its latest configuration.
+        if let PendingChange::Remove(peer) = &self.pending {
+            peer.id == id
         } else {
-            peers >> 1
+            true
         }
     }
 
     pub(crate) fn clear_heartbeats<H: Handler>(&self, handler: &mut H) {
         for peer in &self.peers {
             handler.clear_timeout(Timeout::Heartbeat(peer.id));
+        }
+    }
+
+    pub(crate) fn with_all_peers<F>(&self, mut f: F)
+    where
+        F: FnMut(&ServerId) -> Result<(), Error>,
+    {
+        self.peers.iter().map(|peer| f(&peer.id)).last();
+        if let PendingChange::Add(peer) = self.pending {
+            f(&peer.id);
         }
     }
 
@@ -87,12 +217,25 @@ impl ConsensusConfig {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
+pub enum PendingChange {
+    Nothing,
+    Add(Peer),
+    Remove(Peer),
+}
+
+impl Default for PendingChange {
+    fn default() -> Self {
+        PendingChange::Nothing
+    }
+}
+
 /// Tunables for each node. This config is per node and not replicated.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ConsensusOptions {
     pub timeouts: SlowNodeTimeouts,
 }
-
 
 /// Raft paper describes a multiple-round method for catching up the log where the size of the
 /// message is reduced each round due to number of log entries decreasing.
@@ -130,27 +273,3 @@ impl Default for SlowNodeTimeouts {
         }
     }
 }
-
-//TODO
-//#[cfg(test)]
-//mod test {
-
-//// Tests the majority function.
-//#[test]
-//fn test_majority() {
-//let peers = TestCluster::new(1).peers;
-//let majority = peers.values().next().unwrap().majority();
-//assert_eq!(1, majority);
-
-//let peers = TestCluster::new(2).peers;
-//let majority = peers.values().next().unwrap().majority();
-//assert_eq!(2, majority);
-
-//let peers = TestCluster::new(3).peers;
-//let majority = peers.values().next().unwrap().majority();
-//assert_eq!(2, majority);
-//let peers = TestCluster::new(4).peers;
-//let majority = peers.values().next().unwrap().majority();
-//assert_eq!(3, majority);
-//}
-//}

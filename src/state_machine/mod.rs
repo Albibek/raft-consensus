@@ -10,8 +10,9 @@ use bytes::Bytes;
 //pub use crate::state_machine::channel::ChannelStateMachine;
 use crate::persistent_log::Log;
 pub use crate::state_machine::null::NullStateMachine;
-use crate::{LogIndex, Term};
+use crate::{LogIndex, Peer, Term};
 
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SnapshotInfo {
     /// Last index of the entry contained in the snapshot
     pub index: LogIndex,
@@ -19,9 +20,23 @@ pub struct SnapshotInfo {
     /// Term of the last entry contained in the snapshot
     pub term: Term,
 
-    /// Size of snapshot in bytes (for decisions about snapshotting at the consensus level, i.e.
-    /// comparing log size with snapshot size)
+    /// The latest consensus config known to snapshot
+    pub config: Vec<Peer>,
+
+    /// Size of snapshot in bytes (for decisions about snapshotting at the consensus level,
+    /// for example, comparing log size with snapshot size)
     pub size: usize,
+}
+
+impl Default for SnapshotInfo {
+    fn default() -> Self {
+        Self {
+            index: LogIndex(0),
+            term: Term(0),
+            config: Vec::new(),
+            size: 0,
+        }
+    }
 }
 
 /// This trait is meant to be implemented such that the commands issued to it via `apply()` will
@@ -75,14 +90,21 @@ pub trait StateMachine {
 
     /// Applies a command to the state machine. A command should be already stored in the specified log index.
     /// Asynchronous machines may decide if last_applied should be increased at once, but if not,
-    /// they should expect the same index to be requested multiple times.
+    /// they should expect the same index to be requested multiple times along with having gaps
+    /// between machine's last_applied and the requested index.
     ///
-    /// If `results_required` is true, should return an application-specific result value which will
+    /// If `results_required` is true, should return an implementation-specific result value which will
     /// be forwarded to client. `results_required` may be false when the command is applied on a follower which is not
     /// expected to reply to a client.
-    /// Function may return None in cases where result is not required or in any other situation.
-    /// For example a client, which does not expect answer at all or uses `query()` for polling
-    /// state machine.
+    ///
+    /// It should be noted, that despite of possible machine asynchronousness, the result have to
+    /// be returned immediately, i.e. potentially before the real persistence. For example, it could be a good
+    /// idea to have some "queued" mesage, or just returning None and requiring clients to poll the
+    /// machine later.
+    ///
+    /// Function may return None in cases where result is delayed, not required or, in any other situation.
+    /// In case of None being returned, no response will be sent to the client after calling this
+    /// function.
     fn apply(
         &mut self,
         index: LogIndex,
@@ -125,20 +147,30 @@ pub trait StateMachine {
     /// i.e. to create a correct request for the next chunk or to understand that there is no more chunks left.
     fn read_snapshot_chunk(&self, request: Option<&[u8]>) -> Result<Vec<u8>, Self::Error>;
 
-    /// Should write a part of externally initiated new snapshot. May make it current if
-    /// all chunks are received. Is is also up to the implementation to decide if the snapshot
-    /// is a new one and how it should be recreated based on log index.
+    /// Should write a part of externally initiated new snapshot.
     ///
-    /// The index and term must be saved to be returned from snapshot_info.
+    /// Numbering of chunks is left to implementation and.
+    /// After receiving the last chunk:
+    /// * If force flag is set, than the snapshot must be made current at
+    /// the required index even if there was some previously taken
+    /// snapshots or if there is other inconsistency.
+    /// * If force flag is false, then is is up to the implementation to decide on
+    /// whatever should be done on the snapshot. Still, it is good to know, that
+    /// most probably snapshot_info will be called after writing the last chunk right away.
     ///
-    /// The returned value is a request for the next chunk or None if the
-    /// chunk is the last one. On follower any returned value, including None, will be sent to leader
-    /// to let leader know that the chunk was the last one which will mean the follower is ready
-    /// to apply entries from the log.
+    /// The snapshot is expected to be consistent with index term and provided config.
+    /// These values must be persisted and returned from snapshot_info if corresponsing
+    /// snapshot is in place.
+    ///
+    /// The returned value have to be a request for the next chunk or None if no more
+    /// chunks are required from the remote side. On follower this last None value will
+    /// also be sent to leader, but will not be passed to read_snapshot_chunk at leader's state machine.
     fn write_snapshot_chunk(
         &mut self,
         index: LogIndex,
         term: Term,
+        config: Option<Vec<Peer>>,
+        force: bool,
         chunk_bytes: &[u8],
     ) -> Result<Option<Vec<u8>>, Self::Error>;
 

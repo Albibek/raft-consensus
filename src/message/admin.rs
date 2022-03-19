@@ -72,6 +72,7 @@ pub enum ConfigurationChangeResponse {
     LeaderJustChanged,
     AlreadyPending,
     UnknownLeader,
+    NoAliveFollowers,
     NotLeader(ServerId),
 }
 

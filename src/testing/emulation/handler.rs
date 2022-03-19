@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::collections::VecDeque;
 
 use crate::message::*;
@@ -19,6 +20,10 @@ pub enum Action {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TestHandler {
     pub cur: ServerId,
+
+    pub peers: HashSet<ServerId>,
+    pub clients: HashSet<ClientId>,
+    pub admins: HashSet<AdminId>,
 
     pub peer_network: HashMap<(ServerId, ServerId), VecDeque<PeerMessage>>,
     /// handler is used only to send responses, not the requests
@@ -127,37 +132,65 @@ impl Handler for TestHandler {
 }
 
 impl TestHandler {
-    pub fn new(size: usize) -> Self {
-        let mut peer_network = HashMap::new();
-        for i in 0..size {
-            for j in 0..size {
-                if i != j {
-                    peer_network.insert((ServerId(i as u64), ServerId(j as u64)), VecDeque::new());
-                }
-            }
-        }
-
-        let client_id = ClientId(uuid::Uuid::from_slice(&[0u8; 16]).unwrap());
-        let mut client_network = HashMap::new();
-        for i in 0..size {
-            client_network.insert((ServerId(i as u64), client_id), VecDeque::new());
-        }
-
-        let admin_id = AdminId(uuid::Uuid::from_slice(&[0u8; 16]).unwrap());
-        let mut admin_network = HashMap::new();
-        for i in 0..size {
-            admin_network.insert((ServerId(i as u64), admin_id), VecDeque::new());
-        }
-
+    pub fn new() -> Self {
         Self {
             cur: ServerId(u64::MAX),
-            peer_network,
-            client_network,
-            admin_network,
+
+            peers: HashSet::new(),
+            clients: HashSet::new(),
+            admins: HashSet::new(),
+
+            peer_network: HashMap::new(),
+            client_network: HashMap::new(),
+            admin_network: HashMap::new(),
 
             election_timeouts: HashMap::new(),
             heartbeat_timeouts: HashMap::new(),
             client_timeouts: HashMap::new(),
+        }
+    }
+
+    pub fn add_node(&mut self, id: ServerId) {
+        if self.peers.contains(&id) {
+            // do not change existing nodes
+            return;
+        }
+
+        if self.peers.len() == 0 {
+            self.peers.insert(id);
+            return;
+        }
+
+        // connect each other peer to the new one
+        for peer in self.peers.iter().cloned() {
+            self.peer_network.insert((peer, id), VecDeque::new());
+            self.peer_network.insert((id, peer), VecDeque::new());
+        }
+        // then add the peer to list
+        self.peers.insert(id);
+    }
+
+    pub fn add_client(&mut self, id: ClientId) {
+        if self.clients.contains(&id) {
+            // do not change existing nodes
+            return;
+        }
+        self.clients.insert(id);
+
+        for peer in self.peers.iter().cloned() {
+            self.client_network.insert((peer, id), VecDeque::new());
+        }
+    }
+
+    pub fn add_admin(&mut self, id: AdminId) {
+        if self.admins.contains(&id) {
+            // do not change existing nodes
+            return;
+        }
+        self.admins.insert(id);
+
+        for peer in self.peers.iter().cloned() {
+            self.admin_network.insert((peer, id), VecDeque::new());
         }
     }
 

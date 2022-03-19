@@ -13,6 +13,7 @@ use raft_consensus::*;
 /// Tests for green scenarios(when network works OK, and nodes do not fail)
 
 // TODO: test stale leader (leader with lower term than rest of the cluster)
+//
 // TODO: test solitary leader (1-node cluster):
 // Tests that a consensus state machine with no peers will transitition immediately to the
 // leader state upon the first election timeout.
@@ -28,12 +29,15 @@ use raft_consensus::*;
 // dropped. See https://github.com/ktoso/akka-raft/issues/66; it's
 // not actually something that can happen in practice with TCP, but
 // still possible with UDP and it would be better to avoid it anyways
+//
+// TODO: test multiple clients adding entries with different urgencies, make sure the state machines
+// are equal and clients get their responses right
 
 #[test]
 fn test_kickstart() {
     // Test the very first stage of init: election of a leader
     // after all nodes have started as followers
-    let mut cluster = TestCluster::new(3, false);
+    let mut cluster = TestCluster::new(3);
     for node in cluster.nodes.values() {
         assert_eq!(node.kind(), ConsensusState::Follower);
     }
@@ -68,7 +72,7 @@ fn test_kickstart() {
 fn test_sticky_leader() {
     // Test the very first stage of init: election of a leader
     // after all nodes have started as followers
-    let mut cluster = TestCluster::new(3, false);
+    let mut cluster = TestCluster::new(3);
     for node in cluster.nodes.values() {
         assert_eq!(node.kind(), ConsensusState::Follower);
     }
@@ -102,12 +106,14 @@ fn test_sticky_leader() {
 #[test]
 fn test_leader_transfer_auto() {
     // Test the leader transfer where any follower node can become a leader
-    let mut cluster = TestCluster::new(3, false);
+    let mut cluster = TestCluster::new(3);
     for node in cluster.nodes.values() {
         assert_eq!(node.kind(), ConsensusState::Follower);
     }
     cluster.kickstart();
     let admin_id = AdminId(uuid::Uuid::from_slice(&[0u8; 16]).unwrap());
+
+    cluster.add_admin(admin_id);
     cluster.apply_action(Action::Admin(
         admin_id,
         ServerId(0),
@@ -147,12 +153,13 @@ fn test_leader_transfer_auto() {
 #[test]
 fn test_leader_transfer_manual() {
     // Test the leader transfer when leader ID is specified explicitly
-    let mut cluster = TestCluster::new(3, false);
+    let mut cluster = TestCluster::new(3);
     for node in cluster.nodes.values() {
         assert_eq!(node.kind(), ConsensusState::Follower);
     }
     cluster.kickstart();
     let admin_id = AdminId(uuid::Uuid::from_slice(&[0u8; 16]).unwrap());
+    cluster.add_admin(admin_id);
     cluster.apply_action(Action::Admin(
         admin_id,
         ServerId(0),
@@ -172,7 +179,7 @@ fn test_leader_transfer_manual() {
 
 #[test]
 fn test_client_proposal_default() {
-    let mut cluster = TestCluster::new(3, false);
+    let mut cluster = TestCluster::new(3);
     for node in cluster.nodes.values() {
         assert_eq!(node.kind(), ConsensusState::Follower);
     }
@@ -181,6 +188,7 @@ fn test_client_proposal_default() {
     let client_id = ClientId(uuid::Uuid::from_slice(&[0u8; 16]).unwrap());
     let leader_id = ServerId(0);
 
+    cluster.add_client(client_id);
     // client proposal will be inserted at LogIndex = 2
     let query = Bytes::from((&[0, 0, 0, 42]).as_slice());
     cluster.apply_action(Action::Client(
@@ -188,10 +196,10 @@ fn test_client_proposal_default() {
         leader_id,
         ClientMessage::ClientProposalRequest(ClientRequest {
             data: query.clone(),
-            guarantee: ClientGuarantee::default(),
+            urgency: Urgency::default(),
         }),
     ));
-    // send the proposal to followers (after timeout, because of default client guarantee)
+    // send the proposal to followers (after timeout, because of default client urgency)
     // and process their responses
     cluster.apply_heartbeats();
     cluster.apply_peer_packets();
@@ -202,7 +210,7 @@ fn test_client_proposal_default() {
         .get(&(leader_id, client_id))
         .unwrap();
 
-    dbg!(responses);
+    trace!(?responses);
 
     // TODO: apply client packets, make sure the hash is good there
 
@@ -219,14 +227,19 @@ fn test_client_proposal_default() {
     let expected_hash = hasher.finish();
 
     for (id, node) in &cluster.nodes {
-        dbg!(id, node.state_machine().unwrap().state, expected_hash);
-        assert_eq!(node.state_machine().unwrap().state, expected_hash);
+        //       dbg!(id, node.state_machine().unwrap().state, expected_hash);
+        assert_eq!(
+            node.state_machine().unwrap().state,
+            expected_hash,
+            "id={:?}",
+            id
+        );
     }
 }
 
 #[test]
 fn test_client_proposal_fast() {
-    let mut cluster = TestCluster::new(3, false);
+    let mut cluster = TestCluster::new(3);
     for node in cluster.nodes.values() {
         assert_eq!(node.kind(), ConsensusState::Follower);
     }
@@ -235,6 +248,7 @@ fn test_client_proposal_fast() {
     let client_id = ClientId(uuid::Uuid::from_slice(&[0u8; 16]).unwrap());
     let leader_id = ServerId(0);
 
+    cluster.add_client(client_id);
     // client proposal will be inserted at LogIndex = 2
     let query = Bytes::from((&[0, 0, 0, 42]).as_slice());
     cluster.apply_action(Action::Client(
@@ -242,11 +256,11 @@ fn test_client_proposal_fast() {
         leader_id,
         ClientMessage::ClientProposalRequest(ClientRequest {
             data: query.clone(),
-            guarantee: ClientGuarantee::Fast,
+            urgency: Urgency::Fast,
         }),
     ));
     // send the proposal to followers
-    // NOTE: there is no heartbeat timeout calls here, client guarantee must
+    // NOTE: there is no heartbeat timeout calls here, client urgency must
     // send the entry to followers immediately
     //
     // process follower responses which must result in sending the immediate pings,
@@ -270,7 +284,7 @@ fn test_client_proposal_fast() {
 
 #[test]
 fn test_client_proposal_batch() {
-    let mut cluster = TestCluster::new(3, false);
+    let mut cluster = TestCluster::new(3);
     for node in cluster.nodes.values() {
         assert_eq!(node.kind(), ConsensusState::Follower);
     }
@@ -279,6 +293,7 @@ fn test_client_proposal_batch() {
     let client_id = ClientId(uuid::Uuid::from_slice(&[0u8; 16]).unwrap());
     let leader_id = ServerId(0);
 
+    cluster.add_client(client_id);
     // client proposal will be inserted at LogIndex = 2
     let query = Bytes::from((&[0, 0, 0, 42]).as_slice());
     cluster.apply_action(Action::Client(
@@ -286,7 +301,7 @@ fn test_client_proposal_batch() {
         leader_id,
         ClientMessage::ClientProposalRequest(ClientRequest {
             data: query.clone(),
-            guarantee: ClientGuarantee::Batch,
+            urgency: Urgency::Batch,
         }),
     ));
     // "send" the proposal to followers:

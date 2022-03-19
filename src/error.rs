@@ -30,6 +30,12 @@ pub enum Error {
     #[error("unknown peer")]
     UnknownPeer(ServerId),
 
+    #[error("another configuration change is pending")]
+    ConfigChangeExists,
+
+    #[error("only one node can be changed by request")]
+    ConfigChangeTooBig,
+
     #[error("unexpected message")]
     UnexpectedMessage,
 
@@ -92,6 +98,9 @@ pub enum CriticalError {
 
     #[error("BUG: log returned existing voted_for in a solitary consensus: {}", _0)]
     LogInconsistentVoted(ServerId),
+
+    #[error("Config must contain at least one peer")]
+    EmptyConfig,
 
     #[error("Consensus state become unrecoverable after last error, consensus cannot proceed")]
     Unrecoverable,
