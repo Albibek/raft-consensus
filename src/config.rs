@@ -14,23 +14,32 @@ pub use crate::state_machine::StateMachine;
 /// Full cluster config replicated using Raft mechanism. Always stores all
 /// nodes, including self.
 #[derive(Debug, Clone, PartialEq, Eq)]
-//#[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
 pub struct ConsensusConfig {
-    pub peers: Vec<Peer>,
+    /// all voting peers committed to config
+    pub voters: Vec<Peer>,
+    /// all voter candidates, not persisted until they are committed becoming
+    /// voters
+    pub volatile: Vec<Peer>,
+
+    // TODO: non-voting nodes already committed to config
+    //pub non_voters: Vec<Peer>,
     pending: PendingChange,
 }
 
 impl ConsensusConfig {
     pub fn uninitialized() -> Self {
         Self {
-            peers: Vec::new(),
+            voters: Vec::new(),
+            volatile: Vec::new(),
             pending: PendingChange::default(),
         }
     }
 
+    /// create new config with no volatile peers
     pub fn new<I: Iterator<Item = Peer>>(peers: I) -> Self {
         Self {
-            peers: Vec::from_iter(peers),
+            voters: Vec::from_iter(peers),
+            volatile: Vec::new(),
             pending: PendingChange::default(),
         }
     }
@@ -44,7 +53,7 @@ impl ConsensusConfig {
         if new_peers.is_empty() {
             return Err(Error::LastNodeRemoval);
         }
-        if (new_peers.len() as isize - self.peers.len() as isize).abs() > 1 {
+        if (new_peers.len() as isize - self.voters.len() as isize).abs() > 1 {
             // We also support changing meta, i.e. when
             // no peer ids get changed.
             // This will require pushing and commiting the config entry
@@ -52,7 +61,7 @@ impl ConsensusConfig {
             return Err(Error::ConfigChangeTooBig);
         }
 
-        for peer in self.peers {
+        for peer in self.voters {
             if !new_peers.iter().any(|new_peer| new_peer.id == peer.id) {
                 if self.pending != PendingChange::Nothing {
                     return Err(Error::ConfigChangeTooBig);
@@ -75,12 +84,12 @@ impl ConsensusConfig {
 
     #[inline]
     pub(crate) fn is_initialized(&self) -> bool {
-        !self.peers.is_empty()
+        !self.voters.is_empty()
     }
 
     #[inline]
     pub(crate) fn is_solitary(&self, this: ServerId) -> bool {
-        self.peers.len() == 1 && self.peers[0].id == this
+        self.voters.len() == 1 && self.voters[0].id == this
     }
 
     #[inline]
@@ -103,7 +112,62 @@ impl ConsensusConfig {
 
     #[inline]
     pub(crate) fn has_peer(&self, peer: ServerId) -> bool {
-        self.peers.iter().any(|p| p.id == peer)
+        self.voters.iter().any(|p| p.id == peer)
+    }
+
+    #[inline]
+    // unlike remove_volatile we don't return error here because
+    // this functions is called as a reaction to add_server_command, so
+    // the message to admin can be returned instead
+    pub(crate) fn add_volatile(&mut self, peer: Peer) -> bool {
+        if let Some(pos) = self.volatile.iter().position(|peer| peer.id == peer.id) {
+            return false;
+        } else {
+            self.volatile.push(peer);
+            return true;
+        }
+    }
+
+    #[inline]
+    pub(crate) fn remove_volatile(&mut self, id: ServerId) -> Result<(), Error> {
+        if let Some(pos) = self.volatile.iter().position(|peer| peer.id == id) {
+            self.volatile.swap_remove(pos);
+            Ok(())
+        } else {
+            Err(Error::unreachable(debug_where!()))
+        }
+    }
+
+    #[inline]
+    pub(crate) fn forget_volatile(&mut self) {
+        self.pending = PendingChange::Nothing;
+        self.volatile.clear()
+    }
+
+    pub(crate) fn create_config_update(&self) -> Vec<Peer> {
+        let mut result = self.voters.clone();
+        match self.pending {
+            PendingChange::Nothing => {}
+            PendingChange::Add(peer) => result.push(peer),
+            PendingChange::Remove(peer) => {
+                if let Some(pos) = result.iter().position(|p| p.id == peer.id) {
+                    result.swap_remove(pos);
+                }
+            }
+        }
+        result.sort();
+        result
+    }
+
+    #[inline]
+    pub(crate) fn new_pending_add(&mut self, id: ServerId) -> Result<(), Error> {
+        if let Some(pos) = self.volatile.iter().position(|peer| peer.id == id) {
+            let peer = self.volatile.swap_remove(pos);
+            self.pending = PendingChange::Add(peer);
+            Ok(())
+        } else {
+            Err(Error::unreachable(debug_where!()))
+        }
     }
 
     pub(crate) fn has_pending_peer(&self, id: ServerId) -> bool {
@@ -124,23 +188,19 @@ impl ConsensusConfig {
         std::mem::swap(&mut pending, &mut self.pending);
         match pending {
             PendingChange::Nothing => {}
-            PendingChange::Add(peer) => self.peers.push(peer),
+            PendingChange::Add(peer) => self.voters.push(peer),
             PendingChange::Remove(peer) => {
-                if let Some(pos) = self.peers.iter().position(|p| p.id == peer.id) {
-                    self.peers.swap_remove(pos);
+                if let Some(pos) = self.voters.iter().position(|p| p.id == peer.id) {
+                    self.voters.swap_remove(pos);
                 }
             }
         }
     }
 
-    pub(crate) fn cancel_pending(&mut self) {
-        self.pending = PendingChange::Nothing;
-    }
-
     // Get the cluster quorum majority size.
     // Assumes config is already persisted.
     pub(crate) fn majority(&self) -> usize {
-        let peers = self.peers.len();
+        let peers = self.voters.len();
         if peers == 1 {
             return 1;
         }
@@ -190,7 +250,7 @@ impl ConsensusConfig {
     }
 
     pub(crate) fn clear_heartbeats<H: Handler>(&self, handler: &mut H) {
-        for peer in &self.peers {
+        for peer in &self.voters {
             handler.clear_timeout(Timeout::Heartbeat(peer.id));
         }
     }
@@ -199,7 +259,7 @@ impl ConsensusConfig {
     where
         F: FnMut(&ServerId) -> Result<(), Error>,
     {
-        self.peers.iter().map(|peer| f(&peer.id)).last();
+        self.voters.iter().map(|peer| f(&peer.id)).last();
         if let PendingChange::Add(peer) = self.pending {
             f(&peer.id);
         }
@@ -209,7 +269,7 @@ impl ConsensusConfig {
     where
         F: FnMut(&ServerId) -> Result<(), Error>,
     {
-        self.peers
+        self.voters
             .iter()
             .filter(|peer| &peer.id != this)
             .map(|peer| f(&peer.id))
