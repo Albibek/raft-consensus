@@ -61,7 +61,7 @@ impl ConsensusConfig {
             return Err(Error::ConfigChangeTooBig);
         }
 
-        for peer in self.voters {
+        for peer in &self.voters {
             if !new_peers.iter().any(|new_peer| new_peer.id == peer.id) {
                 if self.pending != PendingChange::Nothing {
                     return Err(Error::ConfigChangeTooBig);
@@ -103,7 +103,7 @@ impl ConsensusConfig {
 
     #[inline]
     pub(crate) fn has_pending_removal_for(&self, id: ServerId) -> bool {
-        if let PendingChange::Remove(peer) = self.pending {
+        if let PendingChange::Remove(peer) = &self.pending {
             id == peer.id
         } else {
             false
@@ -146,9 +146,9 @@ impl ConsensusConfig {
 
     pub(crate) fn create_config_update(&self) -> Vec<Peer> {
         let mut result = self.voters.clone();
-        match self.pending {
+        match &self.pending {
             PendingChange::Nothing => {}
-            PendingChange::Add(peer) => result.push(peer),
+            PendingChange::Add(peer) => result.push(peer.clone()),
             PendingChange::Remove(peer) => {
                 if let Some(pos) = result.iter().position(|p| p.id == peer.id) {
                     result.swap_remove(pos);
@@ -171,7 +171,7 @@ impl ConsensusConfig {
     }
 
     pub(crate) fn has_pending_peer(&self, id: ServerId) -> bool {
-        match self.pending {
+        match &self.pending {
             PendingChange::Nothing => false,
             PendingChange::Add(peer) => peer.id == id,
             PendingChange::Remove(peer) => peer.id == id,
@@ -184,7 +184,7 @@ impl ConsensusConfig {
 
     // Moves pending change into the main configuration
     pub(crate) fn commit_pending(&mut self) {
-        let pending = PendingChange::Nothing;
+        let mut pending = PendingChange::Nothing;
         std::mem::swap(&mut pending, &mut self.pending);
         match pending {
             PendingChange::Nothing => {}
@@ -260,7 +260,7 @@ impl ConsensusConfig {
         F: FnMut(&ServerId) -> Result<(), Error>,
     {
         self.voters.iter().map(|peer| f(&peer.id)).last();
-        if let PendingChange::Add(peer) = self.pending {
+        if let PendingChange::Add(peer) = &self.pending {
             f(&peer.id);
         }
     }

@@ -88,31 +88,26 @@ pub trait StateMachine {
     /// Should return a mutable reference to the log, for consensus to use it directly
     fn log_mut(&mut self) -> &mut Self::Log;
 
-    /// Applies a command to the state machine. A command should be already stored in the specified log index.
-    /// Asynchronous machines may decide if last_applied should be increased at once, but if not,
-    /// they should expect the same index to be requested multiple times along with having gaps
-    /// between machine's last_applied and the requested index.
+    /// Applies all commands to the state machine _up to and including_ the specified log index.
+    /// The index will always point to an existing and persisted log entry.
     ///
-    /// If `results_required` is true, should return an implementation-specific result value which will
-    /// be forwarded to client. `results_required` may be false when the command is applied on a follower which is not
-    /// expected to reply to a client.
+    /// The control of really applying any data completely lies on the state machine
+    /// implementation including the way to answer the client's proposals.
+    /// The function does not return any result because data may not be accessible
+    /// right after the moment of applying or may not be required at all. The client will be
+    /// informed that its proposal has been committed by the consensus, and after that it
+    /// depends on the client-machine protocol specific messages to query the results.
     ///
-    /// It should be noted, that despite of possible machine asynchronousness, the result have to
-    /// be returned immediately, i.e. potentially before the real persistence. For example, it could be a good
-    /// idea to have some "queued" mesage, or just returning None and requiring clients to poll the
-    /// machine later.
-    ///
-    /// Function may return None in cases where result is delayed, not required or, in any other situation.
+    /// Function may return None  at will: in cases where result is delayed, not required or, in any other situation.
     /// In case of None being returned, no response will be sent to the client after calling this
     /// function.
-    fn apply(
-        &mut self,
-        index: LogIndex,
-        results_required: bool,
-    ) -> Result<Option<Bytes>, Self::Error>;
+    fn apply(&mut self, index: LogIndex) -> Result<(), Self::Error>;
 
-    /// Queries a value of the state machine. Goes right from the clients, bypassing the persistent log, but
-    /// can mutate the state machine if required by the implementation.
+    /// Queries a value of the state machine. Goes right from the clients, bypassing the persistent log.
+    /// Although the Raft paper does not recommend changing state machine psrsistent state using
+    /// read-only queries, this function accepts mutable `self` to let the implementation
+    /// choose and change it's own state, not related to persistence or, for example, give
+    /// responses to previously proposed commands.
     ///
     /// Returns a state machine specific result value.
     fn query(&mut self, query: Bytes) -> Result<Bytes, Self::Error>;
@@ -159,7 +154,7 @@ pub trait StateMachine {
     /// most probably snapshot_info will be called after writing the last chunk right away.
     ///
     /// The snapshot is expected to be consistent with index term and provided config.
-    /// These values must be persisted and returned from snapshot_info if corresponsing
+    /// These values must be persisted and returned from snapshot_info if corresponding
     /// snapshot is in place.
     ///
     /// The returned value have to be a request for the next chunk or None if no more

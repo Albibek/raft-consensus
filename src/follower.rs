@@ -162,7 +162,7 @@ where
             .write_snapshot_chunk(
                 request.snapshot_index,
                 request.snapshot_term,
-                request.last_config,
+                request.last_config.clone(),
                 request.force_reset,
                 &request.chunk_data,
             )
@@ -200,7 +200,7 @@ where
                 //
                 // State machine is allowed to not accept a snapshot if reset was not required,
                 // which means we need to update the snapshot status first
-                let info = self
+                let mut info = self
                     .state_machine
                     .snapshot_info()
                     .map_err(|e| Error::Critical(CriticalError::StateMachine(Box::new(e))))?;
@@ -210,7 +210,7 @@ where
                     .map_err(|e| Error::PersistentLogRead(Box::new(e)))?;
                 let current_config_index = self.latest_config_index;
                 let (new_committed_config_index, new_pending_config_index) = if let Some(info) =
-                    info
+                    info.take()
                 {
                     // if there is any snapshot available, check if current config
                     // indices were replaced by the latest write
@@ -732,8 +732,9 @@ where
                 // the previous one is committed
                 return Err(Error::unreachable(debug_where!()));
             }
+            let latest_config_index = self.latest_config_index; // bind required to pass the index as self is borrowed mutably
             self.log_mut()
-                .set_latest_config_view(self.latest_config_index, updated_config_index)
+                .set_latest_config_view(latest_config_index, updated_config_index)
                 .map_err(|e| Error::Critical(CriticalError::PersistentLogWrite(Box::new(e))))?;
 
             self.latest_config_index = updated_config_index;
@@ -753,68 +754,13 @@ where
 
     /// Applies all committed but unapplied log entries to the state machine ignoring the results.
     pub(crate) fn apply_follower_commits(&mut self) -> Result<(), Error> {
-        let mut entry_index = self
-            .state_machine
-            .last_applied()
+        trace!(to = ?self.commit_index, "applying entries");
+        self.state_machine
+            .apply(self.commit_index)
             .map_err(|e| Error::Critical(CriticalError::StateMachine(Box::new(e))))?;
 
-        if entry_index < self.commit_index {
-            trace!(
-                "applying commits from {} to {}",
-                entry_index + 1,
-                &self.commit_index
-            );
-        } else {
-            trace!(
-                "not applying commits: {} >= {}",
-                entry_index,
-                &self.commit_index
-            );
-        };
-        while entry_index < self.commit_index {
-            entry_index = entry_index + 1;
-            let entry_kind = self
-                .log()
-                .entry_meta_at(entry_index)
-                .map_err(|e| Error::PersistentLogRead(Box::new(e)))?;
-
-            match entry_kind {
-                LogEntryMeta::Empty => {
-                    self.state_machine
-                        .apply(entry_index, false)
-                        .map_err(|e| Error::Critical(CriticalError::StateMachine(Box::new(e))))?;
-                }
-                LogEntryMeta::Proposal(_) => {
-                    self.state_machine
-                        .apply(entry_index, false)
-                        .map_err(|e| Error::Critical(CriticalError::StateMachine(Box::new(e))))?;
-                }
-                LogEntryMeta::Config(config) => {
-                    self.state_machine
-                        .apply(entry_index, false)
-                        .map_err(|e| Error::Critical(CriticalError::StateMachine(Box::new(e))))?;
-
-                    // applying a config entry means the config probably was a pending one
-                    // we detect this by checking current indices
-                    if entry_index == self.latest_config_index {
-                        // this entry was a pending config, so we:
-                        // make our in-memory config non-pending
-                        self.config.commit_pending();
-
-                        // commit updated indices to log, setting both of them to the index
-                        // of current entry
-                        self.log_mut()
-                            .set_latest_config_view(
-                                self.latest_config_index,
-                                self.latest_config_index,
-                            )
-                            .map_err(|e| {
-                                Error::Critical(CriticalError::PersistentLogWrite(Box::new(e)))
-                            })?;
-                    }
-                }
-            }
-        }
+        // TODO: when having clients connected to follower, deal with their
+        // expected proposals the same way as it is done on leader
 
         Ok(())
     }

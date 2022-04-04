@@ -71,7 +71,7 @@ impl<L: Log> StateMachine for HashMachine<L> {
     type Error = Error;
     type Log = L;
 
-    fn apply(&mut self, index: LogIndex, results_required: bool) -> Result<Option<Bytes>, Error> {
+    fn apply(&mut self, index: LogIndex) -> Result<(), Error> {
         let mut entry = LogEntry::default();
         self.last_applied = index;
         self.log
@@ -84,15 +84,11 @@ impl<L: Log> StateMachine for HashMachine<L> {
             }
 
             self.state = self.state ^ hasher.finish();
-            if results_required {
-                Ok(Some(Bytes::copy_from_slice(&self.state.to_le_bytes()[..])))
-            } else {
-                Ok(Some(Bytes::new()))
-            }
-        } else {
-            // don't apply other types of entries, only last_applied should change the hash
-            Ok(None)
-        }
+        } //else {
+          // don't apply other types of entries, only last_applied should change the hash
+          //}
+
+        Ok(())
     }
 
     fn query(&mut self, query: Bytes) -> Result<Bytes, Error> {

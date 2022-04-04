@@ -48,9 +48,9 @@ impl<L: Log> StateMachine for NullStateMachine<L> {
         &mut self.log
     }
 
-    fn apply(&mut self, index: LogIndex, _: bool) -> Result<Option<Bytes>, Error> {
+    fn apply(&mut self, index: LogIndex) -> Result<(), Error> {
         self.index = index;
-        Ok(Some(self.state.clone()))
+        Ok(())
     }
 
     fn query(&mut self, _query: Bytes) -> Result<Bytes, Error> {

@@ -92,7 +92,12 @@ impl Default for Urgency {
 #[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
 /// Response to client command
 pub enum ClientResponse {
+    /// Client query response
     Success(Bytes),
+
+    /// The proposal at LogIndex has been committed and is being applied
+    /// by the state machine.
+    Applied(LogIndex),
 
     /// The proposal has been queued on the leader and waiting the majority
     /// of nodes to commit it

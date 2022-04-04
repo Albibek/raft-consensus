@@ -90,7 +90,7 @@ where
         log.sync().unwrap();
 
         for i in 1..9 {
-            machine.apply(LogIndex(i), false).unwrap();
+            machine.apply(LogIndex(i)).unwrap();
         }
 
         // take snapshot at each index, make sure the index and term is correct
@@ -118,7 +118,7 @@ where
             .unwrap();
         source_log.sync().unwrap();
 
-        source_machine.apply(LogIndex(1), false).unwrap();
+        source_machine.apply(LogIndex(1)).unwrap();
         source_machine.take_snapshot(LogIndex(1), Term(2)).unwrap();
         source_machine.sync().unwrap();
 
@@ -126,7 +126,7 @@ where
         // transfer snapshot from source machine to destination
         let mut current_chunk = source_machine.read_snapshot_chunk(None).unwrap();
         while let Some(next_request) = dest_machine
-            .write_snapshot_chunk(LogIndex(1), Term(2), &current_chunk)
+            .write_snapshot_chunk(LogIndex(1), Term(2), None, true, &current_chunk)
             .unwrap()
         {
             current_chunk = source_machine
