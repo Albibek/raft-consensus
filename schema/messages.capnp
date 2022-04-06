@@ -61,7 +61,6 @@ struct PeerMessage {
         success @1 :TermAndIndexes;
         staleTerm @2 :UInt64;
         inconsistentPrevEntry @3 :TermAndIndexes;
-        staleEntry @4 :Void;
       }
     }
 

@@ -99,29 +99,6 @@ where
             .map_err(|e| Error::PersistentLogRead(Box::new(e)))
     }
 
-    /* /// Helper for returning the index of the latest applied log entry.*/
-    /*#[inline]*/
-    /*pub(crate) fn latest_log_index(&self) -> LogIndex {*/
-    /*self.log_view.1*/
-    /* }*/
-
-    /* /// Helper for returning the index of the latest in flight log entry.*/
-    /*#[inline]*/
-    /*pub(crate) fn latest_volatile_log_index(&self) -> Result<LogIndex, Error> {*/
-    /*Ok(self*/
-    /*.log()*/
-    /*.latest_volatile_index()*/
-    /*.map_err(|e| Error::PersistentLogRead(Box::new(e)))?)*/
-    /*}*/
-
-    /*#[inline]*/
-    /*pub(crate) fn zero_log_index(&self) -> Result<LogIndex, Error> {*/
-    /*Ok(self*/
-    /*.log()*/
-    /*.zero_index()*/
-    /*.map_err(|e| Error::PersistentLogRead(Box::new(e)))?)*/
-    /*}*/
-
     /// Helper for self.state_machine.log()
     #[inline]
     pub(crate) fn log(&self) -> &M::Log {

@@ -51,29 +51,26 @@ where
 
         let config =
             ConsensusConfig::new(vec![Peer::new(42.into()), Peer::new(69.into())].into_iter());
-        todo!("fix machine tests");
-        /*
-         *
-         *        let config_entry = LogEntry {
-         *            term: Term(1),
-         *            data: LogEntryData::Config(config.clone()),
-         *        };
-         *        log.append_entries(
-         *            LogIndex(1),
-         *            &[
-         *                empty_entry.clone(),
-         *                proposal_entry.clone(),
-         *                config_entry.clone(),
-         *            ],
-         *        )
-         *        .unwrap();
-         *        log.sync().unwrap();
-         *        machine.apply(LogIndex(1), false).unwrap();
-         *        machine.apply(LogIndex(2), false).unwrap();
-         *        machine.apply(LogIndex(3), false).unwrap();
-         *        machine.sync().unwrap();
-         *        assert_eq!(machine.last_applied().unwrap(), LogIndex(3));
-         */
+
+        let config_entry = LogEntry {
+            term: Term(1),
+            data: LogEntryData::Config(config.create_config_update()),
+        };
+        log.append_entries(
+            LogIndex(1),
+            &[
+                empty_entry.clone(),
+                proposal_entry.clone(),
+                config_entry.clone(),
+            ],
+        )
+        .unwrap();
+        log.sync().unwrap();
+        machine.apply(LogIndex(1)).unwrap();
+        machine.apply(LogIndex(2)).unwrap();
+        machine.apply(LogIndex(3)).unwrap();
+        machine.sync().unwrap();
+        assert_eq!(machine.last_applied().unwrap(), LogIndex(3));
     }
 
     pub fn test_snapshot_index_and_term_correct(&mut self) {

@@ -25,7 +25,7 @@ where
         handler: &mut H,
         from: ServerId,
         request: AppendEntriesRequest,
-    ) -> Result<(AppendEntriesResponse, CurrentState<M, H>), Error> {
+    ) -> Result<(Option<AppendEntriesResponse>, CurrentState<M, H>), Error> {
         let leader_term = request.term;
         let current_term = self.current_term()?;
 
@@ -37,7 +37,10 @@ where
         // will become an eternal candidate, sending it's vote requests each election
         // timeout even when connection comes back
         if leader_term < current_term - 1 {
-            return Ok((AppendEntriesResponse::StaleTerm(current_term), self.into()));
+            return Ok((
+                Some(AppendEntriesResponse::StaleTerm(current_term)),
+                self.into(),
+            ));
         }
 
         // receiving AppendEntries for candidate means new leader was found,
@@ -325,10 +328,7 @@ where
     pub(crate) fn start_election(&mut self, handler: &mut H, voluntary: bool) -> Result<(), Error> {
         self.inc_current_term()?;
         self.state_data.reset_votes();
-        if self
-            .config
-            .peer_votes_for_self(self.latest_log_index, self.id)
-        {
+        if self.config.peer_votes_for_self(self.id) {
             self.state_data.record_vote(self.id)
         }
         let id = self.id;

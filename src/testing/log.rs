@@ -1,7 +1,7 @@
 use bytes::Bytes;
 
 use crate::message::Urgency;
-use crate::persistent_log::{Log, LogEntry, LogEntryData, LogEntryMeta};
+use crate::persistent_log::{Log, LogEntry, LogEntryData};
 use crate::{ConsensusConfig, LogIndex, Peer, ServerId, Term};
 
 use std::marker::PhantomData;

@@ -35,13 +35,16 @@ where
         handler: &mut H,
         from: ServerId,
         request: AppendEntriesRequest,
-    ) -> Result<(AppendEntriesResponse, CurrentState<M, H>), Error> {
+    ) -> Result<(Option<AppendEntriesResponse>, CurrentState<M, H>), Error> {
         // when leader receives AppendEntries, this means another leader is in action somehow
         let leader_term = request.term;
         let current_term = self.current_term()?;
 
         if leader_term < current_term {
-            return Ok((AppendEntriesResponse::StaleTerm(current_term), self.into()));
+            return Ok((
+                Some(AppendEntriesResponse::StaleTerm(current_term)),
+                self.into(),
+            ));
         }
 
         if leader_term == current_term {
@@ -80,7 +83,7 @@ where
         match response {
             AppendEntriesResponse::Success(follower_term, _, _)
             | AppendEntriesResponse::StaleTerm(follower_term)
-            | AppendEntriesResponse::InconsistentPrevEntry(follower_term, _, _)
+            | AppendEntriesResponse::InconsistentIndex(follower_term, _, _)
                 if current_term < follower_term =>
             {
                 debug!("leader found a peer with the higher term, stepping down");
@@ -93,14 +96,13 @@ where
 
             AppendEntriesResponse::Success(follower_term, _, _)
             | AppendEntriesResponse::StaleTerm(follower_term)
-            | AppendEntriesResponse::InconsistentPrevEntry(follower_term, _, _)
+            | AppendEntriesResponse::InconsistentIndex(follower_term, _, _)
                 if current_term > follower_term =>
             {
                 // some follower confirmed message we've sent at previous term
                 // it is ok for us
                 Ok((None, self.into()))
             }
-            AppendEntriesResponse::StaleEntry => Ok((None, self.into())),
             AppendEntriesResponse::StaleTerm(_) => {
                 // The peer is reporting a stale term, but the term number matches the local term.
                 // Ignore the response, since it is to a message from a prior term, and this server
@@ -108,11 +110,14 @@ where
 
                 Ok((None, self.into()))
             }
-            AppendEntriesResponse::InconsistentPrevEntry(
+            AppendEntriesResponse::InconsistentIndex(
                 _follower_term,
                 follower_last_index,
                 follower_volatile_index,
             ) => {
+                todo!("do not send entries to inconsistent follower");
+                // TODO: only send either snapshot or heartbeat
+                // heartbeat MUST be with follower's index prev_entry and term
                 let message = self.next_entries_or_snapshot(
                     handler,
                     from,
@@ -121,6 +126,13 @@ where
                     current_term,
                 )?;
                 Ok((message, self.into()))
+            }
+
+            AppendEntriesResponse::InconsistentSnapshot => {
+                // Follower is bad enough that it must be reset
+                todo!("reset the follower by sending it the next snapshot")
+                // TODO: introduce empty snapshot info, that always exists
+                // Convention: snapshot index = 0 means reset
             }
             AppendEntriesResponse::Success(
                 _,
@@ -1350,7 +1362,6 @@ impl Leader {
             // at the moment config only contains voting peers
             // TODO: persist non-voters to config as well
             followers.insert(*id, FollowerInfo::new_saved_voter(latest_log_index + 1));
-            Ok(())
         });
 
         Leader {

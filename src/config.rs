@@ -17,12 +17,13 @@ pub use crate::state_machine::StateMachine;
 pub struct ConsensusConfig {
     /// all voting peers committed to config
     pub voters: Vec<Peer>,
-    /// all voter candidates, not persisted until they are committed becoming
+    /// all voter candidates' metadata, not persisted until they are committed becoming
     /// voters
     pub volatile: Vec<Peer>,
 
     // TODO: non-voting nodes already committed to config
     //pub non_voters: Vec<Peer>,
+    /// The peer being currently committed due to configuration change
     pending: PendingChange,
 }
 
@@ -83,11 +84,6 @@ impl ConsensusConfig {
     }
 
     #[inline]
-    pub(crate) fn is_initialized(&self) -> bool {
-        !self.voters.is_empty()
-    }
-
-    #[inline]
     pub(crate) fn is_solitary(&self, this: ServerId) -> bool {
         self.voters.len() == 1 && self.voters[0].id == this
     }
@@ -96,15 +92,6 @@ impl ConsensusConfig {
     pub(crate) fn has_pending_removal(&self) -> bool {
         if let PendingChange::Remove(_) = self.pending {
             true
-        } else {
-            false
-        }
-    }
-
-    #[inline]
-    pub(crate) fn has_pending_removal_for(&self, id: ServerId) -> bool {
-        if let PendingChange::Remove(peer) = &self.pending {
-            id == peer.id
         } else {
             false
         }
@@ -238,7 +225,7 @@ impl ConsensusConfig {
         peers >> 1
     }
 
-    pub(crate) fn peer_votes_for_self(&self, latest_index: LogIndex, id: ServerId) -> bool {
+    pub(crate) fn peer_votes_for_self(&self, id: ServerId) -> bool {
         // 4.2.2 a server that is not part of its own latest configuration should still start
         // new elections, as it might still be needed until the Cnew entry is committed (as in Figure 4.6). It does
         // not count its own vote in elections unless it is part of its latest configuration.
@@ -257,7 +244,7 @@ impl ConsensusConfig {
 
     pub(crate) fn with_all_peers<F>(&self, mut f: F)
     where
-        F: FnMut(&ServerId) -> Result<(), Error>,
+        F: FnMut(&ServerId),
     {
         self.voters.iter().map(|peer| f(&peer.id)).last();
         if let PendingChange::Add(peer) = &self.pending {

@@ -24,7 +24,9 @@ where
         PeerMessage::AppendEntriesRequest(request) => {
             // request produces response and optionally - new state
             let (response, new) = s.append_entries_request(handler, from, request)?;
-            handler.send_peer_message(from, PeerMessage::AppendEntriesResponse(response));
+            if let Some(response) = response {
+                handler.send_peer_message(from, PeerMessage::AppendEntriesResponse(response));
+            }
             Ok(new)
         }
 
@@ -193,7 +195,7 @@ where
         handler: &mut H,
         from: ServerId,
         request: AppendEntriesRequest,
-    ) -> Result<(AppendEntriesResponse, CurrentState<M, H>), Error>;
+    ) -> Result<(Option<AppendEntriesResponse>, CurrentState<M, H>), Error>;
 
     /// Apply an append entries response to the consensus.
     fn append_entries_response(

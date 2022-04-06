@@ -1,4 +1,4 @@
-use crate::persistent_log::{Log, LogEntry, LogEntryMeta};
+use crate::persistent_log::{Log, LogEntry};
 use crate::{LogIndex, ServerId, Term};
 
 use thiserror::Error as ThisError;
@@ -120,20 +120,6 @@ impl Log for MemLog {
             .map(|entry| *dest = entry.clone())
             .ok_or(MemLogError::BadIndex(index.into()))?;
         Ok(true)
-    }
-
-    fn entry_meta_at(&self, index: LogIndex) -> Result<LogEntryMeta, Self::Error> {
-        let index: u64 = index.as_u64();
-        if index <= self.zero_index {
-            return Err(MemLogError::ConsensusGuarantee(format!(
-                "reading entry meta at {} which is earlier than first index {}",
-                index, self.zero_index
-            )));
-        }
-        self.entries
-            .get((index - 1) as usize)
-            .map(|entry| entry.meta())
-            .ok_or(MemLogError::BadIndex(index.into()))
     }
 
     fn append_entries(&mut self, start: LogIndex, entries: &[LogEntry]) -> Result<(), Self::Error> {

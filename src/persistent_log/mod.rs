@@ -22,7 +22,6 @@ pub use crate::persistent_log::mem::MemLog;
 // this module imports
 use std::fmt::Debug;
 
-use crate::config::ConsensusConfig;
 use crate::message::peer::{Entry, EntryData};
 use crate::{LogIndex, Peer, ServerId, Term};
 
@@ -126,10 +125,6 @@ pub trait Log {
     /// the index range (latest_index, latest_volatile_index]
     fn read_entry(&self, index: LogIndex, dest: &mut LogEntry) -> Result<bool, Self::Error>;
 
-    /// Should return the metadata of the entry at the specified index.
-    /// The same guarantees as in `read_entry` apply.
-    fn entry_meta_at(&self, index: LogIndex) -> Result<LogEntryMeta, Self::Error>;
-
     /// Must append an entry to the log. The moment of persisting entries may be decided by an implementation,
     /// but the indexes must change only after the entries are persisted leaving no gaps and keeping the incoming ordering.
     /// The consensus guarantees that no overwrites of existing entries will be requested unless
@@ -197,15 +192,6 @@ pub struct LogEntry {
     pub data: LogEntryData,
 }
 
-/// Kinds of a log entry without internal data
-#[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
-pub enum LogEntryMeta {
-    Empty,
-    Proposal(Urgency),
-    Config(Vec<Peer>),
-}
-
 /// Kinds of a log entry to be processed
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "use_serde", derive(Serialize, Deserialize))]
@@ -216,14 +202,6 @@ pub enum LogEntryData {
 }
 
 impl LogEntry {
-    pub fn meta(&self) -> LogEntryMeta {
-        match &self.data {
-            LogEntryData::Empty => LogEntryMeta::Empty,
-            LogEntryData::Proposal(_, urgency) => LogEntryMeta::Proposal(urgency.clone()),
-            LogEntryData::Config(config) => LogEntryMeta::Config(config.clone()),
-        }
-    }
-
     /// returns data stored in proposal if the entry matches type
     pub fn try_proposal_data(&self) -> Option<Bytes> {
         if let LogEntryData::Proposal(ref data, _) = self.data {

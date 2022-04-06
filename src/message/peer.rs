@@ -285,8 +285,8 @@ impl Entry {
 pub enum AppendEntriesResponse {
     Success(Term, LogIndex, LogIndex),
     StaleTerm(Term),
-    InconsistentPrevEntry(Term, LogIndex, LogIndex),
-    StaleEntry,
+    InconsistentIndex(Term, LogIndex, LogIndex),
+    InconsistentSnapshot,
 }
 
 impl From<AppendEntriesResponse> for PeerMessage {
@@ -310,13 +310,12 @@ impl AppendEntriesResponse {
             append_entries_response::StaleTerm(m) => AppendEntriesResponse::StaleTerm(m.into()),
             append_entries_response::InconsistentPrevEntry(m) => {
                 let m = m.map_err(Error::Capnp)?;
-                AppendEntriesResponse::InconsistentPrevEntry(
+                AppendEntriesResponse::InconsistentIndex(
                     m.get_term().into(),
                     m.get_latest_log_index().into(),
                     m.get_volatile_log_index().into(),
                 )
             }
-            append_entries_response::StaleEntry(()) => AppendEntriesResponse::StaleEntry,
         };
         Ok(message)
     }
@@ -330,13 +329,12 @@ impl AppendEntriesResponse {
                 message.set_volatile_log_index(log_index.into());
             }
             &AppendEntriesResponse::StaleTerm(term) => builder.set_stale_term(term.into()),
-            &AppendEntriesResponse::InconsistentPrevEntry(term, log_index, volatile_index) => {
+            &AppendEntriesResponse::InconsistentIndex(term, log_index, volatile_index) => {
                 let mut message = builder.reborrow().init_inconsistent_prev_entry();
                 message.set_term(term.into());
                 message.set_latest_log_index(log_index.into());
                 message.set_volatile_log_index(log_index.into());
             }
-            &AppendEntriesResponse::StaleEntry => builder.set_stale_entry(()),
         }
     }
 
