@@ -80,7 +80,7 @@ pub trait Log {
     ///   latest_volatile_index - the index of last appended, but not persisted entry
     /// )
     ///
-    /// In freshly created log all indexes must be LogIndex(0)
+    /// In a freshly created log all indexes must be LogIndex(0)
     /// In the log, where nothing is persisted, latest_index must be equal to zero_index
     fn current_view(&self) -> Result<(LogIndex, LogIndex, LogIndex), Self::Error>;
 
@@ -97,7 +97,7 @@ pub trait Log {
     /// It is possible that the `index` will point beyond the log's latest_index or latest_volatile_index,
     /// or, in some rare cases to index earlier than zero_index.
     /// The implementation must support these cases by discarding the whole log, persisting the
-    /// zero term as `term` (because there may be no knowlege about this term in the log) and
+    /// zero term as `term` (because there may be no knowlege or an incorrect knowlege about this term in the log) and
     /// setting its indexes accordingly. That is zero_index and latest_index must be set to `index`,
     /// while latest_volatile_index may or may not be moved to `index` as well.
     fn discard_until(&mut self, index: LogIndex, zero_term: Term) -> Result<(), Self::Error>;

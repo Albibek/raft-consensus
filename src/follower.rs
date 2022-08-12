@@ -577,9 +577,6 @@ where
             )));
         }
 
-        // Now, due to follower making snapshots independently of the leader,
-        // the incoming request from it may have some extra entries, that follower
-        // does not need.
         // try to find term of specified log index and check if there such entry exists
         let existing_term = self
             .log()
@@ -587,76 +584,68 @@ where
             .map_err(|e| Error::PersistentLogRead(Box::new(e)))?;
 
         if existing_term != leader_prev_log_term {
-            // An existing entry conflicts with a new one (same index but different terms):
+            // An existing entry in persistent log conflicts with a new one (same index but different terms):
             // we have to delete the existing entries after AND INCLUDING the zero entry
             // LogIndex(0) is not possible here because term will always match (equal to Term(0))
             //
-            // Regardless of the result we got below (except the unrecoverable failures)
-            // we cannot predict leader's pre-previous entry term, so this if's return is
-            // almost unconditional
+            // Regardless of the result we got above (except the unrecoverable failures)
+            // we cannot predict leader's pre-previous entry term, so this if's return will
+            // not depend on the next if block, except for somea criticals
             //
             if leader_prev_log_index == self.zero_log_index {
-                // something really bad happened: most probably local snapshot was broken
-                // why: because in good scenario same indices must match the terms on
-                // leader and follower
-                //
-                // all we can do is recheck the snapshot on the state machine if it was
-                // out of sync with log for some reason (both of them may store index and term
-                // at zero entry)
+                // Leader have sent the entries starting from follower's zero index, meaning the
+                // whole log is to be discarded anyways.
+
+                // But there is still hope that the zero entry and term are correct inside the snapshot.
+                // With log already potentially empty, the snapshot is the only source of truth.
+                // So we query its information
                 let info = self
                     .state_machine
                     .snapshot_info()
                     .map_err(|e| Error::Critical(CriticalError::StateMachine(Box::new(e))))?;
                 if let Some(info) = info {
-                    if info.index != self.zero_log_index || info.term != existing_term {
-                        // just not matching ths snapshot with the index is fixable by resetting the log
+                    // Now, having the indexes from the snapshot (which is now the only possible source of truth):
+                    // * check if the term and index match the leader:
+                    if info.index == leader_prev_log_index && info.term == leader_prev_log_term {
+                        // The indexes in snapshot match!
+                        // We can discard the whole log, seting the correct indexes and proceed
+                        // with applying entries
                         warn!(
                             local_zero_index = %self.zero_log_index,
                             local_zero_term = %existing_term,
                             snapshot_index = %info.index,
                             snapshot_term = %info.term,
-                            "follower snapshot is out of sync with persistent log");
+                            "follower snapshot is out of sync with persistent log, log is discarded");
                         self.log_mut()
                             .discard_until(info.index, info.term)
                             .map_err(|e| {
                                 Error::Critical(CriticalError::PersistentLogWrite(Box::new(e)))
                             })?;
-                        // The data in log still may be not matching the data from leader
-                        // This is only solvable by sending the leader some index behind
-                        // our snapshot so it would send us either a correct snapshot or
-                        // the entry preceeding the previous one hopefully correct this time
-                        // Leader will send heartbeat or a new snapshot in such situation
-                        if info.index != leader_prev_log_index || info.term != leader_prev_log_term
-                        {
-                        } else {
-                            //see below: good behaviour, except the snapshot is bad
-                            todo!("deal with unsync snapshot and log");
-                        }
                     } else {
-                        // Term and log index in snapshot data is the same as in log, but still not the same as on leader's previous entry.
-                        // To fix this we can only ask leader to send us a newer snapshot or some earlier entries.
-                        // Leader will send heartbeat or a new snapshot in such situation
-                        warn!(
-                            local_zero_index = %self.zero_log_index,
-                            local_zero_term = %existing_term,
-                            leadev_prev_index = %leader_prev_log_index,
-                            leader_prev_term = %leader_prev_log_term,
-                            "follower term does not match leader term at the same index, follower is probably broken");
+                        // Snapshot is also bad. We can only report the error, making the
+                        // caller reset the follower.
+
+                        return Err(Error::Critical(CriticalError::SnapshotAndLogCorrupted));
                     }
                 } else {
+                    // We are still in the branch where the term in log did not match the one from leader. But
+                    // now we don't have any sources of truth on the state machine.
+                    // For LogIndex(0) such situation would be correct, but the term  for LogIndex(0) must always be Term(0),
+                    // meaning we cannot get here when log is at LogIndex(0)
+                    // This definitely means the snapshot absence is not normal: the state cannot
+                    // be restored.
                     trace!(
                             local_zero_index = %self.zero_log_index,
                             local_zero_term = %existing_term,
-                            "follower snapshot is absent");
-                    // we are at index != LogIndex(0), but there is no snapshot:
-                    // we are definitely broken
+                            "follower snapshot is absent while log index does not match term");
                     return Err(Error::Critical(CriticalError::SnapshotExpected));
                 }
             } else {
-                // now: we are still at non-matching terms, but the snapshot is somewhere behind
-                // the leader's prev_entry
-                // this means, that our log's tail starting from leader_prev_log_index is
-                // inconsistent, so we must delete it and ask a leader for pre-previous entry
+                // Here the term in log do not match the one on leader, but the snapshot is somewhere behind
+                // the leader's prev_entry.
+                // This means, that our log's tail starting from leader_prev_log_index is
+                // inconsistent, so we must delete it and ask a leader for pre-previous entry until
+                // we find matching terms.
 
                 self.log_mut()
                     .discard_since(leader_prev_log_index)
@@ -670,15 +659,30 @@ where
             )));
         }
 
-        todo!("recheck the actions on valid terms: compare each term from leader");
+        // Starting from here, we know that the terms are correct, meaning the entries can be
+        // appended.
+        // Though, due to follower making snapshots independently of the leader,
+        // the incoming request from it may have some extra entries, that follower
+        // does not need. we should also consider the bug described in ktoso/akka-raft#66
+        // and avoid rewriting the entries that are already committed in either log or snapshot
+
+        // To do this we should count the correct offset inside the entries vector
+        // and then apply only what is left AND what is not yet been added to log.
+        // The main problem with rearrangement is to avoid rewriting the correct(!)
+        // entries already in log, because leader may already consider them committed.
+        // So the real task is to count such ovrelap, if any, and recheck the index
+        // and term of entries from the request.
+        //
+        //
         todo!("rethink the part above in terms of ktoso/akka-raft#66 and deleting already committed entries");
+
         // now, for non-empty entries list
-        // append only those that needs to be applied
-        // FIXME the log should probably be cleared, but
+        // append only those that need to be applied
+        // FIXME the log MUST be discarded beforehands, but
         // only the uncommitted part of it
         let AppendEntriesRequest { entries, .. } = request;
         let num_entries = entries.len();
-
+        //
         let new_latest_log_index = leader_prev_log_index + num_entries as u64;
         if new_latest_log_index < self.min_index {
             // Stale entry; ignore. This guards against overwriting a

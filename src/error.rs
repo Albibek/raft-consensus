@@ -120,6 +120,9 @@ pub enum CriticalError {
     #[error("state machine snapshot is at later index than commit index")]
     SnapshotInfoCorrupted,
 
+    #[error("neither log, nor snapshot match leader term at zero index")]
+    SnapshotAndLogCorrupted,
+
     #[error("error interacting with the state machine {}", _0)]
     StateMachine(Box<dyn StdError + 'static>),
 }
