@@ -455,6 +455,7 @@ where
         // not applied yet. Without this check they will only be applied
         // after receiving a packet from the leader. But if we have an external tick,
         // we may do it earlier, making load a bit more distributed
+        //
         // (This is commented, because the current tick(heartbeat timer) is almost the same interval
         // as leader's ping. Furthermore, somebody may prefer a batched state machine applies
         // because this may be faster in some cases)
@@ -635,9 +636,9 @@ where
                     // This definitely means the snapshot absence is not normal: the state cannot
                     // be restored.
                     trace!(
-                            local_zero_index = %self.zero_log_index,
-                            local_zero_term = %existing_term,
-                            "follower snapshot is absent while log index does not match term");
+                        local_zero_index = %self.zero_log_index,
+                        local_zero_term = %existing_term,
+                        "follower snapshot is absent while log index does not match term");
                     return Err(Error::Critical(CriticalError::SnapshotExpected));
                 }
             } else {
@@ -663,65 +664,107 @@ where
         // appended.
         // Though, due to follower making snapshots independently of the leader,
         // the incoming request from it may have some extra entries, that follower
-        // does not need. we should also consider the bug described in ktoso/akka-raft#66
-        // and avoid rewriting the entries that are already committed in either log or snapshot
+        // does not need.
+        // We should also consider the bug described in ktoso/akka-raft#66:
+        // Due to packet reordering it is possible that follower will receive
+        // AppendEntries with the list of entries shorter than the previously received.
+        // This means we cannot mindlessly delete the rest of the log starting from prevIndex
+        // instead, we need to compare terms and indexes in the incoming packet and only rewrite
+        // entries starting from the one that does not match or does not exist in the follower log
 
-        // To do this we should count the correct offset inside the entries vector
-        // and then apply only what is left AND what is not yet been added to log.
-        // The main problem with rearrangement is to avoid rewriting the correct(!)
-        // entries already in log, because leader may already consider them committed.
-        // So the real task is to count such ovrelap, if any, and recheck the index
-        // and term of entries from the request.
-        //
-        //
         todo!("rethink the part above in terms of ktoso/akka-raft#66 and deleting already committed entries");
+        todo!("find correct behaviour for heartbeats");
 
-        // now, for non-empty entries list
-        // append only those that need to be applied
-        // FIXME the log MUST be discarded beforehands, but
-        // only the uncommitted part of it
         let AppendEntriesRequest { entries, .. } = request;
         let num_entries = entries.len();
-        //
-        let new_latest_log_index = leader_prev_log_index + num_entries as u64;
-        if new_latest_log_index < self.min_index {
-            // Stale entry; ignore. This guards against overwriting a
-            // possibly committed part of the log if messages get
-            // rearranged; see ktoso/akka-raft#66.
-            return Ok(None);
-        }
 
-        let append_index = leader_prev_log_index + 1;
+        //let new_latest_log_index = leader_prev_log_index + num_entries as u64;
+        //if new_latest_log_index < self.min_index {
+        //// Stale entry; ignore. This guards against overwriting a
+        //// possibly committed part of the log if messages get
+        //// rearranged; see ktoso/akka-raft#66.
+        //return Ok(None);
+        //}
 
+        //let append_index = leader_prev_log_index + 1;
+        let entries_last_index = leader_prev_log_index + num_entries as u64;
+        let entries_first_index = leader_prev_log_index + 1;
+
+        let new_commit_index = cmp::min(request.leader_commit, self.latest_log_index);
+
+        let append_index = if self.latest_volatile_log_index == leader_prev_log_index {
+            // the most often case: everything is normal, entries are appended
+            // as intended, nothing to discard
+            self.latest_volatile_log_index + 1
+        } else if self.latest_volatile_log_index > leader_prev_log_index {
+            // entries overlaps with the log somehow, we need to know how exactly
+            // and which indexes are correct
+            //
+            // TODO: while we don't have to overwrite anything before commit index,
+            // this case is only possible with bad leader and packet reordering
+            // Ideally, we should check the entries terms and indexes and ignore the packet if all of them match
+            // and to return a critical error if indexes don't match
+
+            // obviously, there may be a non-overlapping part, that is not written yet at all
+            let overlapping_len = self.latest_volatile_log_index - leader_prev_log_index;
+
+            let overlapping_start = leader_prev_log_index + 1;
+            let overlapping_end = leader_prev_log_index + overlapping_len as u64;
+
+            let mut entry_index = overlapping_len as usize - 1;
+            let mut index = overlapping_end;
+            let mut overwrite_index = None;
+
+            while index <= overlapping_start {
+                let term = self
+                    .log()
+                    .term_of(index)
+                    .map_err(|e| Error::PersistentLogRead(Box::new(e)))?;
+                if term != entries[entry_index].term {
+                    overwrite_index = Some(entry_index);
+                    todo!("enforce overwriting");
+                }
+                index = index - 1;
+                entry_index = entry_index - 1;
+            }
+            todo!()
+        } else {
+            // self.latest_volatile_log_index < leader_prev_log_index */
+            return Ok(Some(AppendEntriesResponse::InconsistentIndex(
+                current_term,
+                leader_prev_log_index - 1,
+                leader_prev_log_index - 1,
+            )));
+        };
+
+        todo!("this is an old code, may be based on incorrect assumptions");
         // for a heartbeat request appending entries may be skipped,
         // but all other check and actions laying afterwards still has be performed
         // because due to Raft's nature the follower's state machine(not log though) is always 1 commit behind the leader
         // until it receives the next AppendEntries message, be it heartbeat or whatever else
         let mut updated_config_index = None;
-        if entries.len() > 0 {
-            let mut log_entries = Vec::with_capacity(entries.len());
-            let mut entry_index = append_index;
-            for entry in entries.into_iter() {
-                // with each send, leader marks config entries as active if they really take place
-                // as current cluster configuration, this way the follower can skip using previous
-                // inactive entries as actual ones and will not connect to some old nodes
-                if let EntryData::Config(config, is_active) = &entry.data {
-                    if *is_active {
-                        updated_config_index = Some(entry_index);
-                    }
+        let mut log_entries = Vec::with_capacity(entries.len());
+        let mut entry_index = append_index;
+        for entry in entries.into_iter() {
+            // with each send, leader marks config entries as active if they really take place
+            // as current cluster configuration, this way the follower can skip using previous
+            // inactive entries as actual ones and will not connect to some old nodes
+            if let EntryData::Config(config, is_active) = &entry.data {
+                if *is_active {
+                    updated_config_index = Some(entry_index);
                 }
-                entry_index = entry_index + 1;
-
-                log_entries.push(entry.into());
             }
+            entry_index = entry_index + 1;
 
-            trace!("appending at {}: {:?}", append_index, &log_entries);
-            self.log_mut()
-                .append_entries(append_index, &log_entries)
-                .map_err(|e| Error::Critical(CriticalError::PersistentLogWrite(Box::new(e))))?;
-            self.update_log_view()?;
-            self.min_index = self.latest_log_index;
+            log_entries.push(entry.into());
         }
+
+        trace!("appending at {}: {:?}", append_index, &log_entries);
+        self.log_mut()
+            .append_entries(append_index, &log_entries)
+            .map_err(|e| Error::Critical(CriticalError::PersistentLogWrite(Box::new(e))))?;
+        self.update_log_view()?;
+        self.min_index = self.latest_log_index;
 
         // We are matching the leader's log up to and including self.latest_log_index, which
         // may have been moved forward after appending
